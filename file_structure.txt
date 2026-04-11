@@ -1,0 +1,189 @@
+CLIPMIND REQUIRED FILE STRUCTURE
+
+This structure is updated to match the current codex_identity.md.
+It follows the exact backend file names defined there and adds the minimum
+frontend files required for upload, polling, preview, and download.
+
+clipmind/
+|-- codex_identity.md
+|-- file_structure.txt
+|-- README.md
+|-- .gitignore
+|-- .env.example
+|-- config.py
+|-- requirements.txt
+|-- docker-compose.yml
+|
+|-- api/
+|   |-- __init__.py
+|   |-- main.py
+|   |-- routes/
+|   |   |-- __init__.py
+|   |   |-- upload.py
+|   |   `-- jobs.py
+|   `-- models/
+|       |-- __init__.py
+|       `-- job.py
+|
+|-- workers/
+|   |-- __init__.py
+|   |-- celery_app.py
+|   `-- pipeline.py
+|
+|-- services/
+|   |-- __init__.py
+|   |-- storage.py
+|   |-- transcription.py
+|   |-- clip_detector.py
+|   |-- video_processor.py
+|   |-- caption_renderer.py
+|   `-- cost_tracker.py
+|
+|-- db/
+|   |-- __init__.py
+|   |-- connection.py
+|   `-- queries.py
+|
+|-- migrations/
+|   `-- 001_create_jobs_table.sql
+|
+|-- prompts/
+|   `-- clip_detection_v1.txt
+|
+|-- web/
+|   |-- package.json
+|   |-- next.config.ts
+|   |-- tsconfig.json
+|   |-- app/
+|   |   |-- layout.tsx
+|   |   |-- page.tsx
+|   |   `-- jobs/[jobId]/page.tsx
+|   |-- components/
+|   |   |-- upload-form.tsx
+|   |   |-- job-status.tsx
+|   |   |-- clip-list.tsx
+|   |   `-- clip-player.tsx
+|   `-- lib/
+|       `-- api.ts
+|
+`-- tests/
+    |-- test_upload.py
+    |-- test_jobs.py
+    |-- test_clip_detector.py
+    |-- test_video_processor.py
+    `-- test_caption_renderer.py
+
+WHAT EACH PART IS FOR
+
+- `config.py`
+  Loads all environment variables defined in codex_identity.md, including
+  `CLIP_PROMPT_VERSION`, upload limits, chunk settings, and polling interval.
+
+- `requirements.txt`
+  Must contain the exact pinned dependencies listed in codex_identity.md.
+
+- `docker-compose.yml`
+  Starts local Redis and Postgres for Celery and the jobs table during development.
+
+- `api/main.py`
+  FastAPI entry point. Registers routes and exposes the backend app.
+
+- `api/routes/upload.py`
+  Implements `POST /upload`.
+  Validates format, file size, and duration before creating a job.
+
+- `api/routes/jobs.py`
+  Implements:
+  `GET /jobs/{job_id}/status`
+  `GET /jobs/{job_id}/clips`
+
+- `api/models/job.py`
+  Canonical Pydantic models only.
+  All routes, workers, and services must import from this file.
+
+- `workers/celery_app.py`
+  Celery configuration and Redis connection.
+
+- `workers/pipeline.py`
+  Full background job pipeline:
+  extract audio -> transcribe -> detect clips -> cut -> crop -> caption -> export.
+
+- `services/storage.py`
+  Supabase Storage upload and download helpers for source video, audio, and final clips.
+
+- `services/transcription.py`
+  Whisper wrapper with word-level timestamps and retry logic via `tenacity`.
+
+- `services/clip_detector.py`
+  Transcript chunking, prompt loading, LLM scoring, overlap removal, thresholding,
+  and final clip selection.
+
+- `services/video_processor.py`
+  FFmpeg audio extraction, raw clip cutting, vertical crop, and final export logic
+  using the exact commands defined in codex_identity.md.
+
+- `services/caption_renderer.py`
+  Converts Whisper word timestamps into clip-relative SRT captions and burns them in.
+
+- `services/cost_tracker.py`
+  Calculates estimated cost before processing and accumulates actual API cost after calls.
+
+- `db/connection.py`
+  SQLAlchemy database engine setup.
+
+- `db/queries.py`
+  All database queries for the `jobs` table.
+  No inline SQL should appear in routes, workers, or services.
+
+- `migrations/001_create_jobs_table.sql`
+  Must contain the exact SQL from codex_identity.md, including indexes and
+  the `updated_at` trigger.
+
+- `prompts/clip_detection_v1.txt`
+  The active default clip-detection prompt file.
+  Prompt versions should stay in this folder as `clip_detection_v2.txt`, etc.
+
+- `web/`
+  Minimal Next.js frontend required by the MVP:
+  upload one video, poll job status every 4 seconds, preview clips, and download them.
+
+- `tests/`
+  Verifies the strict contract defined in codex_identity.md:
+  file validation, job status responses, clip scoring rules, FFmpeg steps, and captions.
+
+FILES THAT MUST MATCH CODEX_IDENTITY EXACTLY
+
+1. `requirements.txt`
+2. `.env.example`
+3. `api/models/job.py`
+4. `api/routes/upload.py`
+5. `api/routes/jobs.py`
+6. `db/queries.py`
+7. `migrations/001_create_jobs_table.sql`
+8. `prompts/clip_detection_v1.txt`
+9. `services/clip_detector.py`
+10. `services/video_processor.py`
+11. `services/caption_renderer.py`
+
+BUILD ORDER
+
+1. `requirements.txt`
+2. `config.py`
+3. `db/connection.py`
+4. `migrations/001_create_jobs_table.sql`
+5. `api/models/job.py`
+6. `db/queries.py`
+7. `workers/celery_app.py`
+8. `services/storage.py`
+9. `services/transcription.py`
+10. `services/clip_detector.py`
+11. `services/video_processor.py`
+12. `services/caption_renderer.py`
+13. `services/cost_tracker.py`
+14. `workers/pipeline.py`
+15. `api/routes/upload.py`
+16. `api/routes/jobs.py`
+17. `api/main.py`
+18. `web/app/page.tsx`
+19. `web/app/jobs/[jobId]/page.tsx`
+20. `tests/`
