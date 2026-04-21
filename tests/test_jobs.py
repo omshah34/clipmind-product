@@ -1,6 +1,10 @@
+"""File: tests/test_jobs.py
+Purpose: Test job status responses and clip details retrieval API endpoints.
+"""
+
 import unittest
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from api.models.job import ClipResult, JobRecord
 from api.routes.jobs import build_clip_summaries
@@ -28,8 +32,8 @@ class JobRouteTests(unittest.TestCase):
                     reason="Strong hook and clear payoff.",
                 )
             ],
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
         )
 
         summaries = build_clip_summaries(job)

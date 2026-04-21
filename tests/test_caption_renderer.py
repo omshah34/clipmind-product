@@ -1,4 +1,9 @@
 import tempfile
+"""File: tests/test_caption_renderer.py
+Purpose: Verify SRT generation from Whisper word timestamps, caption timing
+         accuracy, and FFmpeg caption burning produces correct output.
+"""
+
 import unittest
 from pathlib import Path
 

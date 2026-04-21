@@ -1,0 +1,162 @@
+/* File: web/styles/onboarding.css */
+
+.onboarding-container {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    background: linear-gradient(180deg, #f8fbff 0%, #eef4fb 100%);
+    font-family: inherit;
+}
+
+.onboarding-card {
+    background: rgba(255, 255, 255, 0.92);
+    border-radius: 16px;
+    padding: 40px;
+    width: 100%;
+    max-width: 500px;
+    box-shadow: 0 20px 40px rgba(16, 32, 51, 0.08);
+    border: 1px solid rgba(16, 32, 51, 0.08);
+}
+
+.step-indicator {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 30px;
+}
+
+.step-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: #c8d2df;
+    transition: background 0.3s;
+}
+
+.step-dot.active {
+    background: #4a90e2;
+    box-shadow: 0 0 10px rgba(74, 144, 226, 0.5);
+}
+
+.step-line {
+    height: 2px;
+    width: 40px;
+    background: #d7e0eb;
+    margin: 0 5px;
+    transition: background 0.3s;
+}
+
+.step-line.active {
+    background: #4a90e2;
+}
+
+.step-content {
+    text-align: center;
+}
+
+.step-content h1 {
+    font-size: 1.5rem;
+    margin-bottom: 10px;
+    color: #102033;
+}
+
+.step-content p {
+    font-size: 0.95rem;
+    color: #5f6b7d;
+    margin-bottom: 25px;
+    line-height: 1.5;
+}
+
+.fade-in {
+    animation: fadeIn 0.4s ease-in-out;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.value-prop-box, .summary-box {
+    background: #f8fbff;
+    padding: 20px;
+    border-radius: 12px;
+    margin-bottom: 25px;
+    text-align: left;
+    border: 1px solid rgba(16, 32, 51, 0.08);
+}
+
+.goal-options, .platform-options {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 10px;
+    margin-top: 15px;
+}
+
+.goal-options {
+    grid-template-columns: 1fr 1fr;
+}
+
+.goal-btn, .platform-btn {
+    background: #ffffff;
+    border: 1px solid #d5deea;
+    padding: 12px;
+    border-radius: 8px;
+    color: #102033;
+    cursor: pointer;
+    font-weight: 500;
+    transition: all 0.2s;
+}
+
+.goal-btn:hover, .platform-btn:hover {
+    background: #f5f8fc;
+}
+
+.goal-btn.selected, .platform-btn.selected {
+    background: rgba(74, 144, 226, 0.15);
+    border-color: #4a90e2;
+    color: #4a90e2;
+}
+
+.next-btn, .start-app-btn {
+    width: 100%;
+    padding: 14px;
+    border-radius: 8px;
+    background: linear-gradient(135deg, #4a90e2, #2962ff);
+    color: white;
+    font-weight: 600;
+    font-size: 1rem;
+    border: none;
+    cursor: pointer;
+    transition: opacity 0.2s;
+}
+
+.next-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.nav-buttons {
+    display: flex;
+    gap: 15px;
+}
+
+.back-btn {
+    flex: 1;
+    padding: 14px;
+    background: #ffffff;
+    border: 1px solid #d5deea;
+    color: #5f6b7d;
+    border-radius: 8px;
+    cursor: pointer;
+}
+
+.pulse {
+    animation: pulseGlow 2s infinite;
+}
+
+@keyframes pulseGlow {
+    0% { box-shadow: 0 0 0 0 rgba(74, 144, 226, 0.4); }
+    70% { box-shadow: 0 0 0 10px rgba(74, 144, 226, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(74, 144, 226, 0); }
+}

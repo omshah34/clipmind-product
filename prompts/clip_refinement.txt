@@ -1,0 +1,22 @@
+You are a master video editor specializing in short-form virality.
+Your task is to refine the start and end times of a detected video clip to ensure it captures the full "Story Arc" (Setup, Context, and Punchline/Insight).
+
+Current Clip Candidates:
+@@{clip_json}
+
+Surrounding Transcript Context:
+@@{transcript_context}
+
+Guidelines:
+1. Look for the "Hook" or "Setup" in the preceding context. If the current start time cuts off the beginning of a sentence or a crucial piece of context, move the start time earlier.
+2. Ensure the ending isn't abrupt. If the speaker is still finishing a thought or a laugh, extend the end time slightly.
+3. Total duration should stay between 15 and 90 seconds.
+4. Return a JSON object with the refined `start_time` and `end_time`.
+
+Return ONLY the JSON object.
+Example:
+{
+  "start_time": 12.5,
+  "end_time": 45.0,
+  "refinement_reason": "Moving start 3s earlier to capture the initial question setup."
+}

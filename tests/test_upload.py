@@ -1,3 +1,8 @@
+"""File: tests/test_upload.py
+Purpose: Verify upload file validation, size constraints, duration checks,
+         and format restrictions match codex_identity.md specification.
+"""
+
 import unittest
 
 from api.routes.upload import UploadValidationError, validate_upload_constraints

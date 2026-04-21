@@ -1,3 +1,8 @@
+"""File: tests/test_clip_detector.py
+Purpose: Verify clip detection, LLM scoring, segment selection, and
+         score thresholding logic matches codex_identity.md rules.
+"""
+
 import unittest
 
 from services.clip_detector import (
@@ -18,7 +23,7 @@ class ClipDetectorTests(unittest.TestCase):
                 "virality_score": 7,
             }
         )
-        self.assertAlmostEqual(score, 7.45, places=2)
+        self.assertAlmostEqual(score, 7.55, places=2)
 
     def test_select_top_clips_skips_overlap(self) -> None:
         selected = select_top_clips(

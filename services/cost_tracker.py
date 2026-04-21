@@ -1,8 +1,13 @@
+"""File: services/cost_tracker.py
+Purpose: Calculates estimated cost before processing and accumulates actual API
+         cost after calls. Tracks per-job costs for billing implementation.
+"""
+
 from __future__ import annotations
 
 import math
 
-from config import settings
+from core.config import settings
 
 
 WHISPER_COST_PER_MINUTE = 0.006

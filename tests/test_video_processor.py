@@ -1,3 +1,8 @@
+"""File: tests/test_video_processor.py
+Purpose: Test FFmpeg audio extraction, clip cutting, vertical cropping,
+         and export logic matches exact commands in codex_identity.md.
+"""
+
 import unittest
 from pathlib import Path
 

@@ -1,22 +1,35 @@
+/**
+ * File: app/layout.tsx
+ * Purpose: Root layout component. Sets up global styles, metadata,
+ *          and app-wide layout structure for all pages.
+ */
+
+"use client";
+
 import type { ReactNode } from "react";
+import { AuthProvider } from "@/components/auth-provider";
 
 
 const globalStyles = `
   :root {
-    color-scheme: dark;
-    --bg: #091119;
-    --bg-soft: #111d29;
-    --panel: rgba(17, 29, 41, 0.72);
-    --panel-strong: rgba(11, 18, 27, 0.9);
-    --text: #f4f2ec;
-    --muted: #9fa9b7;
-    --line: rgba(255,255,255,0.08);
+    color-scheme: light;
+    --bg: #f6f8fc;
+    --bg-soft: #eef3f9;
+    --surface: rgba(255, 255, 255, 0.84);
+    --surface-strong: rgba(255, 255, 255, 0.96);
+    --panel: rgba(255, 255, 255, 0.86);
+    --panel-strong: rgba(255, 255, 255, 0.96);
+    --text: #102033;
+    --muted: #5f6b7d;
+    --line: rgba(16, 32, 51, 0.1);
     --accent: #ff6f61;
-    --accent-soft: rgba(255,111,97,0.16);
+    --accent-soft: rgba(255,111,97,0.12);
+    --shadow: 0 12px 28px rgba(16, 32, 51, 0.06);
+    --shadow-lg: 0 24px 54px rgba(16, 32, 51, 0.1);
   }
 
   * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; background: radial-gradient(circle at top, #1b2c3f 0%, var(--bg) 48%, #060b12 100%); color: var(--text); }
+  html, body { margin: 0; padding: 0; background: radial-gradient(circle at top, #ffffff 0%, var(--bg) 44%, #e7edf6 100%); color: var(--text); }
   body { font-family: "Space Grotesk", "Segoe UI", sans-serif; min-height: 100vh; }
   a { color: inherit; text-decoration: none; }
   button, input { font: inherit; }
@@ -26,16 +39,16 @@ const globalStyles = `
     position: fixed;
     inset: 0;
     background:
-      linear-gradient(90deg, rgba(255,255,255,0.04) 1px, transparent 1px),
-      linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px);
+      linear-gradient(90deg, rgba(16,32,51,0.045) 1px, transparent 1px),
+      linear-gradient(rgba(16,32,51,0.03) 1px, transparent 1px);
     background-size: 120px 120px;
-    mask-image: linear-gradient(to bottom, rgba(0,0,0,0.95), rgba(0,0,0,0.2));
+    mask-image: linear-gradient(to bottom, rgba(0,0,0,0.75), rgba(0,0,0,0.12));
     pointer-events: none;
   }
   .page {
-    width: min(1180px, calc(100vw - 40px));
+    width: min(1240px, calc(100vw - 40px));
     margin: 0 auto;
-    padding: 32px 0 72px;
+    padding: 28px 0 80px;
     position: relative;
     z-index: 1;
   }
@@ -44,7 +57,7 @@ const globalStyles = `
     align-items: center;
     justify-content: space-between;
     gap: 16px;
-    margin-bottom: 44px;
+    margin-bottom: 28px;
   }
   .brand-mark {
     display: inline-flex;
@@ -68,26 +81,75 @@ const globalStyles = `
     gap: 28px;
     align-items: stretch;
   }
+  .hero-shell {
+    position: relative;
+  }
+  .hero-copy {
+    display: grid;
+    align-content: start;
+    gap: 18px;
+    padding: 42px 0 0;
+  }
+  .hero-copy h1 {
+    font-size: clamp(60px, 8vw, 108px);
+    line-height: 0.9;
+    margin-bottom: 0;
+    max-width: 8ch;
+  }
+  .hero-copy .lead {
+    font-size: 19px;
+    max-width: 42ch;
+    margin-bottom: 0;
+  }
+  .hero-actions {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-top: 14px;
+  }
+  .hero-meta {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-top: 6px;
+  }
+  .hero-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.82);
+    border: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 13px;
+    box-shadow: var(--shadow);
+  }
   .poster {
-    min-height: 580px;
+    min-height: 620px;
     border: 1px solid var(--line);
     background:
-      linear-gradient(160deg, rgba(255,111,97,0.14), transparent 30%),
-      linear-gradient(180deg, rgba(255,255,255,0.06), transparent 32%),
-      var(--panel-strong);
-    border-radius: 28px;
-    padding: 32px;
+      radial-gradient(circle at top right, rgba(255,111,97,0.18), transparent 32%),
+      radial-gradient(circle at left center, rgba(78, 144, 226, 0.1), transparent 28%),
+      var(--surface-strong);
+    border-radius: 32px;
+    padding: 30px;
     position: relative;
     overflow: hidden;
     animation: rise 520ms ease-out both;
+    box-shadow: var(--shadow-lg);
   }
   .poster::after {
     content: "";
     position: absolute;
-    inset: auto -10% -20% 40%;
-    height: 340px;
-    background: radial-gradient(circle, rgba(255,111,97,0.28), transparent 70%);
-    filter: blur(24px);
+    inset: 0;
+    background:
+      linear-gradient(135deg, rgba(255,255,255,0.9), rgba(255,255,255,0.35)),
+      linear-gradient(90deg, rgba(16,32,51,0.04) 1px, transparent 1px),
+      linear-gradient(rgba(16,32,51,0.03) 1px, transparent 1px);
+    background-size: auto, 72px 72px, 72px 72px;
+    opacity: 0.35;
+    pointer-events: none;
   }
   .kicker {
     display: inline-flex;
@@ -97,9 +159,9 @@ const globalStyles = `
     border-radius: 999px;
     background: var(--accent-soft);
     border: 1px solid rgba(255,111,97,0.2);
-    color: #ffd0c9;
+    color: #9f3c2f;
     font-size: 13px;
-    margin-bottom: 24px;
+    margin-bottom: 18px;
   }
   h1 {
     font-size: clamp(48px, 7vw, 98px);
@@ -119,14 +181,15 @@ const globalStyles = `
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 14px;
-    margin-top: 38px;
+    margin-top: 24px;
   }
   .metric {
     padding: 16px;
     border-radius: 18px;
-    background: rgba(255,255,255,0.03);
+    background: rgba(255,255,255,0.92);
     border: 1px solid var(--line);
     backdrop-filter: blur(8px);
+    box-shadow: var(--shadow);
   }
   .metric strong { display: block; font-size: 28px; margin-bottom: 4px; }
   .metric span { color: var(--muted); font-size: 13px; }
@@ -137,6 +200,7 @@ const globalStyles = `
     padding: 28px;
     backdrop-filter: blur(16px);
     animation: rise 680ms ease-out both;
+    box-shadow: var(--shadow-lg);
   }
   .panel h2 { margin: 0 0 10px; font-size: 28px; letter-spacing: -0.03em; }
   .panel p { margin: 0 0 18px; color: var(--muted); line-height: 1.6; }
@@ -144,11 +208,80 @@ const globalStyles = `
     display: grid;
     gap: 14px;
   }
+  .upload-dropzone {
+    display: grid;
+    gap: 10px;
+    padding: 20px;
+    border-radius: 22px;
+    border: 1px solid rgba(16, 32, 51, 0.12);
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.96), rgba(248,250,255,0.96));
+    box-shadow: var(--shadow);
+    cursor: pointer;
+    transition: transform 180ms ease, border-color 180ms ease, box-shadow 180ms ease;
+  }
+  .upload-dropzone:hover {
+    transform: translateY(-1px);
+    border-color: rgba(255,111,97,0.28);
+    box-shadow: 0 18px 34px rgba(16, 32, 51, 0.08);
+  }
+  .upload-dropzone-top {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    align-items: flex-start;
+  }
+  .upload-label {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--muted);
+    margin-bottom: 4px;
+  }
+  .upload-title {
+    margin: 0;
+    font-size: 18px;
+    letter-spacing: -0.02em;
+  }
+  .upload-copy {
+    margin: 0;
+    color: var(--muted);
+    line-height: 1.55;
+    font-size: 14px;
+  }
+  .upload-browse {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 10px 14px;
+    border-radius: 999px;
+    background: rgba(255, 111, 97, 0.12);
+    color: #a53c2f;
+    border: 1px solid rgba(255, 111, 97, 0.18);
+    font-weight: 700;
+    font-size: 13px;
+    white-space: nowrap;
+  }
+  .upload-file {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .upload-file strong {
+    color: var(--text);
+    font-weight: 700;
+  }
+  .upload-input {
+    display: none;
+  }
   .field {
     padding: 18px;
     border-radius: 18px;
-    border: 1px dashed rgba(255,255,255,0.18);
-    background: rgba(255,255,255,0.03);
+    border: 1px dashed rgba(16,32,51,0.16);
+    background: rgba(255,255,255,0.9);
   }
   .upload-row {
     display: flex;
@@ -165,16 +298,143 @@ const globalStyles = `
     font-weight: 700;
     cursor: pointer;
     transition: transform 180ms ease, box-shadow 180ms ease;
-    box-shadow: 0 14px 30px rgba(255,111,97,0.25);
+    box-shadow: 0 14px 30px rgba(255,111,97,0.22);
   }
   .button:hover { transform: translateY(-1px); }
   .button:disabled { opacity: 0.55; cursor: not-allowed; box-shadow: none; }
   .subtle-button {
     border: 1px solid var(--line);
-    background: transparent;
+    background: rgba(255,255,255,0.8);
     color: var(--text);
     padding: 12px 18px;
     border-radius: 999px;
+    transition: transform 180ms ease, border-color 180ms ease, box-shadow 180ms ease;
+    box-shadow: var(--shadow);
+  }
+  .subtle-button:hover { transform: translateY(-1px); border-color: rgba(255,111,97,0.2); box-shadow: 0 16px 28px rgba(16, 32, 51, 0.08); }
+  .section-band {
+    display: grid;
+    gap: 18px;
+    margin-top: 28px;
+    padding: 26px 0 0;
+    border-top: 1px solid var(--line);
+  }
+  .section-band h2 {
+    margin: 0;
+    font-size: 24px;
+    letter-spacing: -0.03em;
+  }
+  .section-band p {
+    margin: 0;
+    color: var(--muted);
+    line-height: 1.6;
+    max-width: 60ch;
+  }
+  .feature-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 18px;
+  }
+  .feature-item {
+    padding: 18px 0;
+    border-top: 1px solid var(--line);
+  }
+  .feature-item strong {
+    display: block;
+    font-size: 16px;
+    margin-bottom: 8px;
+    letter-spacing: -0.01em;
+  }
+  .feature-item span {
+    color: var(--muted);
+    line-height: 1.6;
+    font-size: 14px;
+  }
+  .signal-board {
+    display: grid;
+    gap: 14px;
+  }
+  .signal-frame {
+    position: relative;
+    border-radius: 28px;
+    padding: 18px;
+    border: 1px solid var(--line);
+    background: linear-gradient(180deg, rgba(255,255,255,0.98), rgba(246,249,253,0.92));
+    box-shadow: var(--shadow);
+  }
+  .signal-frame::before {
+    content: "";
+    position: absolute;
+    inset: 12px;
+    border-radius: 20px;
+    border: 1px solid rgba(255,111,97,0.1);
+    pointer-events: none;
+  }
+  .signal-header {
+    display: flex;
+    justify-content: space-between;
+    gap: 14px;
+    align-items: center;
+    margin-bottom: 16px;
+  }
+  .signal-header strong {
+    font-size: 15px;
+    letter-spacing: -0.02em;
+  }
+  .signal-header span {
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .signal-steps {
+    display: grid;
+    gap: 10px;
+  }
+  .signal-step {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    align-items: center;
+    padding: 14px 16px;
+    border-radius: 18px;
+    background: rgba(255,255,255,0.96);
+    border: 1px solid var(--line);
+  }
+  .signal-step b {
+    display: block;
+    font-size: 14px;
+    margin-bottom: 2px;
+  }
+  .signal-step small {
+    color: var(--muted);
+  }
+  .signal-step em {
+    font-style: normal;
+    font-size: 12px;
+    color: #a53c2f;
+    background: rgba(255,111,97,0.1);
+    padding: 6px 10px;
+    border-radius: 999px;
+    border: 1px solid rgba(255,111,97,0.18);
+  }
+  .signal-meta {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+  }
+  .signal-meta div {
+    padding: 14px;
+    border-radius: 18px;
+    background: rgba(255,255,255,0.94);
+    border: 1px solid var(--line);
+  }
+  .signal-meta strong {
+    display: block;
+    font-size: 18px;
+    margin-bottom: 4px;
+  }
+  .signal-meta span {
+    color: var(--muted);
+    font-size: 13px;
   }
   .stack { display: grid; gap: 18px; margin-top: 34px; }
   .status-strip {
@@ -189,7 +449,7 @@ const globalStyles = `
     height: 8px;
     width: 100%;
     border-radius: 999px;
-    background: rgba(255,255,255,0.08);
+    background: rgba(16,32,51,0.08);
     overflow: hidden;
   }
   .progress > span {
@@ -208,13 +468,14 @@ const globalStyles = `
     padding: 16px;
     border: 1px solid var(--line);
     border-radius: 22px;
-    background: rgba(255,255,255,0.03);
+    background: rgba(255,255,255,0.92);
     transition: transform 180ms ease, border-color 180ms ease, background 180ms ease;
+    box-shadow: 0 10px 24px rgba(16, 32, 51, 0.05);
   }
   .clip-tile:hover {
     transform: translateY(-2px);
     border-color: rgba(255,111,97,0.32);
-    background: rgba(255,255,255,0.05);
+    background: rgba(255,255,255,1);
   }
   .clip-meta {
     display: flex;
@@ -237,7 +498,7 @@ const globalStyles = `
     border-radius: 18px;
     overflow: hidden;
     border: 1px solid var(--line);
-    background: #030507;
+    background: #edf2f7;
   }
   .player video {
     width: 100%;
@@ -254,8 +515,21 @@ const globalStyles = `
     padding: 14px 16px;
     border-radius: 16px;
     border: 1px solid rgba(255,111,97,0.24);
-    background: rgba(255,111,97,0.09);
-    color: #ffd0c9;
+    background: rgba(255,111,97,0.12);
+    color: #8d2f25;
+  }
+  .shell-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 14px;
+  }
+  .shell-subtitle {
+    color: var(--muted);
+    font-size: 14px;
+    line-height: 1.5;
+    max-width: 48ch;
   }
   @keyframes rise {
     from { opacity: 0; transform: translateY(14px); }
@@ -266,6 +540,10 @@ const globalStyles = `
     .hero { grid-template-columns: 1fr; }
     .poster { min-height: auto; }
     .metrics { grid-template-columns: 1fr; }
+    .feature-grid { grid-template-columns: 1fr; }
+    .signal-meta { grid-template-columns: 1fr; }
+    .hero-copy { padding-top: 18px; }
+    .hero-copy h1 { max-width: none; }
   }
 `;
 
@@ -274,10 +552,12 @@ export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en">
       <body>
-        <div className="shell">
-          <style dangerouslySetInnerHTML={{ __html: globalStyles }} />
-          {children}
-        </div>
+        <AuthProvider>
+          <div className="shell">
+            <style dangerouslySetInnerHTML={{ __html: globalStyles }} />
+            {children}
+          </div>
+        </AuthProvider>
       </body>
     </html>
   );

@@ -1,0 +1,80 @@
+"""File: api/routes/hooks.py
+Purpose: Hook Laboratory endpoints for A/B testing headline variants.
+"""
+
+from __future__ import annotations
+
+import logging
+from uuid import UUID
+from fastapi import APIRouter, HTTPException, Depends
+
+from api.dependencies import get_current_user, AuthenticatedUser
+from api.dependencies.workspace import require_workspace_role
+from db.repositories.jobs import get_job
+from api.models.job import ErrorResponse
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/jobs", tags=["hook-lab"])
+
+
+@router.get("/{job_id}/clips/{clip_index}/hooks")
+async def get_hook_variants(
+    job_id: UUID, 
+    clip_index: int,
+    user: AuthenticatedUser = Depends(get_current_user)
+):
+    """Returns the generated hook headlines for a specific clip."""
+    job = get_job(job_id)
+    if not job or not job.clips_json:
+        raise HTTPException(status_code=404, detail="Job or clips not found")
+        
+    if clip_index < 0 or clip_index >= len(job.clips_json):
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Clip index {clip_index} out of range"
+        )
+        
+    clip = job.clips_json[clip_index]
+    
+    # In Phase 2, we return the hook_headlines generated during clip detection (v3 prompt)
+    # If the job was processed with an older prompt, this might be empty.
+    return {
+        "job_id": job_id,
+        "clip_index": clip_index,
+        "hook_headlines": getattr(clip, "hook_headlines", [])
+    }
+
+
+@router.post("/{job_id}/clips/{clip_index}/hooks/render")
+async def render_hook_preview(
+    job_id: UUID, 
+    clip_index: int, 
+    headline: str,
+    user: AuthenticatedUser = Depends(get_current_user)
+):
+    """
+    Triggers a 'Fast Preview' render (first 3-5s) of the clip with a custom headline overlay.
+    """
+    from workers.render_clips import render_hook_preview as render_task
+    
+    # Validate job exists
+    job = get_job(job_id)
+    if not job or not job.clips_json:
+        raise HTTPException(status_code=404, detail="Job or clips not found")
+        
+    if clip_index < 0 or clip_index >= len(job.clips_json):
+        raise HTTPException(status_code=400, detail="Invalid clip index")
+
+    # Dispatch to Celery
+    task = render_task.delay(
+        job_id=str(job_id),
+        clip_index=clip_index,
+        headline=headline,
+        user_id=str(user.user_id)
+    )
+    
+    return {
+        "status": "queued",
+        "task_id": task.id,
+        "message": "Hook preview render queued."
+    }

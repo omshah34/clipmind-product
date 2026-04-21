@@ -1,6 +1,12 @@
+"""File: services/caption_renderer.py
+Purpose: Converts Whisper word timestamps into clip-relative SRT captions.
+         Burns captions into video using FFmpeg subtitle filter.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
+from services.ass_generator import ASSGenerator
 
 
 def format_srt_time(seconds: float) -> str:
@@ -75,3 +81,15 @@ def write_clip_srt(
         encoding="utf-8",
     )
     return output_path
+
+def write_clip_ass(
+    transcript_json: dict,
+    clip_start_time: float,
+    clip_end_time: float,
+    output_path: Path,
+    preset_name: str = "hormozi",
+    transients: list[float] | None = None,
+) -> Path:
+    words = clip_relative_words(transcript_json, clip_start_time, clip_end_time)
+    generator = ASSGenerator(preset_name=preset_name)
+    return generator.create_ass_file(words, output_path, transients=transients)
