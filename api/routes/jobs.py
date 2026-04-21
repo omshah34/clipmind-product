@@ -7,9 +7,7 @@ Purpose: Job status and clip retrieval endpoints. Provides endpoints to poll
 from __future__ import annotations
 
 from uuid import UUID
-
 from datetime import datetime, timezone
-from uuid import UUID
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
@@ -22,6 +20,7 @@ from api.models.job import (
     JobStatusResponse,
 )
 from db.repositories.jobs import get_job, update_job
+from services.discovery import get_discovery_service
 
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -96,7 +95,6 @@ def reject_job(job_id: UUID) -> dict:
     
     # Ensure both are UTC if necessary, but here we assume DB stores correctly
     now = datetime.now(timezone.utc)
-    # Pydantic models usually handles timezone if DB is TIMESTAMPTZ
     comp_at = job.completed_at
     if comp_at.tzinfo is None:
         comp_at = comp_at.replace(tzinfo=timezone.utc)
@@ -119,4 +117,22 @@ def reject_job(job_id: UUID) -> dict:
         "status": "success",
         "message": "Job rejected successfully. Mock credit refund logged.",
         "job_id": job.id
+    }
+
+
+@router.get("/search", status_code=200)
+async def semantic_search_clips(q: str, limit: int = 5) -> dict:
+    """
+    Search across all indexed clips using semantic intent.
+    Gap: Scrubbing through hours of deep-dive podcasts to find a specific story.
+    """
+    discovery = get_discovery_service()
+    # In a real app, we'd get user_id from the auth dependency
+    # For MVP, we search globally or use the dev_mock_user_id
+    results = await discovery.search_clips(query=q, limit=limit)
+    
+    return {
+        "status": "success",
+        "query": q,
+        "results": results
     }

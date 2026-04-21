@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from api.dependencies import get_current_user, AuthenticatedUser
 from services.export_engine import get_export_engine, ToneType
+from services.batch_service import BatchService
 from db.repositories.jobs import get_job
 
 logger = logging.getLogger(__name__)
@@ -104,18 +105,37 @@ async def get_carousel_pdf_status(
     engine = get_export_engine()
     return engine.generate_linkedin_carousel_pdf(f"{job_id}_{clip_index}")
 
-@exports_router.get("/job/{job_id}/premiere-xml")
-async def export_premiere_xml(
+@exports_router.get("/job/{job_id}/sync-bridge")
+async def export_sync_bridge(
     job_id: str,
-    # user: AuthenticatedUser = Depends(get_current_user) # Disabling for dev mode
+    format: Literal["premiere", "davinci"] = Query("premiere"),
+    user: AuthenticatedUser = Depends(get_current_user)
 ):
-    """Download Final Cut Pro XML for Premiere/DaVinci integration."""
+    """
+    Download a sequence file for professional NLE integration.
+    - format=premiere (XMEML v5)
+    - format=davinci (FCPXML v1.10)
+    """
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+        
+    if str(job.user_id) != str(user.user_id):
+        raise HTTPException(status_code=403, detail="Workspace access denied")
+
     engine = get_export_engine()
-    xml_content = engine.generate_premiere_xml(job_id)
+    xml_content = engine.generate_sync_bridge_xml(job_id, format=format)
     if not xml_content:
-        raise HTTPException(status_code=404, detail="XML generation failed or no clips found")
+        raise HTTPException(status_code=400, detail="No clips available for this job to export")
     
-    return Response(content=xml_content, media_type="application/xml")
+    filename = f"clipmind_{job_id[:8]}_{format}.xml"
+    media_type = "application/xml"
+    
+    return Response(
+        content=xml_content, 
+        media_type=media_type,
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
 
 @exports_router.get("/job/{job_id}/social-pulse")
 async def get_social_pulse(
@@ -131,3 +151,66 @@ async def get_social_pulse(
     clip = job.clips_json[clip_index]
     pulse = await engine.generate_social_pulse(clip.model_dump())
     return pulse
+
+@exports_router.get("/job/{job_id}/social-pulse/all")
+async def get_all_social_pulses(
+    job_id: str,
+    # user: AuthenticatedUser = Depends(get_current_user)
+):
+    """Generate social media packages for all clips in a job (Agency Batch Mode)."""
+    job = get_job(job_id)
+    if not job or not job.clips_json:
+        raise HTTPException(status_code=404, detail="Job or clips not found")
+        
+    engine = get_export_engine()
+    pulses = []
+    
+    # We could parallelize this with asyncio.gather for speed
+    import asyncio
+    tasks = [engine.generate_social_pulse(clip.model_dump()) for clip in job.clips_json]
+    pulses = await asyncio.gather(*tasks)
+    
+    return {
+        "job_id": job_id,
+        "clip_count": len(pulses),
+        "pulses": pulses
+    }
+
+@exports_router.post("/batch/trigger")
+async def trigger_batch_process(
+    job_ids: list[str],
+    user: AuthenticatedUser = Depends(get_current_user)
+):
+    """
+    Triggers background processing for a batch of jobs.
+    Uses 'batch-export' queue and enforces a concurrency limit.
+    """
+    service = BatchService()
+    enqueued_count = service.trigger_batch_render(job_ids)
+    
+    return {
+        "status": "triggered",
+        "enqueued": enqueued_count,
+        "total_requested": len(job_ids),
+        "queue": "batch-export"
+    }
+
+@exports_router.post("/batch/zip")
+async def download_batch_zip(
+    job_ids: list[str],
+    user: AuthenticatedUser = Depends(get_current_user)
+):
+    """
+    Creates and downloads a ZIP archive containing all clips from the specified jobs.
+    """
+    service = BatchService()
+    zip_path = service.create_batch_zip(job_ids)
+    
+    if not zip_path.exists():
+        raise HTTPException(status_code=400, detail="No rendered clips found for specified jobs")
+
+    return Response(
+        content=zip_path.read_bytes(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={zip_path.name}"}
+    )

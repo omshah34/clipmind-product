@@ -25,57 +25,57 @@ class ExportEngine:
         self.model = settings.clip_detector_model
         self.client = llm_client
 
-    def generate_premiere_xml(self, job_id: str) -> str:
+    def generate_sync_bridge_xml(self, job_id: str, format: Literal["premiere", "davinci"] = "premiere") -> str:
         """
-        Generates a Final Cut Pro XML (XMEML) for integration with Premiere Pro/DaVinci.
-        Allows editors to import all viral clips as a single sequence.
+        Generates a professional-grade XML for NLE integration.
+        - Premiere: Final Cut Pro XML (XMEML v5)
+        - DaVinci Resolve: FCPXML (v1.10)
         """
         job = get_job(job_id)
         if not job or not job.clips_json:
             return ""
 
-        fps = 24  # Default for social video
+        fps = 24
         clips = job.clips_json
         source_name = Path(job.source_video_url).name
-        source_url = job.source_video_url
+        
+        # PRO-REQUIREMENT: Absolute paths for local NLE import
+        # If it's a URL, we try to use the local cached version if available
+        local_source = Path(settings.local_storage_dir) / "sources" / source_name
+        media_path = local_source.resolve().as_uri() if local_source.exists() else job.source_video_url
 
+        if format == "davinci":
+            return self._generate_davinci_fcpxml(job_id, clips, source_name, media_path, fps)
+        else:
+            return self._generate_premiere_xmeml(job_id, clips, source_name, media_path, fps)
+
+    def _generate_premiere_xmeml(self, job_id: str, clips: list, source_name: str, media_path: str, fps: int) -> str:
         xml_header = f"""<?xml version="1.0" encoding="UTF-8"?>
 <xmeml version="5">
 <sequence id="sequence-1">
     <name>ClipMind Viral Cuts - {job_id[:8]}</name>
-    <duration>{int(sum(c.duration for c in clips) * fps)}</duration>
+    <duration>{int(sum(c.get('duration', 0) for c in clips) * fps)}</duration>
     <rate><timebase>{fps}</timebase></rate>
     <media>
         <video>
             <track>"""
 
-        xml_footer = """
-            </track>
-        </video>
-    </media>
-</sequence>
-</xmeml>"""
-
         clip_items = []
         current_timeline_start = 0
-        
         for i, clip in enumerate(clips):
-            in_frame = int(clip.start_time * fps)
-            out_frame = int(clip.end_time * fps)
+            in_frame = int(float(clip.get("start_time", 0)) * fps)
+            out_frame = int(float(clip.get("end_time", 0)) * fps)
             duration_frames = out_frame - in_frame
             end_timeline_frame = current_timeline_start + duration_frames
-
-            # First clip defines the file resource, others reference it
-            file_meta = ""
-            if i == 0:
-                file_meta = f"""
+            
+            score = clip.get("final_score", 0)
+            
+            file_meta = f"""
                             <file id="file-1">
                                 <name>{source_name}</name>
-                                <pathurl>{source_url}</pathurl>
+                                <pathurl>{media_path}</pathurl>
                                 <rate><timebase>{fps}</timebase></rate>
-                            </file>"""
-            else:
-                file_meta = '<file id="file-1"/>'
+                            </file>""" if i == 0 else '<file id="file-1"/>'
 
             item = f"""
                 <clipitem id="clipitem-{i+1}">
@@ -88,14 +88,72 @@ class ExportEngine:
                     <out>{out_frame}</out>
                     {file_meta}
                     <labels>
-                        <label2>Virality Score: {clip.final_score}</label2>
+                        <label2>Virality Score: {score}</label2>
                     </labels>
                 </clipitem>"""
-            
             clip_items.append(item)
             current_timeline_start = end_timeline_frame
 
+        markers = []
+        timeline_cursor = 0
+        for clip in clips:
+            duration = int((float(clip.get("end_time", 0)) - float(clip.get("start_time", 0))) * fps)
+            marker = f"""
+        <marker>
+            <name>Hook: {clip.get('hook_headlines', [''])[0]}</name>
+            <comment>Virality: {clip.get('final_score', 0)}/10 | {clip.get('reason', '')}</comment>
+            <in>{timeline_cursor}</in>
+            <out>{timeline_cursor + 1}</out>
+        </marker>"""
+            markers.append(marker)
+            timeline_cursor += duration
+
+        xml_footer = f"""
+            </track>
+        </video>
+    </media>
+    {"".join(markers)}
+</sequence>
+</xmeml>"""
         return xml_header + "".join(clip_items) + xml_footer
+
+    def _generate_davinci_fcpxml(self, job_id: str, clips: list, source_name: str, media_path: str, fps: int) -> str:
+        """
+        DaVinci Resolve Optimized FCPXML 1.10.
+        Uses <fcpxml> root as required for modern Blackmagic Design imports.
+        """
+        xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<fcpxml version="1.10">
+    <resources>
+        <format id="r1" name="FFVideoFormat1080p24" frameDuration="1/{fps}s" width="1920" height="1080"/>
+        <asset id="a1" name="{source_name}" src="{media_path}" start="0s" duration="3600s" hasVideo="1" format="r1"/>
+    </resources>
+    <library>
+        <event name="ClipMind Exports">
+            <project name="Viral Sequence - {job_id[:8]}">
+                <sequence format="r1" tcStart="0s">
+                    <spine>"""
+        
+        cursor = 0
+        for clip in clips:
+            start = float(clip.get("start_time", 0))
+            end = float(clip.get("end_time", 0))
+            dur = end - start
+            
+            xml += f"""
+                        <asset-clip ref="a1" offset="{cursor}s" start="{start}s" duration="{dur}s">
+                            <note>Virality Score: {clip.get('final_score', 0)}</note>
+                        </asset-clip>"""
+            cursor += dur
+            
+        xml += """
+                    </spine>
+                </sequence>
+            </project>
+        </event>
+    </library>
+</fcpxml>"""
+        return xml
 
     async def generate_social_pulse(self, clip_data: dict) -> dict:
         """
@@ -238,14 +296,69 @@ class ExportEngine:
         )
         return response.choices[0].message.content.strip()
 
-    def generate_linkedin_carousel_pdf(self, clip_id: str):
-        """
-        Placeholder for PDF generation logic (Phase 4 integration).
-        For V1, we return a structural metadata map for the frontend to render.
-        """
-        # Logic here would involve generating images via HTML-to-Canvas or similar,
         # then merging into a PDF. For this MVP, we focus on text transformation.
         return {"status": "specced", "message": "PDF Carousel generation coming in Phase 4 - Enterprise."}
+
+    async def generate_story_sequence(self, job_id: str, theme: str) -> Path:
+        """
+        Creates a 'Sequence-Master' narrative.
+        Identify clips in a job related to a theme, sort them logistically, and stitch them.
+        Gap Exploited: Abrupt one-off clips that lack continuous story context.
+        """
+        from services.discovery import get_discovery_service
+        from services.video_processor import apply_broll_cutaways # We might use this too
+        import subprocess
+        
+        job = get_job(job_id)
+        if not job or not job.clips_json:
+            raise ValueError("Job not found or has no clips")
+
+        discovery = get_discovery_service()
+        clips = job.clips_json
+        
+        # 1. Semantic Filter: Find clips from THIS job related to the theme
+        # For MVP, we'll do a simple text match or use discovery's logic locally
+        related_clips = []
+        for clip in clips:
+            text = " ".join([clip.get("reason", "")] + clip.get("hook_headlines", []))
+            # We treat the 'reason' as the primary semantic text for now
+            related_clips.append(clip) # For Phase 3 MVP, we use all clips or top N
+            
+        # 2. Sort by 'Story Continuity' (LLM-based or chronological)
+        # Chronological is safer for narrative integrity unless specified otherwise
+        related_clips.sort(key=lambda x: x.get("start_time", 0))
+        
+        # 3. Stitch with FFmpeg concat
+        output_dir = Path(settings.local_storage_dir) / "sequences"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"sequence_{job_id[:8]}_{theme}.mp4"
+        
+        # Concat logic
+        # We assume clips are already rendered vertical clips. 
+        # In a real pipeline, we'd pull the rendered paths.
+        # For this spec, we generate a concat file.
+        concat_file = output_dir / f"list_{job_id[:8]}.txt"
+        with open(concat_file, "w") as f:
+            for clip in related_clips[:3]: # Limit to 3 clips for 'mini-story'
+                # Mock path for rendered clip
+                clip_path = Path(settings.local_storage_dir) / "clips" / f"clip_{job_id}_{clip.get('clip_index')}.mp4"
+                if clip_path.exists():
+                    f.write(f"file '{clip_path.resolve().as_posix()}'\n")
+        
+        if not concat_file.stat().st_size:
+            raise ValueError("No rendered clips found to sequence. Render them first.")
+
+        cmd = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", str(concat_file),
+            "-c", "copy",
+            str(output_path)
+        ]
+        
+        logger.info("Stitching sequence for job %s with theme: %s", job_id, theme)
+        subprocess.run(cmd, check=True, capture_output=True)
+        
+        return output_path
 
 def get_export_engine() -> ExportEngine:
     return ExportEngine()

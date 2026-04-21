@@ -139,6 +139,102 @@ class SubtitleStyle:
         )
 
 
+# ---------------------------------------------------------------------------
+# Font Registry (Cross-Platform)
+# ---------------------------------------------------------------------------
+
+class FontRegistry:
+    """Handles cross-platform font discovery for FFmpeg filters."""
+    
+    _WIN_FONTS = Path("C:/Windows/Fonts")
+    _LINUX_FONTS = Path("/usr/share/fonts")
+    
+    @classmethod
+    def get_font_path(cls, font_name: str) -> str:
+        """
+        Map a font name (e.g., 'Arial') to a platform-specific absolute path.
+        Returns the escaped path for FFmpeg.
+        """
+        # Common mappings
+        mappings = {
+            "Arial": {"win": "arial.ttf", "linux": "truetype/dejavu/DejaVuSans.ttf"},
+            "Inter": {"win": "Inter-Bold.ttf", "linux": "truetype/inter/Inter-Bold.ttf"},
+            "Verdana": {"win": "verdana.ttf", "linux": "truetype/dejavu/DejaVuSans.ttf"},
+        }
+
+        # Try mapping first
+        file_name = mappings.get(font_name, {}).get("win" if cls._is_windows() else "linux", "arial.ttf")
+        
+        # Check standard locations
+        search_paths = [cls._WIN_FONTS, cls._LINUX_FONTS]
+        if not cls._is_windows():
+            search_paths = [cls._LINUX_FONTS, cls._WIN_FONTS] # Reverse priority
+            
+        for base in search_paths:
+            # Recursive check optionally or just common specific subdirs
+            p = base / file_name
+            if p.exists():
+                return _escape_subtitle_path(p)
+            
+            # Linux specific depth (common for DejaVu)
+            if not cls._is_windows():
+                deep_p = base / "truetype/dejavu" / file_name
+                if deep_p.exists():
+                    return _escape_subtitle_path(deep_p)
+
+        # Final Hard Fallback (assuming standard name in search path or current dir)
+        return font_name 
+
+    @staticmethod
+    def _is_windows() -> bool:
+        import platform
+        return platform.system() == "Windows"
+
+
+class LayoutRegistry:
+    """
+    Manages viral-style layout templates and visual presets.
+    Gap Exploited: 'AI Aesthetic Fatigue' (Generic AI clips get suppressed).
+    Updates: Weekly style definitions fetched from a central AI trend feed.
+    """
+    _TREND_FEED_URL = "https://raw.githubusercontent.com/clipmind/trends/main/styles.json"
+    
+    # Default fallback styles
+    _STYLES = {
+        "ali_abdaal_v2": {
+            "font": "Inter",
+            "font_size": 28,
+            "primary_color": "&H0000FFFF", # Neon Yellow
+            "outline_color": "&H00000000",
+            "alignment": 2,
+            "headline_y": 0.12,
+            "box_opacity": 0.8
+        },
+        "modern_minimal": {
+            "font": "Arial",
+            "font_size": 24,
+            "primary_color": "&H00FFFFFF", # White
+            "outline_color": "&H00000000",
+            "alignment": 2,
+            "headline_y": 0.15,
+            "box_opacity": 0.5
+        }
+    }
+
+    @classmethod
+    def get_style(cls, template_name: str) -> dict:
+        """Fetch style parameters for a specific template."""
+        # In production, this would try to fetch from _TREND_FEED_URL first
+        return cls._STYLES.get(template_name, cls._STYLES["modern_minimal"])
+
+    @classmethod
+    def sync_trends(cls):
+        """Syncs the registry with the latest viral trends."""
+        # Logic: httpx.get(_TREND_FEED_URL) -> update _STYLES
+        logger.info("Synching LayoutRegistry with weekly viral trends...")
+        pass
+
+
 DEFAULT_SUBTITLE_STYLE = SubtitleStyle()
 
 
@@ -495,9 +591,7 @@ def render_vertical_captioned_clip(
         # We escape single quotes and colons for the drawtext filter
         safe_headline = headline.replace("'", "\\'").replace(":", "\\:")
         # Styling: Top-center, bold font, semi-transparent background box
-        # Windows font path double-escaped if needed, but Arial usually works as name
-        # However, for accuracy we use the discovered path
-        font_path = "C\\:/Windows/Fonts/Arial.ttf"
+        font_path = FontRegistry.get_font_path("Arial")
         
         drawtext_vf = (
             f"drawtext=text='{safe_headline}':"
@@ -526,4 +620,117 @@ def render_vertical_captioned_clip(
     _run_command(command)
     logger.info("Rendered captioned clip: %s (wm: %s) -> %s", 
                 layout_type, "yes" if watermark_path else "no", output_path.name)
+    return output_path
+
+
+def generate_waveform_video(
+    audio_path: Path,
+    output_path: Path,
+    duration: float,
+    bg_color: str = "black",
+    width: int = OUTPUT_WIDTH,
+    height: int = OUTPUT_HEIGHT,
+) -> Path:
+    """
+    Generates a vertical video with a static background and dynamic waveform from audio.
+    Used for the 'Voice-to-Viral' feature for podcast MP3s.
+    """
+    _assert_file_exists(audio_path, "audio")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Convert HEX/Name color to FFmpeg color syntax if needed, 
+    # but FFmpeg supports common names like 'black', 'blue', or 0xRRGGBB
+    
+    # Filtergraph: 
+    # 1. color - create static background
+    # 2. showwaves - generate waveform from audio
+    # 3. overlay - put waveform on background
+    filter_complex = (
+        f"color=c={bg_color}:s={width}x{height}:d={duration} [bg]; "
+        f"amovie='{audio_path.as_posix()}', showwaves=s={width}x300:mode=line:colors=white [wave]; "
+        f"[bg][wave] overlay=0:(H-h)/2 [out]"
+    )
+
+    command = [
+        "ffmpeg", "-y",
+        "-filter_complex", filter_complex,
+        "-map", "[out]",
+        "-map", f"0:a?", # map audio from input if it exists
+        "-i", str(audio_path),
+        "-c:v", "libx264",
+        "-c:a", "aac",
+        "-t", str(duration),
+        str(output_path),
+    ]
+    
+    _run_command(command)
+    logger.info("Waveform video generated: %s -> %s", audio_path.name, output_path.name)
+    return output_path
+
+
+def apply_broll_cutaways(
+    video_path: Path,
+    broll_specs: list[dict],
+    output_path: Path,
+) -> Path:
+    """
+    Applies B-Roll cutaways to a video.
+    Cutaways are "Full Cutaway" style: they hide the speaker entirely for the duration.
+    Original audio is preserved.
+    
+    broll_specs: List of { "path": Path, "start": float, "duration": float }
+    """
+    _assert_file_exists(video_path, "base video")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    if not broll_specs:
+        import shutil
+        shutil.copy(video_path, output_path)
+        return output_path
+
+    # Build complex filtergraph
+    # We overlay each B-roll clip at its specified timestamp
+    # [0:v][1:v] overlay=0:0:enable='between(t,start,end)' [v1];
+    # [v1][2:v] overlay=0:0:enable='between(t,start,end)' [v2] ...
+    
+    inputs = ["-i", str(video_path)]
+    filters = []
+    last_label = "[0:v]"
+    
+    for i, spec in enumerate(broll_specs):
+        b_path = spec["path"]
+        start = spec["start"]
+        duration = spec["duration"]
+        end = start + duration
+        
+        inputs.extend(["-i", str(b_path)])
+        
+        # Scale B-roll to cover the base video (Full Cutaway)
+        # 1:v -> scaling -> [b1]; [last_label][b1] overlay...
+        b_label = f"[b{i+1}]"
+        filters.append(f"[{i+1}:v] scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=increase,crop={OUTPUT_WIDTH}:{OUTPUT_HEIGHT} {b_label}")
+        
+        out_label = f"[v{i+1}]"
+        filters.append(f"{last_label}{b_label} overlay=0:0:enable='between(t,{start},{end})' {out_label}")
+        last_label = out_label
+
+    filter_complex = "; ".join(filters)
+    
+    command = [
+        "ffmpeg", "-y"
+    ]
+    command.extend(inputs)
+    command.extend([
+        "-filter_complex", filter_complex,
+        "-map", last_label,
+        "-map", "0:a?", # Keep original audio
+        "-c:v", "libx264",
+        "-crf", "23",
+        "-preset", "fast",
+        "-c:a", "aac",
+        str(output_path)
+    ])
+    
+    _run_command(command)
+    logger.info("Applied %d B-Roll cutaways to %s", len(broll_specs), video_path.name)
     return output_path

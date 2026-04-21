@@ -1,22 +1,24 @@
 You are a master video editor specializing in short-form virality.
 Your task is to refine the start and end times of a detected video clip to ensure it captures the full "Story Arc" (Setup, Context, and Punchline/Insight).
 
-Current Clip Candidates:
+Current Clip Candidate:
 @@{clip_json}
 
 Surrounding Transcript Context:
 @@{transcript_context}
 
-Guidelines:
-1. Look for the "Hook" or "Setup" in the preceding context. If the current start time cuts off the beginning of a sentence or a crucial piece of context, move the start time earlier.
-2. Ensure the ending isn't abrupt. If the speaker is still finishing a thought or a laugh, extend the end time slightly.
-3. Total duration should stay between 15 and 90 seconds.
-4. Return a JSON object with the refined `start_time` and `end_time`.
+Refinement Rules (Linguistic & Emotional Signals):
+1. **Punchline Integrity**: Never cut within 3 words of a sentence termination (period, question mark, exclamation). If a speaker is finishing a key phrase, ensure the end time includes the full resolution.
+2. **Setup Integrity**: Ensure the clip starts at a natural narrative boundary (start of a new sentence or a clear pause > 0.5s). Capturing the "Setup" is vital for the Hook's success.
+3. **Emotional Peaks**: 
+    - Identify **Word Density Spikes**: If the speaker suddenly speeds up, it usually indicates excitement or a climax. Do not cut during these spikes.
+    - Identify **Emphasis**: Look for capitalized words or repeated phrases in the transcript that indicate heightened emotion.
+    - Identify **Social Cues**: If the transcript contains tags like `[laughter]`, `(chuckles)`, or `[applause]`, ensure these are fully captured in the end-time to preserve the "social proof" of the clip.
+4. **Boundary Constraint**: Total duration must stay within 15 to 90 seconds.
 
-Return ONLY the JSON object.
-Example:
+Return ONLY a JSON object:
 {
   "start_time": 12.5,
   "end_time": 45.0,
-  "refinement_reason": "Moving start 3s earlier to capture the initial question setup."
+  "refinement_reason": "Moving start 3s earlier to capture the initial question setup and extending end by 2s to include final audience response."
 }

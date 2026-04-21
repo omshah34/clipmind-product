@@ -1,0 +1,8 @@
+{
+  "exclude": [
+    ".*/db/alembic/versions/.*",
+    ".*/db/init_db\\.py",
+    ".*/db/init_sqlite\\.py"
+  ],
+  "use-ignore-files": true
+}

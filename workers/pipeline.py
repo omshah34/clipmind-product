@@ -38,7 +38,10 @@ from services.clip_detector import get_clip_detector_service
 from services.event_emitter import emit_job_completed, emit_clips_generated
 from services.storage import storage_service
 from services.transcription import get_transcription_service
-from services.video_processor import cut_clip, extract_audio, render_vertical_captioned_clip, DEFAULT_SUBTITLE_STYLE
+from services.video_processor import (
+    cut_clip, extract_audio, render_vertical_captioned_clip, 
+    generate_waveform_video, DEFAULT_SUBTITLE_STYLE
+)
 from services.subject_tracking import get_subject_tracker
 from services.audio_engine import AudioEngine
 from services.ws_manager import (
@@ -46,6 +49,8 @@ from services.ws_manager import (
     emit_clip_ready, emit_completed, emit_error,
 )
 from services.export_engine import get_export_engine
+from services.discovery import get_discovery_service
+from services.visual_engine import VisualEngine, VISUAL_CATEGORY_MAP
 from workers.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -104,6 +109,7 @@ def process_job(self, job_id: str) -> list[dict]:
     clip_detector_service = get_clip_detector_service()
     subject_tracker = get_subject_tracker()
     export_engine = get_export_engine()
+    discovery_service = get_discovery_service()
 
     # Temp dir created here so both success and failure paths can clean it up.
     temp_dir = Path(tempfile.mkdtemp(prefix=f"clipmind_{job.id}_"))
@@ -132,17 +138,23 @@ def process_job(self, job_id: str) -> list[dict]:
             emit_progress(job_id, current_stage, progress=15)
 
         # ------------------------------------------------------------------ #
-        # 2. Extract audio
+        # 2. Extract audio (Branch: skip if source is already audio)
         # ------------------------------------------------------------------ #
-        current_stage = "extracting_audio"
-        emit_stage(job_id, current_stage, progress=20)
-        with _stage_timer(job_id, current_stage):
-            update_job(job.id, status=current_stage)
-            audio_path = temp_dir / f"{job.id}.mp3"
-            extract_audio(source_video_path, audio_path)
-            audio_url = storage_service.upload_file(audio_path, "audio", f"{job.id}.mp3")
-            update_job(job.id, audio_url=audio_url)
-            emit_progress(job_id, current_stage, progress=30)
+        is_audio_only = source_video_path.suffix.lower() in [".mp3", ".wav", ".m4a"]
+        audio_path = temp_dir / f"{job.id}.mp3"
+
+        if is_audio_only:
+            logger.info("[job=%s] Source is audio-only. Skipping extraction.", job_id)
+            shutil.copy(source_video_path, audio_path)
+        else:
+            current_stage = "extracting_audio"
+            emit_stage(job_id, current_stage, progress=20)
+            with _stage_timer(job_id, current_stage):
+                update_job(job.id, status=current_stage)
+                extract_audio(source_video_path, audio_path)
+                audio_url = storage_service.upload_file(audio_path, "audio", f"{job.id}.mp3")
+                update_job(job.id, audio_url=audio_url)
+                emit_progress(job_id, current_stage, progress=30)
 
         # ------------------------------------------------------------------ #
         # 3. Transcribe
@@ -163,6 +175,17 @@ def process_job(self, job_id: str) -> list[dict]:
                 actual_cost_usd=round(actual_cost, 6),
             )
             emit_progress(job_id, current_stage, progress=50, words=word_count)
+            
+            # -- AI Semantic Discovery Indexing (Phase 3) --
+            try:
+                with _stage_timer(job_id, "indexing_semantics"):
+                    # This is non-blocking in Phase 3 for MVP
+                    # (In-memory/local-index is fast)
+                    import asyncio
+                    asyncio.run(discovery_service.add_job_to_index(job.id, transcript_json))
+                    logger.info("[job=%s] Job indexed for AI semantic discovery", job_id)
+            except Exception as idx_exc:
+                logger.warning("[job=%s] Semantic indexing failed: %s", job_id, idx_exc)
 
         # ------------------------------------------------------------------ #
         # 4. Detect clips
@@ -223,12 +246,26 @@ def process_job(self, job_id: str) -> list[dict]:
                 emit_stage(job_id, "cutting_clip", progress=clip_progress_base, clip_index=clip_index, total_clips=len(detected_clips))
                 with _stage_timer(job_id, current_stage):
                     update_job(job.id, status="cutting_video")
-                    cut_clip(
-                        source_video_path,
-                        start_time=float(clip["start_time"]),
-                        end_time=float(clip["end_time"]),
-                        output_path=raw_clip_path,
-                    )
+                    if is_audio_only:
+                        # For audio only, we still need to cut the raw audio segment first
+                        audio_clip_path = temp_dir / f"clip_{clip_index}_audio.mp3"
+                        cut_clip(audio_path, float(clip["start_time"]), float(clip["end_time"]), audio_clip_path)
+                        
+                        # -- Phase 6: Audio-to-Viral Generative Stage --
+                        with _stage_timer(job_id, "generating_waveform"):
+                            generate_waveform_video(
+                                audio_clip_path,
+                                raw_clip_path,
+                                duration=float(clip["end_time"]) - float(clip["start_time"]),
+                                bg_color="black" # Default, or pull from brand kit later
+                            )
+                    else:
+                        cut_clip(
+                            source_video_path,
+                            start_time=float(clip["start_time"]),
+                            end_time=float(clip["end_time"]),
+                            output_path=raw_clip_path,
+                        )
 
                 # -- Write ASS + Render captions ----------------------------
                 current_stage = f"captioning_clip_{clip_index}"
@@ -344,6 +381,44 @@ def process_job(self, job_id: str) -> list[dict]:
                             watermark_path=watermark_path,
                             headline=headline
                         )
+                        # -- B-Roll Pulse Cutaway Injection (Phase 3) --
+                        try:
+                            # 1. Identify visual keywords from the clip reason/headlines
+                            keywords = clip.get("hook_headlines", []) + [clip.get("reason", "")]
+                            # 2. Search for related B-roll
+                            broll_meta = yield from VisualEngine.find_contextual_broll(keywords).__await__()
+                            
+                            if broll_meta:
+                                with _stage_timer(job_id, "applying_broll"):
+                                    update_job(job.id, status="applying_broll")
+                                    # Download B-roll (using simple download for MVP)
+                                    broll_specs = []
+                                    for i, b in enumerate(broll_meta):
+                                        b_local = temp_dir / f"broll_{clip_index}_{i}.mp4"
+                                        storage_service.download_to_local(b["url"], b_local)
+                                        # Distribute B-roll across the clip duration
+                                        clip_duration = float(clip["end_time"]) - float(clip["start_time"])
+                                        target_start = (clip_duration / (len(broll_meta) + 1)) * (i + 1)
+                                        broll_specs.append({
+                                            "path": b_local,
+                                            "start": target_start,
+                                            "duration": min(3.0, clip_duration / 4) # Short punchy cutaways
+                                        })
+                                    
+                                    # Apply cutaways to the final rendered clip
+                                    broll_output = temp_dir / f"clip_{clip_index}_brolled.mp4"
+                                    # Note: We apply b-roll AFTER captioning to ensure captions stay visible 
+                                    # OR before to burn captions over b-roll. 
+                                    # Strategy: Full cutaway means we might want captions OVER b-roll.
+                                    # For Phase 3, we'll apply it to the captioned output.
+                                    from services.video_processor import apply_broll_cutaways
+                                    apply_broll_cutaways(final_clip_path, broll_specs, broll_output)
+                                    shutil.copy2(broll_output, final_clip_path)
+                                    logger.info("[job=%s] Applied %d B-roll cutaways to clip %d", job_id, len(broll_specs), clip_index)
+                                    
+                        except Exception as broll_exc:
+                            logger.warning("[job=%s] B-Roll injection failed for clip %d: %s", job_id, clip_index, broll_exc)
+
                     except Exception as render_exc:
                         logger.warning(
                             "[job=%s] Caption rendering failed for clip %d: %s. Falling back to raw cut.",
