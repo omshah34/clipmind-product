@@ -4,10 +4,19 @@
  *          and app-wide layout structure for all pages.
  */
 
-"use client";
-
 import type { ReactNode } from "react";
-import { AuthProvider } from "@/components/auth-provider";
+import type { Metadata, Viewport } from "next";
+import { Providers } from "./providers";
+
+export const metadata: Metadata = {
+  title: "ClipMind — AI Video Studio",
+  description: "Turn long videos into ready-to-post clips automatically.",
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+};
 
 
 const globalStyles = `
@@ -552,12 +561,12 @@ export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en">
       <body>
-        <AuthProvider>
+        <Providers>
           <div className="shell">
             <style dangerouslySetInnerHTML={{ __html: globalStyles }} />
             {children}
           </div>
-        </AuthProvider>
+        </Providers>
       </body>
     </html>
   );

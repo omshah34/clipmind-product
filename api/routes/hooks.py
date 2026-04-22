@@ -19,11 +19,13 @@ router = APIRouter(prefix="/jobs", tags=["hook-lab"])
 
 @router.get("/{job_id}/clips/{clip_index}/hooks")
 async def get_hook_variants(
-    job_id: UUID, 
+    job_id: str, 
     clip_index: int,
     user: AuthenticatedUser = Depends(get_current_user)
 ):
-    """Returns the generated hook headlines for a specific clip."""
+    """Returns 3 AI-generated Hook variations (different start timestamps) for a specific clip."""
+    from services.llm_integration import generate_hook_variants
+    
     job = get_job(job_id)
     if not job or not job.clips_json:
         raise HTTPException(status_code=404, detail="Job or clips not found")
@@ -34,20 +36,18 @@ async def get_hook_variants(
             detail=f"Clip index {clip_index} out of range"
         )
         
-    clip = job.clips_json[clip_index]
+    hooks = generate_hook_variants(str(job_id), clip_index)
     
-    # In Phase 2, we return the hook_headlines generated during clip detection (v3 prompt)
-    # If the job was processed with an older prompt, this might be empty.
     return {
         "job_id": job_id,
         "clip_index": clip_index,
-        "hook_headlines": getattr(clip, "hook_headlines", [])
+        "hooks": hooks
     }
 
 
 @router.post("/{job_id}/clips/{clip_index}/hooks/render")
 async def render_hook_preview(
-    job_id: UUID, 
+    job_id: str, 
     clip_index: int, 
     headline: str,
     user: AuthenticatedUser = Depends(get_current_user)

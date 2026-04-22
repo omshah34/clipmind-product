@@ -1,5 +1,5 @@
 """
-run.py — ClipMind One-Command Dev Launcher
+run.py - ClipMind One-Command Dev Launcher
 ==========================================
 Starts all services in parallel:
   1. FastAPI backend (Uvicorn)
@@ -7,7 +7,7 @@ Starts all services in parallel:
   3. Celery Beat scheduler
   4. Next.js frontend (npm run dev)
 
-★ REDIS AUTO-START: Automatically starts Redis via WSL2 → Docker → Native Windows.
+* REDIS AUTO-START: Automatically starts Redis via WSL2 -> Docker -> Native Windows.
   You never need to touch the terminal for Redis.
 
 Usage:
@@ -29,12 +29,15 @@ import shutil
 import re
 from pathlib import Path
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# -- Config --------------------------------------------------------------------
 
 ROOT    = Path(__file__).resolve().parent
 WEB_DIR = ROOT / "web"
 IS_WINDOWS = platform.system() == "Windows"
-PYTHON     = sys.executable
+
+# Prefer virtual environment Python if it exists
+VENV_PYTHON = ROOT / ".venv" / ("Scripts" if IS_WINDOWS else "bin") / ("python.exe" if IS_WINDOWS else "python")
+PYTHON = str(VENV_PYTHON) if VENV_PYTHON.exists() else sys.executable
 
 LOG_DIR = ROOT / "log"
 LOG_DIR.mkdir(exist_ok=True)
@@ -51,7 +54,7 @@ def yellow(t): return _c("93", t)
 def cyan(t):   return _c("96", t)
 def bold(t):   return _c("1",  t)
 
-# ── Redis Helpers ─────────────────────────────────────────────────────────────
+# -- Redis Helpers -------------------------------------------------------------
 
 def _redis_client(redis_url: str, socket_timeout: int = 5, socket_connect_timeout: int = 5):
     import redis
@@ -64,7 +67,7 @@ def _redis_client(redis_url: str, socket_timeout: int = 5, socket_connect_timeou
 
 
 def _is_redis_alive(redis_url: str) -> bool:
-    """Single quick check — returns True if Redis responds to PING."""
+    """Single quick check - returns True if Redis responds to PING."""
     try:
         import redis as redislib
         _redis_client(redis_url, socket_timeout=3, socket_connect_timeout=3).ping()
@@ -86,7 +89,7 @@ def _wait_for_redis(redis_url: str, *, attempts: int = 15, delay: float = 1.0) -
     print()   # newline after dots
     return False
 
-# ── Redis Auto-Start Strategies ───────────────────────────────────────────────
+# -- Redis Auto-Start Strategies -----------------------------------------------
 
 def _try_wsl(redis_url: str) -> bool:
     """Start Redis inside WSL2 and wait for it to answer."""
@@ -94,7 +97,7 @@ def _try_wsl(redis_url: str) -> bool:
     if not wsl:
         return False
 
-    print(f"        Strategy 1 → WSL2 redis-server")
+    print(f"        Strategy 1 -> WSL2 redis-server")
 
     # Try the standard service manager first, then fallback to direct daemon
     commands = [
@@ -114,7 +117,7 @@ def _try_wsl(redis_url: str) -> bool:
                 if _wait_for_redis(redis_url, attempts=10):
                     return True
         except Exception as exc:
-            print(f"        WSL2 cmd failed ({cmd[:30]}…): {exc}")
+            print(f"        WSL2 cmd failed ({cmd[:30]}...): {exc}")
 
     return False
 
@@ -128,7 +131,7 @@ def _try_docker(redis_url: str) -> bool:
     if not docker:
         return False
 
-    print(f"        Strategy 2 → Docker redis:alpine")
+    print(f"        Strategy 2 -> Docker redis:alpine")
 
     # Check if container already exists and is running
     try:
@@ -137,7 +140,7 @@ def _try_docker(redis_url: str) -> bool:
             capture_output=True, text=True, timeout=10,
         )
         if check.stdout.strip() == "true":
-            print(f"{green('        [Docker]')}  clipmind-redis container already running ✓")
+            print(f"{green('        [Docker]')}  clipmind-redis container already running")
             return _wait_for_redis(redis_url, attempts=5)
     except Exception:
         pass
@@ -160,7 +163,7 @@ def _try_docker(redis_url: str) -> bool:
             capture_output=True, text=True, timeout=60,
         )
         if result.returncode == 0:
-            print(f"{green('        [Docker]')}  redis:alpine container started ✓")
+            print(f"{green('        [Docker]')}  redis:alpine container started")
             time.sleep(2)
             if _wait_for_redis(redis_url, attempts=15):
                 return True
@@ -183,12 +186,12 @@ def _try_native_windows(redis_url: str) -> bool:
     if not redis_exe or not IS_WINDOWS:
         return False
 
-    print(f"        Strategy 3 → Native redis-server.exe")
+    print(f"        Strategy 3 -> Native redis-server.exe")
 
     try:
         si = subprocess.STARTUPINFO()
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = subprocess.SW_HIDE   # Run hidden — no console popup
+        si.wShowWindow = subprocess.SW_HIDE   # Run hidden - no console popup
 
         proc = subprocess.Popen(
             [redis_exe],
@@ -199,7 +202,7 @@ def _try_native_windows(redis_url: str) -> bool:
         # Track it so shutdown() can kill it too
         processes.append(proc)
 
-        print(f"{green('        [Native]')}  redis-server.exe started (PID {proc.pid}) ✓")
+        print(f"{green('        [Native]')}  redis-server.exe started (PID {proc.pid})")
         time.sleep(2)
         if _wait_for_redis(redis_url, attempts=10):
             return True
@@ -220,7 +223,7 @@ def auto_start_redis(redis_url: str | None = None) -> bool:
     """
     redis_url = redis_url or os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
-    print(f"\n{yellow('[AUTO]')}  Redis not running — trying auto-start strategies...\n")
+    print(f"\n{yellow('[AUTO]')}  Redis not running - trying auto-start strategies...\n")
 
     for strategy in (_try_wsl, _try_docker, _try_native_windows):
         if strategy(redis_url):
@@ -242,24 +245,24 @@ def check_redis() -> bool:
     print(f"{yellow('[CHECK]')} Verifying Redis at {redis_url} ...")
 
     if _is_redis_alive(redis_url):
-        print(f"{green('[OK]')}    Redis is ready ✓\n")
+        print(f"{green('[OK]')}    Redis is ready\n")
         return True
 
-    # Not running — try to start it
+    # Not running - try to start it
     if auto_start_redis(redis_url):
-        print(f"\n{green('[OK]')}    Redis connected after auto-start ✓\n")
+        print(f"\n{green('[OK]')}    Redis connected after auto-start\n")
         return True
 
-    # All strategies failed — print clear instructions
+    # All strategies failed - print clear instructions
     print(f"\n{red('[FAIL]')}  Could not auto-start Redis automatically.\n")
     print(f"  Manual options (choose one):\n")
-    print(f"  A) Docker Desktop  →  {bold('docker run -d -p 6379:6379 --name clipmind-redis redis:alpine')}")
-    print(f"  B) Chocolatey      →  {bold('choco install redis')}  then  {bold('redis-server')}")
-    print(f"  C) WSL2            →  {bold('wsl -u root -- service redis-server start')}")
+    print(f"  A) Docker Desktop  ->  {bold('docker run -d -p 6379:6379 --name clipmind-redis redis:alpine')}")
+    print(f"  B) Chocolatey      ->  {bold('choco install redis')}  then  {bold('redis-server')}")
+    print(f"  C) WSL2            ->  {bold('wsl -u root -- service redis-server start')}")
     print(f"\n  Verify with:  {bold('redis-cli ping')}  (expected: PONG)\n")
     return False
 
-# ── Service Definitions ───────────────────────────────────────────────────────
+# -- Service Definitions -------------------------------------------------------
 
 SERVICES = {
     "api": {
@@ -312,7 +315,7 @@ SERVICES = {
     },
 }
 
-# ── Process Manager ───────────────────────────────────────────────────────────
+# -- Process Manager -----------------------------------------------------------
 
 processes: list[subprocess.Popen] = []
 stop_event = threading.Event()
@@ -352,7 +355,7 @@ def log_stream(proc: subprocess.Popen, label: str, color_fn):
                 fname = filepath.replace("\\", "/").split("/")[-1]
                 last_source_file = f"{fname}:{lineno}"
 
-            if any(k in lower for k in ["error", "traceback", "exception", "failed", "⨯"]):
+            if any(k in lower for k in ["error", "traceback", "exception", "failed", "x"]):
                 severity = "[ERROR]"
                 source_tag = f" ({last_source_file})" if last_source_file else ""
             elif "warn" in lower:
@@ -374,7 +377,7 @@ def start_service(key: str, svc: dict) -> subprocess.Popen | None:
 
     exe = cmd[0]
     if shutil.which(str(exe)) is None and not Path(str(exe)).exists():
-        print(f"{red('[SKIP]')} {label} — executable not found: {exe}")
+        print(f"{red('[SKIP]')} {label} - executable not found: {exe}")
         return None
 
     print(f"{color('[START]')} {bold(label)}")
@@ -420,13 +423,13 @@ def load_env():
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
             key, _, val = line.partition("=")
-            os.environ.setdefault(key.strip(), val.strip())
+            os.environ[key.strip()] = val.strip()
 
 
 def check_frontend_deps():
     node_modules = WEB_DIR / "node_modules"
     if not node_modules.exists():
-        print(f"{yellow('[SETUP]')} node_modules missing — running npm install...")
+        print(f"{yellow('[SETUP]')} node_modules missing - running npm install...")
         result = subprocess.run(
             ["npm.cmd" if IS_WINDOWS else "npm", "install"],
             cwd=str(WEB_DIR),
@@ -457,7 +460,7 @@ def shutdown(sig=None, frame=None):
         pass
     sys.exit(0)
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# -- Main ----------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="ClipMind Dev Launcher")
@@ -471,14 +474,14 @@ def main():
     if not IS_WINDOWS:
         signal.signal(signal.SIGTERM, shutdown)
 
-    print(bold("\n╔══════════════════════════════════════╗"))
-    print(bold("║       ClipMind Dev Launcher          ║"))
-    print(bold("╚══════════════════════════════════════╝\n"))
+    print("\n" + "="*40)
+    print("       ClipMind Dev Launcher")
+    print("="*40 + "\n")
 
     load_env()
     check_env()
 
-    # ── Determine which services to run ──────────────────────────────────────
+    # -- Determine which services to run --------------------------------------
     run_keys: list[str] = []
 
     if args.frontend:
@@ -495,13 +498,13 @@ def main():
             run_keys.append("beat")
         run_keys.append("web")
 
-    # ── Redis: check + auto-start BEFORE workers launch ──────────────────────
+    # -- Redis: check + auto-start BEFORE workers launch ----------------------
     if ("worker" in run_keys or "beat" in run_keys) and not args.frontend:
         if not check_redis():
             print(f"{yellow('[WARN]')}  Skipping worker + beat (Redis unavailable).\n")
             run_keys = [k for k in run_keys if k not in {"worker", "beat"}]
 
-    # ── Frontend deps ─────────────────────────────────────────────────────────
+    # -- Frontend deps ---------------------------------------------------------
     if "web" in run_keys:
         if not check_frontend_deps():
             run_keys.remove("web")
@@ -512,7 +515,7 @@ def main():
 
     print(f"\n{bold('Starting:')} {', '.join(SERVICES[k]['label'] for k in run_keys)}\n")
 
-    # ── Launch services with staggered startup ────────────────────────────────
+    # -- Launch services with staggered startup --------------------------------
     started: list[tuple[str, subprocess.Popen]] = []
     for i, key in enumerate(run_keys):
         proc = start_service(key, SERVICES[key])
@@ -531,7 +534,7 @@ def main():
     print(f"  {bold('Web:')}     http://localhost:3000\n")
     print(f"{green(bold('>>> CLIPMIND IS READY <<<'))}\n")
 
-    # ── Monitor & auto-restart crashed services ───────────────────────────────
+    # -- Monitor & auto-restart crashed services -------------------------------
     while True:
         time.sleep(2)
         for key, proc in list(started):

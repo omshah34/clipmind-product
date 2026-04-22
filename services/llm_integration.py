@@ -313,3 +313,97 @@ Only include keys for platforms in the target list above.
 def is_llm_available() -> bool:
     """Check if LLM is configured and available."""
     return llm_client is not None and OPENAI_API_KEY != ""
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=5),
+    reraise=True,
+)
+def generate_hook_variants(job_id: str, clip_index: int) -> list[dict]:
+    """
+    Analyzes the transcript segment for a clip and returns 3 distinct start-time variations (Hooks).
+    """
+    try:
+        from services.caption_renderer import flatten_words
+        
+        job = get_job(job_id)
+        if not job or not job.clips_json or clip_index >= len(job.clips_json):
+            raise ValueError(f"Job/Clip not found or invalid.")
+        
+        # Handle dict or model
+        clip = job.clips_json[clip_index]
+        if hasattr(clip, "model_dump"):
+            clip = clip.model_dump()
+        elif hasattr(clip, "dict"):
+            clip = clip.dict()
+            
+        start_time = float(clip.get("start_time", 0))
+        
+        if not llm_client or not getattr(job, "transcript_json", None):
+            return [
+                {"variant": "A", "start_time": start_time, "description": "Original start", "hook_text": "Original Hook"},
+                {"variant": "B", "start_time": start_time + 1.0, "description": "Delayed +1s", "hook_text": "Alternate Hook 1"},
+                {"variant": "C", "start_time": start_time + 2.0, "description": "Delayed +2s", "hook_text": "Alternate Hook 2"}
+            ]
+            
+        words = flatten_words(job.transcript_json)
+        
+        context_start = max(0.0, start_time - 5.0)
+        context_end = start_time + 5.0
+        
+        context_words = [w for w in words if context_start <= float(w["start"]) <= context_end]
+        if not context_words:
+            raise ValueError("No transcript words found around the start time.")
+            
+        transcript_text = " ".join([f"[{w['start']:.2f}] {w['word']}" for w in context_words])
+        
+        prompt = f"""You are an elite YouTube Shorts editor.
+We have a clip that originally starts at timestamp {start_time:.2f}.
+Here is the transcript around that start time (format: [timestamp] word):
+
+{transcript_text}
+
+Identify 3 distinct high-energy, scroll-stopping starting words/timestamps ("Hooks") from this context window.
+For example, instead of starting on an 'Umm' or a quiet breath, start directly on an action verb, a controversial statement, or an engaging question.
+Return exactly 3 Hooks.
+
+Return ONLY valid JSON with this structure:
+{{
+  "hooks": [
+    {{
+      "variant": "A",
+      "start_time": 12.34,
+      "description": "Starts directly on the controversial claim.",
+      "hook_text": "The biggest lie in tech..."
+    }}
+  ]
+}}
+"""
+        response = llm_client.chat.completions.create(
+            model=settings.clip_detector_model,
+            messages=[
+                {"role": "system", "content": "You optimize short-form video hooks for retention."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.7,
+            max_tokens=500,
+            response_format={"type": "json_object"}
+        )
+        
+        result = json.loads(response.choices[0].message.content.strip())
+        return result.get("hooks", [])
+        
+    except Exception as e:
+        print(f"Error generating hook variants for job {job_id}: {e}")
+        # Always safe to fallback
+        # Get start time again carefully since we are in `except` block and locals might be unbound if it crashed early
+        st = 0.0
+        try:
+            st = float(job.clips_json[clip_index].get("start_time", 0)) if 'job' in locals() else 0.0
+        except:
+            pass
+        return [
+            {"variant": "A", "start_time": st, "description": "Original start", "hook_text": "Original Hook"},
+            {"variant": "B", "start_time": st + 1.0, "description": "Delayed start", "hook_text": "Variant B"},
+            {"variant": "C", "start_time": st + 2.0, "description": "Delayed start", "hook_text": "Variant C"}
+        ]

@@ -155,6 +155,58 @@ class ExportEngine:
 </fcpxml>"""
         return xml
 
+    def generate_capcut_bridge_zip(self, job_id: str, clip_index: int) -> Path:
+        """
+        Feature 1: The 'CapCut Bridge'.
+        Creates a ZIP containing the raw trimmed video (no burned-in subtitles)
+        and a perfectly timed .srt file for off-platform editing.
+        """
+        import zipfile
+        from services.video_processor import cut_clip
+        from services.caption_renderer import write_clip_srt
+
+        job = get_job(job_id)
+        if not job or not job.clips_json or clip_index >= len(job.clips_json):
+            raise ValueError("Job or clip not found")
+
+        # Handle both Pydantic models and dicts
+        clip = job.clips_json[clip_index]
+        if hasattr(clip, "model_dump"):
+            clip = clip.model_dump()
+        elif hasattr(clip, "dict"):
+            clip = clip.dict()
+
+        source_name = Path(job.source_video_url).name
+        local_source = Path(settings.local_storage_dir) / "sources" / source_name
+
+        if not local_source.exists():
+            raise FileNotFoundError(f"Source video not found locally: {local_source}")
+
+        start_time = float(clip.get("start_time", 0))
+        end_time = float(clip.get("end_time", 0))
+
+        export_dir = Path(settings.local_storage_dir) / "exports" / f"capcut_bridge_{job_id}_{clip_index}"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        
+        raw_clip_path = export_dir / f"clip_{clip_index}_raw.mp4"
+        srt_path = export_dir / f"clip_{clip_index}.srt"
+        zip_path = export_dir.parent / f"clipmind_capcut_{job_id}_{clip_index}.zip"
+
+        # 1. Cut the raw clip
+        cut_clip(local_source, start_time, end_time, raw_clip_path, validate_duration=False)
+
+        # 2. Generate SRT
+        if job.transcript_json:
+            write_clip_srt(job.transcript_json, start_time, end_time, srt_path)
+
+        # 3. Zip them together
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            zipf.write(raw_clip_path, raw_clip_path.name)
+            if srt_path.exists():
+                zipf.write(srt_path, srt_path.name)
+
+        return zip_path
+
     async def generate_social_pulse(self, clip_data: dict) -> dict:
         """
         AI-driven viral caption and hashtag suggestions based on 'Social Pulse'.

@@ -43,9 +43,9 @@ class ClipSummary(BaseModel):
 class JobRecord(BaseModel):
     """Full DB row shape. Used internally in workers and services."""
 
-    id: uuid.UUID
-    user_id: Optional[uuid.UUID] = None
-    brand_kit_id: Optional[uuid.UUID] = None
+    id: str
+    user_id: Optional[str] = None
+    brand_kit_id: Optional[str] = None
     status: str
     source_video_url: str
     audio_url: Optional[str] = None
@@ -83,7 +83,7 @@ class JobRecord(BaseModel):
 class UploadResponse(BaseModel):
     """Response shape for POST /upload."""
 
-    job_id: uuid.UUID
+    job_id: str
     status: str
     created_at: datetime
 
@@ -98,7 +98,7 @@ class DirectUploadInitRequest(BaseModel):
 
 
 class DirectUploadInitResponse(BaseModel):
-    job_id: uuid.UUID
+    job_id: str
     status: str
     created_at: datetime
     upload_url: str
@@ -106,18 +106,18 @@ class DirectUploadInitResponse(BaseModel):
 
 
 class DirectUploadCompleteRequest(BaseModel):
-    job_id: uuid.UUID
+    job_id: str
 
 
 class DirectUploadFailRequest(BaseModel):
-    job_id: uuid.UUID
+    job_id: str
     message: str
 
 
 class JobStatusResponse(BaseModel):
     """Response shape for GET /jobs/{job_id}/status."""
 
-    job_id: uuid.UUID
+    job_id: str
     status: str
     failed_stage: Optional[str] = None
     error_message: Optional[str] = None
@@ -127,7 +127,7 @@ class JobStatusResponse(BaseModel):
 class JobClipsResponse(BaseModel):
     """Response shape for GET /jobs/{job_id}/clips."""
 
-    job_id: uuid.UUID
+    job_id: str
     clips: List[ClipResult]
 
 

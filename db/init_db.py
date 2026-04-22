@@ -599,8 +599,14 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
 # fmt: on
 
 def init_db_tables(engine) -> None:
-    """Execute all CREATE TABLE IF NOT EXISTS statements for PostgreSQL.
+    """Execute all CREATE TABLE IF NOT EXISTS statements.
+    Automatically detects if we are using PostgreSQL or SQLite.
     """
+    if engine.dialect.name == "sqlite":
+        from db.init_sqlite import init_sqlite_tables
+        init_sqlite_tables(engine)
+        return
+
     logger.info("Initializing PostgreSQL tables...")
     with engine.begin() as conn:
         conn.execute(text(_POSTGRES_SCHEMA))

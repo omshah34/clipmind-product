@@ -23,14 +23,11 @@ logger = logging.getLogger(__name__)
 db_url = settings.database_url
 
 if not db_url:
-    # Maintain original verbose warning logic
-    logger.warning(
-        "DATABASE_URL not configured. Attempting to use local PostgreSQL default. "
-        "Set DATABASE_URL in .env for production."
-    )
-    # Default fallback to localhost for development
-    db_url = "postgresql://clipmind:your_secure_password@localhost:5432/clipmind"
+    logger.warning("DATABASE_URL not configured. Defaulting to local SQLite.")
+    db_url = "sqlite:///clipmind_dev.db"
 
+# Debug log to catch unexpected Postgres URLs
+print(f"DEBUG: Using database URL: {db_url}")
 logger.info(f"Connecting to database via SQLAlchemy...")
 
 # Production-tuned Engine for PostgreSQL

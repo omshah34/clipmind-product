@@ -13,6 +13,9 @@ import {
   regenerateClips,
   getRegenerations,
   downloadClip,
+  getHookVariants,
+  downloadCapcutBridge,
+  adjustClipBoundary,
   type ClipPreviewData,
   type RegenerationResult,
 } from '@/lib/api';
@@ -147,6 +150,23 @@ function ClipCard({
     } catch {
       setDownloading(false);
       setDlError('Download failed — try again');
+    }
+  }
+
+  const [exportingCapcut, setExportingCapcut] = useState(false);
+  async function handleCapcutBridge(e: React.MouseEvent) {
+    e.stopPropagation();
+    try {
+      await downloadCapcutBridge(
+        jobId,
+        clipIndex,
+        `clipmind-capcut-assets-${clipNum}.zip`,
+        () => setExportingCapcut(true),
+        () => setExportingCapcut(false),
+      );
+    } catch {
+      setExportingCapcut(false);
+      setDlError('CapCut export failed — try again');
     }
   }
 
@@ -312,6 +332,27 @@ function ClipCard({
           >
             {isSelected ? '✓ Selected' : 'View Score'}
           </button>
+          
+          <button
+            onClick={handleCapcutBridge}
+            disabled={exportingCapcut}
+            title="Download Raw MP4 + synced SRT for CapCut/Premiere"
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 7,
+              padding: '8px 14px',
+              background: 'transparent',
+              border: `1px solid ${T.faint}`,
+              borderRadius: 8,
+              color: T.muted,
+              fontSize: 12, fontWeight: 500,
+              cursor: exportingCapcut ? 'not-allowed' : 'pointer',
+              transition: 'all 0.15s',
+            }}
+            onMouseEnter={(e) => { if(!exportingCapcut) (e.currentTarget as HTMLButtonElement).style.borderColor = T.purple; (e.currentTarget as HTMLButtonElement).style.color = T.purple; }}
+            onMouseLeave={(e) => { if(!exportingCapcut) (e.currentTarget as HTMLButtonElement).style.borderColor = T.faint; (e.currentTarget as HTMLButtonElement).style.color = T.muted; }}
+          >
+            {exportingCapcut ? 'Zipping...' : 'CapCut Bridge'}
+          </button>
         </div>
 
         {/* Download error */}
@@ -343,7 +384,61 @@ export default function ClipTimelineEditor({ jobId, userId }: ClipTimelineEditor
     virality_score: 0.2,
   });
 
+  const [isDragging, setIsDragging] = useState(false);
+  const [dragStartIdx, setDragStartIdx] = useState<number | null>(null);
+  const [dragEndIdx, setDragEndIdx] = useState<number | null>(null);
+
+  const [hookVariants, setHookVariants] = useState<Array<{ start_time: number; label: string; logic: string }>>([]);
+  const [loadingHooks, setLoadingHooks] = useState(false);
+
   useEffect(() => { loadData(); }, [jobId]);
+
+  useEffect(() => {
+    if (preview && preview.current_clips.length > 0) {
+      loadHookVariants(selectedIdx);
+    }
+  }, [selectedIdx, preview]);
+
+  async function loadHookVariants(idx: number) {
+    if (!preview) return;
+    try {
+      setLoadingHooks(true);
+      const data = await getHookVariants(jobId, idx);
+      setHookVariants(data.variants);
+    } catch (err) {
+      console.error('Failed to load hook variants', err);
+    } finally {
+      setLoadingHooks(false);
+    }
+  }
+
+  async function handleSelectHook(startTime: number) {
+    if (!preview) return;
+    const nextClips = [...preview.current_clips];
+    nextClips[selectedIdx] = { ...nextClips[selectedIdx], start_time: startTime };
+    setPreview({ ...preview, current_clips: nextClips });
+    // Note: This only updates UI locally. Boundary adjustment API will persist later if handle moved.
+  }
+
+  // Debouncing for transcript adjustment (Feature 3)
+  useEffect(() => {
+    if (!preview || !preview.current_clips[selectedIdx]) return;
+    const clip = preview.current_clips[selectedIdx];
+    
+    // Check if bounds actually changed from original (simple check)
+    // We fetch original bounds from the API in a real app, 
+    // but here we just debounce the local state changes.
+    const timer = setTimeout(async () => {
+      try {
+        await adjustClipBoundary(jobId, userId, selectedIdx, clip.start_time, clip.end_time);
+        console.log('Boundary adjusted & re-render queued');
+      } catch (err) {
+        console.error('Debounced adjustment failed', err);
+      }
+    }, 500);
+
+    return () => clearTimeout(timer);
+  }, [preview?.current_clips[selectedIdx]?.start_time, preview?.current_clips[selectedIdx]?.end_time]);
 
   async function loadData() {
     try {
@@ -496,6 +591,56 @@ export default function ClipTimelineEditor({ jobId, userId }: ClipTimelineEditor
 
         {/* RIGHT: Sidebar */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16, position: 'sticky', top: 20 }}>
+
+          {/* Hook A/B Variants */}
+          {selectedClip && (
+            <div style={{
+              background: T.card, border: `1px solid ${T.border}`,
+              borderRadius: 14, padding: 20,
+            }}>
+              <h3 style={{ fontSize: 11, fontWeight: 700, color: T.muted, letterSpacing: '0.1em', margin: '0 0 12px 0' }}>
+                HOOK A/B TESTING (AI)
+              </h3>
+              
+              {loadingHooks ? (
+                <div style={{ padding: '12px 0', textAlign: 'center', color: T.faint, fontSize: 12 }}>
+                  Analyzing alternative hooks...
+                </div>
+              ) : hookVariants.length === 0 ? (
+                <div style={{ fontSize: 12, color: T.muted }}>No alternative hooks found for this segment.</div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  {hookVariants.map((v, i) => {
+                    const isActive = Math.abs(selectedClip.start_time - v.start_time) < 0.1;
+                    return (
+                      <button
+                        key={i}
+                        onClick={() => handleSelectHook(v.start_time)}
+                        style={{
+                          textAlign: 'left', padding: '10px 12px', borderRadius: 8,
+                          background: isActive ? T.accentDim : '#0d0e14',
+                          border: `1px solid ${isActive ? T.accentBdr : T.faint}`,
+                          cursor: 'pointer', transition: 'all 0.15s',
+                        }}
+                      >
+                        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                          <span style={{ fontSize: 12, fontWeight: 700, color: isActive ? T.accent : T.text }}>
+                            Hook {String.fromCharCode(65 + i)}
+                          </span>
+                          <span style={{ fontSize: 11, fontFamily: 'monospace', color: T.muted }}>
+                            T+{v.start_time.toFixed(1)}s
+                          </span>
+                        </div>
+                        <div style={{ fontSize: 11, color: T.muted, lineHeight: 1.4 }}>
+                          {v.logic}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Score breakdown */}
           {selectedClip && (
@@ -726,31 +871,80 @@ export default function ClipTimelineEditor({ jobId, userId }: ClipTimelineEditor
         </button>
 
         {showTranscript && (
-          <div style={{
-            background: T.card, border: `1px solid ${T.border}`, borderRadius: '0 0 12px 12px',
-            borderTop: 'none', padding: 20, marginTop: -1,
-            maxHeight: 260, overflowY: 'auto',
-            lineHeight: 1.9, fontSize: 14,
-          }}>
+          <div 
+            onMouseLeave={() => {
+              if (isDragging) setIsDragging(false);
+            }}
+            style={{
+              background: T.card, border: `1px solid ${T.border}`, borderRadius: '0 0 12px 12px',
+              borderTop: 'none', padding: 20, marginTop: -1,
+              maxHeight: 260, overflowY: 'auto',
+              lineHeight: 1.9, fontSize: 14,
+              userSelect: 'none', // Prevent text selection during drag
+            }}
+          >
             {preview.transcript_words.length === 0 ? (
               <p style={{ color: T.muted, fontSize: 13 }}>No transcript available.</p>
             ) : (
               preview.transcript_words.map((w, i) => {
-                const inSelected = selectedClip
+                let inSelected = selectedClip
                   && w.start >= selectedClip.start_time
                   && w.end <= selectedClip.end_time;
+                
+                // If dragging, override visual selection to show pending drag
+                if (isDragging && dragStartIdx !== null && dragEndIdx !== null) {
+                  const min = Math.min(dragStartIdx, dragEndIdx);
+                  const max = Math.max(dragStartIdx, dragEndIdx);
+                  inSelected = i >= min && i <= max;
+                }
+
                 const inAny = clips.some((c) => w.start >= c.start_time && w.end <= c.end_time);
+                
+                const isStart = selectedClip && Math.abs(w.start - selectedClip.start_time) < 0.2;
+                const isEnd = selectedClip && Math.abs(w.end - selectedClip.end_time) < 0.2;
+
                 return (
                   <span
                     key={i}
+                    onMouseDown={(e) => {
+                      if (!preview || !selectedClip) return;
+                      setIsDragging(true);
+                      setDragStartIdx(i);
+                      setDragEndIdx(i);
+                    }}
+                    onMouseEnter={() => {
+                      if (isDragging) {
+                        setDragEndIdx(i);
+                      }
+                    }}
+                    onMouseUp={() => {
+                      if (isDragging && dragStartIdx !== null) {
+                        const nextClips = [...preview.current_clips];
+                        const clip = nextClips[selectedIdx];
+                        
+                        const min = Math.min(dragStartIdx, i);
+                        const max = Math.max(dragStartIdx, i);
+                        
+                        clip.start_time = preview.transcript_words[min].start;
+                        clip.end_time = preview.transcript_words[max].end;
+                        
+                        setPreview({ ...preview, current_clips: nextClips });
+                        setIsDragging(false);
+                        setDragStartIdx(null);
+                        setDragEndIdx(null);
+                      }
+                    }}
                     title={`${fmt(w.start)}s – ${fmt((w as any).end ?? w.start)}s`}
                     style={{
                       display: 'inline-block', margin: '2px 2px',
                       padding: '1px 4px', borderRadius: 3,
+                      cursor: 'pointer',
                       background: inSelected ? T.accentDim : inAny ? 'rgba(0,201,167,0.07)' : 'transparent',
                       color: inSelected ? T.accent : inAny ? '#5ecfbb' : T.muted,
                       fontWeight: inSelected ? 600 : 400,
-                      transition: 'background 0.1s',
+                      borderLeft: isStart && !isDragging ? `2px solid ${T.accent}` : 'none',
+                      borderRight: isEnd && !isDragging ? `2px solid ${T.accent}` : 'none',
+                      transition: 'background 0.1s, border 0.1s',
                     }}
                   >
                     {w.word}

@@ -359,6 +359,75 @@ export async function regenerateClips(
   return readResponse<RegenerateResponse>(response);
 }
 
+export async function getHookVariants(
+  jobId: string,
+  clipIndex: number
+): Promise<{ variants: Array<{ start_time: number; label: string; logic: string }> }> {
+  const response = await fetch(`${API_BASE_URL}/jobs/${jobId}/clips/${clipIndex}/hooks`, {
+    cache: "no-store",
+  });
+  return readResponse<{ variants: Array<{ start_time: number; label: string; logic: string }> }>(response);
+}
+
+export async function approveClip(
+  jobId: string,
+  clipIndex: number,
+  userId: string
+): Promise<{ status: string; message: string }> {
+  const response = await fetch(`${API_BASE_URL}/jobs/${jobId}/clips/${clipIndex}/approve`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${userId}`,
+    },
+  });
+  return readResponse<{ status: string; message: string }>(response);
+}
+
+export async function discardClip(
+  jobId: string,
+  clipIndex: number,
+  userId: string
+): Promise<{ status: string; message: string }> {
+  const response = await fetch(`${API_BASE_URL}/jobs/${jobId}/clips/${clipIndex}/discard`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${userId}`,
+    },
+  });
+  return readResponse<{ status: string; message: string }>(response);
+}
+
+export async function downloadCapcutBridge(
+  jobId: string,
+  clipIndex: number,
+  filename: string,
+  onStart?: () => void,
+  onDone?: () => void,
+): Promise<void> {
+  onStart?.();
+  try {
+    const url = `${API_BASE_URL}/jobs/${jobId}/clips/${clipIndex}/capcut-bridge`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`CapCut Export failed: ${res.status}`);
+
+    const blob = await res.blob();
+    const objectUrl = URL.createObjectURL(blob);
+
+    const anchor = document.createElement("a");
+    anchor.href = objectUrl;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 10_000);
+  } finally {
+    onDone?.();
+  }
+}
+
 export async function adjustClipBoundary(
   jobId: string,
   userId: string,

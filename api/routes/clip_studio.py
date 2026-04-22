@@ -1,11 +1,10 @@
-"""File: api/routes/clip_studio.py
-Purpose: Clip Studio endpoints for timeline editing, regeneration, and preview.
-         - GET  /jobs/{id}/preview                     — Lightweight metadata
-         - GET  /jobs/{id}/clips/{index}/stream        — Stream video (range-aware)
-         - GET  /jobs/{id}/clips/{index}/download      — Force-download video
-         - POST /jobs/{id}/regenerate                  — Re-run detection with custom weights
-         - PATCH /jobs/{id}/clips/{index}/adjust       — Adjust clip boundaries
-"""
+# File: api/routes/clip_studio.py
+# Purpose: Clip Studio endpoints for timeline editing, regeneration, and preview.
+#          - GET  /jobs/{id}/preview                     : Lightweight metadata
+#          - GET  /jobs/{id}/clips/{index}/stream        : Stream video (range-aware)
+#          - GET  /jobs/{id}/clips/{index}/download      : Force-download video
+#          - POST /jobs/{id}/regenerate                  : Re-run detection with custom weights
+#          - PATCH /jobs/{id}/clips/{index}/adjust       : Adjust clip boundaries
 
 from __future__ import annotations
 
@@ -17,7 +16,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query, Request, Depends
+from fastapi import APIRouter, HTTPException, Query, Request, Depends, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse
 from api.dependencies import get_current_user, AuthenticatedUser
 
@@ -44,13 +43,11 @@ from workers.regenerate_clips import regenerate_clips_task
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/jobs", tags=["clip-studio"])
 
-
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def error_response(error: str, message: str, status_code: int) -> JSONResponse:
     payload = ErrorResponse(error=error, message=message)
     return JSONResponse(status_code=status_code, content=payload.model_dump())
-
 
 def _resolve_clip_url(raw_url: str | None) -> str | None:
     """Convert stored clip_url (S3 URI / local path / HTTP URL) to a
@@ -82,7 +79,7 @@ def _resolve_clip_url(raw_url: str | None) -> str | None:
     return None
 
 
-def _get_clip_record(job_id: UUID, clip_index: int):
+def _get_clip_record(job_id: str, clip_index: int):
     """Return the raw clip record or raise 404."""
     job = get_job(job_id)
     if not job or not job.clips_json:
@@ -98,7 +95,7 @@ def _get_clip_record(job_id: UUID, clip_index: int):
 # ── Stream / Download ─────────────────────────────────────────────────────────
 
 @router.get("/{job_id}/clips/{clip_index}/stream")
-async def stream_clip(job_id: UUID, clip_index: int, request: Request):
+async def stream_clip(job_id: str, clip_index: int, request: Request):
     """Stream a clip video with HTTP range support so the browser
     can seek and the <video> element works correctly.
 
@@ -244,7 +241,7 @@ async def stream_clip(job_id: UUID, clip_index: int, request: Request):
 
 @router.get("/{job_id}/clips/{clip_index}/download")
 async def download_clip(
-    job_id: UUID, 
+    job_id: str, 
     clip_index: int, 
     request: Request,
     user: AuthenticatedUser = Depends(get_current_user)
@@ -273,7 +270,7 @@ async def download_clip(
 # ── Preview ───────────────────────────────────────────────────────────────────
 
 @router.get("/{job_id}/preview", status_code=200)
-def get_job_preview(job_id: UUID) -> ClipPreviewData:
+def get_job_preview(job_id: str) -> ClipPreviewData:
     """Get lightweight preview data for timeline editor (no FFmpeg render).
 
     clip_url in the response always points to the /stream API endpoint so
@@ -344,7 +341,7 @@ def get_job_preview(job_id: UUID) -> ClipPreviewData:
 
 @router.post("/{job_id}/regenerate", status_code=202)
 def regenerate_clips(
-    job_id: UUID,
+    job_id: str,
     payload: RegenerationRequest = RegenerationRequest(),
     user: AuthenticatedUser = Depends(get_current_user)
 ) -> RegenerateClipsResponse:
@@ -407,12 +404,13 @@ def regenerate_clips(
 
 @router.patch("/{job_id}/clips/{clip_index}/adjust", status_code=200)
 def adjust_clip_boundary(
-    job_id: UUID,
+    job_id: str,
     clip_index: int,
     payload: AdjustClipBoundaryRequest,
+    background_tasks: BackgroundTasks,
     user: AuthenticatedUser = Depends(get_current_user)
 ) -> AdjustClipBoundaryResponse:
-    """Adjust a clip's start/end times."""
+    """Adjust a clip's start/end times based on the Context-Bound Transcript Handle UI."""
     job = get_job(job_id)
     if not job or not job.clips_json:
         return error_response("job_not_found", "Job or clips not found", 404)
@@ -435,21 +433,68 @@ def adjust_clip_boundary(
     logger.info(
         "[job=%s] Clip %d adjustment: %.1fs-%.1fs → %.1fs-%.1fs",
         job_id, clip_index,
-        old_clip.start_time, old_clip.end_time,
+        getattr(old_clip, 'start_time', 0), getattr(old_clip, 'end_time', 0),
         payload.new_start, payload.new_end,
     )
 
+    # 1. Update the actual clips_json so it saves immediately
+    clips = [c.model_dump() if hasattr(c, "model_dump") else dict(c) for c in job.clips_json]
+    clips[clip_index]["start_time"] = payload.new_start
+    clips[clip_index]["end_time"] = payload.new_end
+    clips[clip_index]["duration"] = duration
+    update_job(job_id, clips_json=clips)
+
+    # 2. Update timeline logging
     timeline = get_job_timeline(job_id) or {"clips": [], "regeneration_results": []}
     timeline.setdefault("clips", []).append({
         "index": clip_index,
-        "original_start": old_clip.start_time,
-        "original_end": old_clip.end_time,
+        "original_start": getattr(old_clip, 'start_time', 0),
+        "original_end": getattr(old_clip, 'end_time', 0),
         "user_start": payload.new_start,
         "user_end": payload.new_end,
     })
     update_job_timeline(job_id, timeline)
 
     # TODO: queue actual re-render task and return real URL
+
+    # 3. Background fast re-render for dev phase
+    def _dev_re_render():
+        try:
+            from services.caption_renderer import write_clip_srt
+            from core.config import settings
+            import tempfile
+            from pathlib import Path
+            
+            latest_job = get_job(job_id)
+            source_name = Path(latest_job.source_video_url).name
+            local_source = Path(settings.local_storage_dir) / "sources" / source_name
+            
+            if local_source.exists() and getattr(latest_job, "transcript_json", None):
+                export_dir = Path(settings.local_storage_dir) / "exports" / f"adj_{job_id}_{clip_index}"
+                export_dir.mkdir(parents=True, exist_ok=True)
+                srt_path = export_dir / "temp.srt"
+                
+                write_clip_srt(latest_job.transcript_json, payload.new_start, payload.new_end, srt_path)
+                
+                with open(srt_path, "r", encoding="utf-8") as f:
+                    srt_data = f.read()
+                    
+                from workers.render_clips import render_edited_clip
+                try:
+                    # Sync call for dev locally
+                    render_edited_clip(
+                        render_job_id=str(job_id), 
+                        job_id=str(job_id), 
+                        clip_index=clip_index, 
+                        edited_srt=srt_data
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.error(f"Dev auto-render failed: {e}")
+
+    background_tasks.add_task(_dev_re_render)
+
     new_clip_url = f"/api/v1/jobs/{job_id}/clips/{clip_index}/stream"
 
     # ── Content DNA Signal ───────────────────────────────────────────────
@@ -475,7 +520,7 @@ def adjust_clip_boundary(
 
 @router.get("/{job_id}/regenerations", status_code=200)
 def get_regenerations(
-    job_id: UUID,
+    job_id: str,
     limit: int = Query(10, ge=1, le=50),
 ) -> JSONResponse:
     """Get list of past regeneration requests for a job."""
@@ -489,3 +534,45 @@ def get_regenerations(
 
     regenerations = timeline.get("regeneration_results", [])[:limit]
     return JSONResponse(status_code=200, content={"regenerations": regenerations})
+
+@router.post("/{job_id}/clips/{clip_index}/approve", status_code=200)
+def approve_clip(
+    job_id: str, 
+    clip_index: int, 
+    user: AuthenticatedUser = Depends(get_current_user)
+):
+    """(Feature 5) Approve a clip from the Swipe-to-Approve PWA, queuing it for final export."""
+    job = get_job(job_id)
+    if not job or not job.clips_json:
+        return error_response("job_not_found", "Job not found", 404)
+        
+    clips = [c.model_dump() if hasattr(c, "model_dump") else dict(c) for c in job.clips_json]
+    if clip_index < 0 or clip_index >= len(clips):
+        return error_response("invalid_clip", "Clip index out of range", 400)
+        
+    clips[clip_index]["user_status"] = "approved"
+    update_job(job_id, clips_json=clips)
+    
+    logger.info(f"Clip {clip_index} for job {job_id} APPROVED via PWA.")
+    return {"status": "success", "message": "Clip approved and queued for HD export."}
+
+@router.post("/{job_id}/clips/{clip_index}/discard", status_code=200)
+def discard_clip(
+    job_id: str, 
+    clip_index: int, 
+    user: AuthenticatedUser = Depends(get_current_user)
+):
+    """(Feature 5) Discard a clip from the Swipe-to-Approve PWA so it is hidden."""
+    job = get_job(job_id)
+    if not job or not job.clips_json:
+        return error_response("job_not_found", "Job not found", 404)
+        
+    clips = [c.model_dump() if hasattr(c, "model_dump") else dict(c) for c in job.clips_json]
+    if clip_index < 0 or clip_index >= len(clips):
+        return error_response("invalid_clip", "Clip index out of range", 400)
+        
+    clips[clip_index]["user_status"] = "discarded"
+    update_job(job_id, clips_json=clips)
+    
+    logger.info(f"Clip {clip_index} for job {job_id} DISCARDED via PWA.")
+    return {"status": "success", "message": "Clip discarded."}

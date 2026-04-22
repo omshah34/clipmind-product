@@ -82,6 +82,7 @@ _SQLITE_SCHEMA = textwrap.dedent("""\
         brand_kit_id            TEXT,
         campaign_id             TEXT,
         scheduled_publish_date  TIMESTAMP,
+        language                TEXT        DEFAULT 'en',
         is_rejected             INTEGER     NOT NULL DEFAULT 0,
         rejected_at             TIMESTAMP,
         completed_at            TIMESTAMP,

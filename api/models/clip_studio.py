@@ -71,7 +71,7 @@ class AdjustClipBoundaryResponse(BaseModel):
 class ClipPreviewData(BaseModel):
     """Lightweight preview data for timeline UI (no FFmpeg render)."""
     
-    job_id: UUID
+    job_id: str
     status: str = Field(description="Job status")
     transcript_words: list[dict] = Field(description="Transcript words with timestamps")
     current_clips: list[dict] = Field(description="Clip objects with all score fields")

@@ -47,7 +47,7 @@ def error_response(error: str, message: str, status_code: int) -> JSONResponse:
 
 
 @router.get("/{job_id}/status", response_model=JobStatusResponse, status_code=200)
-def get_job_status(job_id: UUID) -> JobStatusResponse:
+def get_job_status(job_id: str) -> JobStatusResponse:
     job = get_job(job_id)
     if job is None:
         return error_response("job_not_found", "No job found for the provided id.", 404)
@@ -62,7 +62,7 @@ def get_job_status(job_id: UUID) -> JobStatusResponse:
 
 
 @router.get("/{job_id}/clips", response_model=JobClipsResponse, status_code=200)
-def get_job_clips(job_id: UUID) -> JobClipsResponse:
+def get_job_clips(job_id: str) -> JobClipsResponse:
     job = get_job(job_id)
     if job is None:
         return error_response("job_not_found", "No job found for the provided id.", 404)
@@ -77,7 +77,7 @@ def get_job_clips(job_id: UUID) -> JobClipsResponse:
 
 
 @router.post("/{job_id}/reject", status_code=200)
-def reject_job(job_id: UUID) -> dict:
+def reject_job(job_id: str) -> dict:
     """Mark a job as rejected if within the 5-minute window after completion."""
     job = get_job(job_id)
     if job is None:

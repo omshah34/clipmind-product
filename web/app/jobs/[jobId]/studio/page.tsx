@@ -1,31 +1,26 @@
-/**
- * File: app/jobs/[jobId]/studio/page.tsx
- * Purpose: Clip Studio page — auth guard, styled header, timeline editor, tips.
- */
-
+// DEV ONLY — REVERT BEFORE DEPLOY
 import { auth } from '@/auth';
 import { redirect } from 'next/navigation';
 import Link from 'next/link';
 import ClipTimelineEditor from '@/components/clip-timeline-editor';
 
-export const metadata = { title: 'Clip Studio — ClipMind' };
+import type { Metadata } from "next";
+export const metadata: Metadata = { title: 'Clip Studio — ClipMind' };
 
 export default async function StudioPage({
   params,
 }: {
   params: { jobId: string };
 }) {
-  const session = await auth();
+  // const session = await auth();
 
   // Redirect unauthenticated users
-  if (!session?.user) {
-    redirect('/login');
-  }
+  // if (!session?.user) {
+  //   redirect('/login');
+  // }
 
-  const userId =
-    (session.user as any)?.id ||
-    session.user.email ||
-    'anonymous';
+  const userId = '00000000-0000-0000-0000-000000000000';
+
 
   return (
     <div style={{

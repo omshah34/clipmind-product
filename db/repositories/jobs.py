@@ -83,6 +83,7 @@ def create_job(
     brand_kit_id: UUID | str | None = None,
     estimated_cost_usd: float = 0.0,
     status: str = "uploaded",
+    language: str | None = "en",
 ) -> JobRecord:
     columns = [
         "status",
@@ -124,7 +125,7 @@ def create_job(
                 "estimated_cost_usd": estimated_cost_usd,
                 "user_id": str(user_id) if user_id else None,
                 "brand_kit_id": str(brand_kit_id) if brand_kit_id else None,
-                "language": "en",
+                "language": language or "en",
             },
         ).one()
     return _row_to_job_record(row)

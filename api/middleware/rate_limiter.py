@@ -62,13 +62,19 @@ class SlidingWindowRateLimiter(BaseHTTPMiddleware):
         # Initialize Redis client lazily
         self.redis = None
         self._lua_sha = None
+        self._lock = asyncio.Lock()
 
     async def get_redis(self):
         if not self.redis:
-            import redis.asyncio as redis
-            self.redis = redis.from_url(settings.redis_url)
-            # Register LUA script
-            self._lua_sha = await self.redis.script_load(LUA_SLIDING_WINDOW)
+            async with self._lock:
+                if not self.redis:
+                    import redis.asyncio as redis
+                    self.redis = redis.from_url(settings.redis_url)
+                    # Register LUA script
+                    sha = await self.redis.script_load(LUA_SLIDING_WINDOW)
+                    if not sha:
+                        raise ValueError("Failed to load rate limiter LUA script")
+                    self._lua_sha = sha
         return self.redis
 
     async def dispatch(
@@ -96,32 +102,36 @@ class SlidingWindowRateLimiter(BaseHTTPMiddleware):
 
         try:
             r = await self.get_redis()
+            if not self._lua_sha:
+                raise ValueError("Rate limiter LUA script SHA is missing")
+                
             # Execute atomic LUA script
-            # evalsha(sha, numkeys, *keys_and_args)
             result = await r.evalsha(self._lua_sha, 1, key, now_ms, self.window_ms, self.limit, self.ttl)
+            if result is None:
+                raise ValueError("Rate limiter LUA script returned None")
             count, allowed = result
-
-            if not allowed:
-                logger.warning(f"Rate limit exceeded for user {user_id} on {request.url.path}")
-                return JSONResponse(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    content={
-                        "detail": "Too many requests. Please try again later.",
-                        "limit": self.limit,
-                        "window_seconds": self.window_ms // 1000
-                    }
-                )
-
-            # 4. Success — proceed
-            response = await call_next(request)
-            
-            # Add headers for transparency
-            response.headers["X-RateLimit-Limit"] = str(self.limit)
-            response.headers["X-RateLimit-Remaining"] = str(max(0, self.limit - count))
-            return response
 
         except Exception as exc:
             # FAIL-OPEN Strategy: If Redis is down, allow the request but log the error.
             # Production visibility is key, but availability is paramount for a SaaS start.
             logger.error(f"Rate limiter failure (Fail-Open): {exc}")
             return await call_next(request)
+
+        if not allowed:
+            logger.warning(f"Rate limit exceeded for user {user_id} on {request.url.path}")
+            return JSONResponse(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                content={
+                    "detail": "Too many requests. Please try again later.",
+                    "limit": self.limit,
+                    "window_seconds": self.window_ms // 1000
+                }
+            )
+
+        # 4. Success — proceed
+        response = await call_next(request)
+        
+        # Add headers for transparency
+        response.headers["X-RateLimit-Limit"] = str(self.limit)
+        response.headers["X-RateLimit-Remaining"] = str(max(0, self.limit - count))
+        return response

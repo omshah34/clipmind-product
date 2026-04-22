@@ -4,7 +4,7 @@ Purpose: API endpoints for omnichannel content exports (LinkedIn, Newsletter).
 """
 
 import logging
-from typing import Optional
+from typing import Optional, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
 
@@ -135,6 +135,40 @@ async def export_sync_bridge(
         content=xml_content, 
         media_type=media_type,
         headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+@exports_router.get("/job/{job_id}/clip/{clip_index}/capcut-bridge")
+async def export_capcut_bridge(
+    job_id: str,
+    clip_index: int,
+    user: AuthenticatedUser = Depends(get_current_user)
+):
+    """
+    Download a ZIP file for the CapCut Bridge.
+    Contains the raw trimmed video and a perfectly timed .srt file.
+    """
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+        
+    if str(job.user_id) != str(user.user_id):
+        raise HTTPException(status_code=403, detail="Workspace access denied")
+
+    engine = get_export_engine()
+    try:
+        zip_path = engine.generate_capcut_bridge_zip(job_id, clip_index)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not zip_path.exists():
+        raise HTTPException(status_code=500, detail="Failed to generate CapCut Bridge ZIP")
+    
+    return Response(
+        content=zip_path.read_bytes(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={zip_path.name}"}
     )
 
 @exports_router.get("/job/{job_id}/social-pulse")
