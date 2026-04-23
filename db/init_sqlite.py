@@ -90,11 +90,11 @@ _SQLITE_SCHEMA = textwrap.dedent("""\
         updated_at              TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
 
-    CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
-    CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_jobs_user_id ON jobs(user_id);
-    CREATE INDEX IF NOT EXISTS idx_jobs_brand_kit_id ON jobs(brand_kit_id);
     CREATE INDEX IF NOT EXISTS idx_jobs_campaign_id ON jobs(campaign_id);
+
+    -- Gap 33: Unique constraints for job deduplication
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedupe_user ON jobs (user_id, source_video_url, prompt_version) WHERE user_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedupe_anon ON jobs (source_video_url, prompt_version) WHERE user_id IS NULL;
 
     -- ====================================================================
     -- 002  brand_kits
@@ -113,6 +113,7 @@ _SQLITE_SCHEMA = textwrap.dedent("""\
         watermark_url     TEXT,
         intro_clip_url    TEXT,
         outro_clip_url    TEXT,
+        vocabulary_hints  TEXT,      -- Gap 72: Stored as comma-separated or JSON in SQLite
         is_default        INTEGER    NOT NULL DEFAULT 0,
         created_at        TIMESTAMP  NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at        TIMESTAMP  NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -217,6 +218,11 @@ _SQLITE_SCHEMA = textwrap.dedent("""\
         clip_index                  INTEGER    NOT NULL,
         platform                    TEXT       NOT NULL,
         platform_clip_id            TEXT,
+        source_type                 TEXT       DEFAULT 'real',
+        ai_predicted_score          REAL,
+        performance_delta           REAL       DEFAULT 0.0,
+        milestone_tier              TEXT,
+        window_complete             INTEGER    DEFAULT 0, -- 0=False, 1=True
         views                       INTEGER    DEFAULT 0,
         likes                       INTEGER    DEFAULT 0,
         saves                       INTEGER    DEFAULT 0,
@@ -231,7 +237,8 @@ _SQLITE_SCHEMA = textwrap.dedent("""\
         published_date              TIMESTAMP,
         synced_at                   TIMESTAMP  DEFAULT CURRENT_TIMESTAMP,
         created_at                  TIMESTAMP  DEFAULT CURRENT_TIMESTAMP,
-        updated_at                  TIMESTAMP  DEFAULT CURRENT_TIMESTAMP
+        updated_at                  TIMESTAMP  DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE (user_id, job_id, clip_index, platform)
     );
 
     CREATE INDEX IF NOT EXISTS idx_clip_perf_user_id ON clip_performance(user_id);
@@ -240,17 +247,21 @@ _SQLITE_SCHEMA = textwrap.dedent("""\
     CREATE TABLE IF NOT EXISTS performance_alerts (
         id              TEXT       PRIMARY KEY DEFAULT (lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-4' || substr(hex(randomblob(2)),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(hex(randomblob(2)),2) || '-' || hex(randomblob(6)))),
         user_id         TEXT       NOT NULL,
-        clip_perf_id    TEXT       NOT NULL,
         alert_type      TEXT       NOT NULL,
         message         TEXT       NOT NULL,
-        metric_name     TEXT,
-        metric_value    REAL,
-        threshold       REAL,
         is_read         INTEGER    DEFAULT 0,
+        metadata_json   TEXT,
         created_at      TIMESTAMP  DEFAULT CURRENT_TIMESTAMP
     );
 
     CREATE INDEX IF NOT EXISTS idx_perf_alerts_user_id ON performance_alerts(user_id);
+
+    CREATE TABLE IF NOT EXISTS alert_cooldowns (
+        user_id         TEXT       NOT NULL,
+        alert_type      TEXT       NOT NULL,
+        last_alerted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (user_id, alert_type)
+    );
 
     CREATE TABLE IF NOT EXISTS platform_credentials (
         id                       TEXT       PRIMARY KEY DEFAULT (lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-4' || substr(hex(randomblob(2)),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(hex(randomblob(2)),2) || '-' || hex(randomblob(6)))),
@@ -263,6 +274,8 @@ _SQLITE_SCHEMA = textwrap.dedent("""\
         account_name             TEXT,
         scopes                   TEXT,
         synced_at                TIMESTAMP,
+        is_active                INTEGER    NOT NULL DEFAULT 1,
+        last_error               TEXT,
         created_at               TIMESTAMP  DEFAULT CURRENT_TIMESTAMP,
         updated_at               TIMESTAMP  DEFAULT CURRENT_TIMESTAMP,
         UNIQUE (user_id, platform)
@@ -288,10 +301,35 @@ _SQLITE_SCHEMA = textwrap.dedent("""\
     CREATE TABLE IF NOT EXISTS user_score_weights (
         user_id          TEXT       PRIMARY KEY,
         weights          TEXT       DEFAULT '{"hook_weight":1.0,"emotion_weight":1.0,"clarity_weight":1.0,"story_weight":1.0,"virality_weight":1.0}',
+        manual_overrides TEXT       DEFAULT '[]',
         signal_count     INTEGER    DEFAULT 0,
         confidence_score REAL       DEFAULT 0.0,
         last_updated     TIMESTAMP  DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS dna_learning_logs (
+        id               TEXT        PRIMARY KEY DEFAULT (lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-4' || substr(hex(randomblob(2)),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(hex(randomblob(2)),2) || '-' || hex(randomblob(6)))),
+        user_id          TEXT        NOT NULL,
+        log_type         TEXT        NOT NULL,
+        dimension        TEXT,
+        old_value        REAL,
+        new_value        REAL,
+        reasoning_code   TEXT,
+        sample_size      INTEGER     DEFAULT 0,
+        created_at       TIMESTAMP   DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_dna_learning_logs_user ON dna_learning_logs(user_id);
+
+    CREATE TABLE IF NOT EXISTS dna_executive_summaries (
+        id               TEXT        PRIMARY KEY DEFAULT (lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-4' || substr(hex(randomblob(2)),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(hex(randomblob(2)),2) || '-' || hex(randomblob(6)))),
+        user_id          TEXT        NOT NULL,
+        summary_text     TEXT        NOT NULL,
+        context_log_ids  TEXT        NOT NULL,
+        created_at       TIMESTAMP   DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_dna_executive_summaries_user ON dna_executive_summaries(user_id);
 
     CREATE TABLE IF NOT EXISTS clip_sequences (
         id                      TEXT       PRIMARY KEY DEFAULT (lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-4' || substr(hex(randomblob(2)),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(hex(randomblob(2)),2) || '-' || hex(randomblob(6)))),

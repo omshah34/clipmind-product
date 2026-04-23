@@ -3,9 +3,15 @@ Purpose: Test the ExecutiveSummarizer service and persistence.
 """
 import unittest
 import asyncio
-from unittest.mock import AsyncMock, patch
+import sys
+import os
+from unittest.mock import AsyncMock, patch, MagicMock
+
+# Add project root to path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from services.dna.executive_summarizer import ExecutiveSummarizer
-from db.queries import get_latest_executive_summary
+from db.repositories.content_dna import get_latest_executive_summary
 
 class TestExecutiveSummary(unittest.TestCase):
 
@@ -53,6 +59,5 @@ class TestExecutiveSummary(unittest.TestCase):
         result = loop.run_until_complete(self.summarizer.generate_summary(self.user_id))
         self.assertIsNone(result)
 
-from unittest.mock import MagicMock
 if __name__ == "__main__":
     unittest.main()

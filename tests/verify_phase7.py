@@ -17,7 +17,8 @@ from services.data_providers.encryption import SecretManager
 from services.data_providers.youtube_provider import YoutubeProvider, PlatformQuotaError
 from services.data_providers.tiktok_provider import TikTokProvider
 from services.performance_engine import PerformanceEngine
-from db.queries import save_platform_credentials, get_platform_credentials, engine
+from db.repositories.users import save_platform_credentials, get_platform_credentials
+from db.connection import engine
 from sqlalchemy import text
 
 def test_encryption():
@@ -94,16 +95,18 @@ def test_engine_revocation():
     with patch.object(engine_obj, "_get_provider_for_user", return_value=mock_provider):
         try:
             engine_obj.sync_clip_performance(
-                user_id=user_id, job_id="job_1", clip_index=0,
+                user_id=user_id, job_id=str(uuid4()), clip_index=0,
                 platform="youtube", platform_clip_id="vid_1",
-                predicted_score=0.5, provider=mock_provider
+                predicted_score=0.5,
+                provider=mock_provider
             )
         except Exception:
             pass
             
     creds = get_platform_credentials(user_id, "youtube")
     print(f"Connection Active: {creds['is_active']}")
-    assert creds["is_active"] is False
+    # SQLite returns 0 for False, PostgreSQL returns False
+    assert creds["is_active"] in [False, 0]
     assert "401" in creds["last_error"]
     print("OK: Engine handles revocation.")
 

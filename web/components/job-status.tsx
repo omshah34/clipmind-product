@@ -13,6 +13,7 @@ import Link from "next/link";
 import ClipList from "./clip-list";
 import LivePipeline from "./live-pipeline";
 import { getJobStatus, JobStatusResponse } from "../lib/api";
+import { Skeleton } from "./skeleton";
 
 const statusProgress: Record<string, number> = {
   uploading: 6,
@@ -109,16 +110,21 @@ export default function JobStatus({ jobId }: { jobId: string }) {
     return <div className="alert">{error}</div>;
   }
 
+  }
+
   // ── Loading state (first fetch not yet returned) ─────────────────────────
-  if (!data) {
+  if (!data && !error) {
     return (
-      <div className="stack">
+      <div className="stack" style={{ gap: 20 }}>
         <div className="status-strip">
-          <span>Loading status</span>
-          <span>Contacting backend…</span>
+          <Skeleton width="120px" height="18px" />
+          <Skeleton width="160px" height="18px" />
         </div>
-        <div className="progress" style={progressStyle(12)}>
-          <span />
+        <Skeleton width="100%" height="8px" borderRadius="999px" />
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-8">
+           <Skeleton width="100%" height="320px" borderRadius="28px" />
+           <Skeleton width="100%" height="320px" borderRadius="28px" />
+           <Skeleton width="100%" height="320px" borderRadius="28px" />
         </div>
       </div>
     );

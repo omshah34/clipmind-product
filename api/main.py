@@ -16,6 +16,26 @@ from fastapi import FastAPI, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from contextlib import asynccontextmanager
+
+# Gap 21: Prevent Log Destruction - Setup logging handled in setup_logging()
+# but we can add a marker here if needed.
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("ClipMind API starting up...")
+    yield
+    # Shutdown
+    logger.info("ClipMind API shutting down...")
+    # 3. Gap 104: Close Redis connection on shutdown
+    for middleware in app.user_middleware:
+        if hasattr(middleware, "options") and "cls" in middleware.options:
+            if middleware.options["cls"] == SlidingWindowRateLimiter:
+                # We need to find the actual instance. 
+                # Since BaseHTTPMiddleware wraps it, we store it on app.state during init
+                if hasattr(app.state, "rate_limiter"):
+                    await app.state.rate_limiter.close()
 try:
     import sentry_sdk
     from sentry_sdk.integrations.fastapi import FastApiIntegration
@@ -71,13 +91,52 @@ if os.getenv("SENTRY_DSN"):
 
 app = FastAPI(title="ClipMind API", version="0.1.0")
 
+# TODO: Fetch these dynamically before launch from:
+# Stripe: https://stripe.com/files/ips/ips_webhooks.json
+# Google: https://www.gstatic.com/ipranges/goog.json
+PLATFORM_WEBHOOK_CIDRS = [
+    # Stripe (Sample subset for dev)
+    "3.18.12.63/32", "3.130.192.231/32", "13.235.14.237/32", "13.235.122.149/32",
+    "18.211.135.69/32", "35.154.171.200/32", "52.15.183.38/32", "54.88.130.119/32",
+    "54.88.130.237/32", "54.187.174.169/32", "54.187.205.235/32", "54.187.216.72/32",
+]
+
 # Add Rate Limiter Middleware
-app.add_middleware(
-    SlidingWindowRateLimiter,
+limiter = SlidingWindowRateLimiter(
+    app,  # Pass app to satisfy BaseHTTPMiddleware
     limit=100,           # 100 requests
-    window_seconds=60    # per minute
+    window_seconds=60,   # per minute
+    allowlist_ips=PLATFORM_WEBHOOK_CIDRS,
+    allowlist_limit=500  # Elevated limit for webhooks
 )
+app.add_middleware(SlidingWindowRateLimiter, **limiter.__dict__)
+# Store instance for lifespan cleanup (Gap 104)
+app.state.rate_limiter = limiter
+
 app.add_middleware(RequestContextMiddleware)
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    """Inject security-hardening headers into every response."""
+    response = await call_next(request)
+    # HSTS: Force HTTPS (production only)
+    if settings.environment == "production":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload"
+    
+    # Anti-Clickjacking
+    response.headers["X-Frame-Options"] = "DENY"
+    # Mime-Sniffing Prevention
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    # XSS Protection for older browsers
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    # Basic Content Security Policy
+    response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' *.clipmind.com"
+    # Gap 81: Referrer-Policy — prevent leaking internal dashboard URLs to external sites
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    # Permissions Policy — disable access to camera/mic/location by default
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    
+    return response
 
 ALLOWED_ORIGINS = [
     os.getenv("FRONTEND_URL", "http://localhost:3000"),
@@ -93,11 +152,13 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    # Gap 51: Restrict to an explicit method whitelist instead of wildcard
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID", "Accept", "Origin"],
 )
 
-app.mount("/storage", StaticFiles(directory=settings.local_storage_dir), name="storage")
+# Gap 79: html=False disables directory listing on the static file server
+app.mount("/storage", StaticFiles(directory=settings.local_storage_dir, html=False), name="storage")
 
 if feature_flag_enabled("dev_auth_bypass", default=os.getenv("ENVIRONMENT", "").lower() in {"", "development", "local", "test"}):
     async def _dev_user_override() -> AuthenticatedUser:
@@ -115,6 +176,9 @@ if feature_flag_enabled("dev_auth_bypass", default=os.getenv("ENVIRONMENT", "").
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.exception("Unhandled exception: %s", exc)
+    # Gap 64: Attach user context to Sentry if available
+    if sentry_sdk and hasattr(request.state, "user_id") and request.state.user_id:
+        sentry_sdk.set_user({"id": str(request.state.user_id)})
     if os.getenv("ENVIRONMENT") == "development":
         return JSONResponse(status_code=500, content={"message": str(exc)})
     return JSONResponse(status_code=500, content={"message": "Internal Server Error"})
@@ -151,7 +215,10 @@ app.include_router(oauth_router, prefix="/api/v1")
 
 @app.get("/health")
 async def healthcheck() -> dict:
-    """Deep health check: verifies core infrastructure connectivity."""
+    """Deep health check: verifies core infrastructure connectivity.
+    
+    Gap 69: Now also probes upstream AI API connectivity.
+    """
     health = {
         "status": "ok",
         "api": "healthy",
@@ -172,20 +239,46 @@ async def healthcheck() -> dict:
         health["status"] = "degraded"
         status_code = 503
 
-    # 2. Check Redis & Workers
+    # 2. Check Redis & Workers (Gap 35, 68)
     try:
         from workers.celery_app import celery_app
         # Ping Redis via celery's connection pool
         with celery_app.connection_or_acquire() as conn:
-            conn.default_channel.connection.client.ping()
-        health["dependencies"]["redis"] = "healthy"
-        
-        # Ping Workers (only in production)
+            client = conn.default_channel.connection.client
+            client.ping()
+            
+            # Gap 35: Redis Memory Health
+            redis_info = client.info("memory")
+            used_mb = round(redis_info.get("used_memory", 0) / (1024 * 1024), 2)
+            peak_mb = round(redis_info.get("used_memory_peak", 0) / (1024 * 1024), 2)
+            health["dependencies"]["redis"] = {
+                "status": "healthy",
+                "used_memory_mb": used_mb,
+                "peak_memory_mb": peak_mb,
+                "fragmentation_ratio": redis_info.get("mem_fragmentation_ratio")
+            }
+
+        # Gap 68: Check Worker Load & Concurrency (only in non-dev or if forced)
         if os.getenv("ENVIRONMENT") != "development":
             inspector = celery_app.control.inspect()
-            pings = inspector.ping()
-            if pings:
-                health["dependencies"]["celery_workers"] = f"healthy ({len(pings)} online)"
+            stats = inspector.stats() or {}
+            active = inspector.active() or {}
+            
+            workers_info = []
+            for name, stat in stats.items():
+                workers_info.append({
+                    "name": name,
+                    "concurrency": stat.get("pool", {}).get("max-concurrency"),
+                    "active_tasks": len(active.get(name, [])),
+                    "is_running": True
+                })
+            
+            if workers_info:
+                health["dependencies"]["celery_workers"] = {
+                    "status": "healthy",
+                    "count": len(workers_info),
+                    "details": workers_info
+                }
             else:
                 health["dependencies"]["celery_workers"] = "unhealthy (none online)"
                 health["status"] = "degraded"
@@ -196,4 +289,43 @@ async def healthcheck() -> dict:
         health["status"] = "degraded"
         status_code = 503
 
+    # 3. Gap 69: Check upstream AI API reachability (lightweight probes, 5s timeout)
+    import httpx
+    _ai_checks = {}
+
+    # OpenAI probe
+    openai_key = os.getenv("OPENAI_API_KEY", "")
+    if openai_key:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                r = await client.get(
+                    "https://api.openai.com/v1/models",
+                    headers={"Authorization": f"Bearer {openai_key}"},
+                )
+            _ai_checks["openai"] = "reachable" if r.status_code < 500 else f"error ({r.status_code})"
+        except Exception as e:
+            _ai_checks["openai"] = f"unreachable ({type(e).__name__})"
+            health["status"] = "degraded"
+    else:
+        _ai_checks["openai"] = "not_configured"
+
+    # Groq probe
+    groq_key = os.getenv("GROQ_API_KEY", "")
+    if groq_key:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                r = await client.get(
+                    "https://api.groq.com/openai/v1/models",
+                    headers={"Authorization": f"Bearer {groq_key}"},
+                )
+            _ai_checks["groq"] = "reachable" if r.status_code < 500 else f"error ({r.status_code})"
+        except Exception as e:
+            _ai_checks["groq"] = f"unreachable ({type(e).__name__})"
+    else:
+        _ai_checks["groq"] = "not_configured"
+
+    health["dependencies"]["ai_apis"] = _ai_checks
+    from datetime import datetime, timezone
+
+    health["timestamp"] = datetime.now(timezone.utc).isoformat()
     return JSONResponse(status_code=status_code, content=health)

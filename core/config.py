@@ -52,11 +52,17 @@ class Settings:
     youtube_client_id: str = os.getenv("YOUTUBE_CLIENT_ID", "")
     youtube_client_secret: str = os.getenv("YOUTUBE_CLIENT_SECRET", "")
     tiktok_session_id: str = os.getenv("TIKTOK_SESSION_ID", "")
+    ytdlp_cookies_file: str | None = os.getenv("YTDLP_COOKIES_FILE")
+    
+    # Webhook Secrets
+    stripe_webhook_secret: str = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+    youtube_webhook_secret: str = os.getenv("YOUTUBE_WEBHOOK_SECRET", "")
 
     min_video_duration_minutes: int = 2
     min_clip_length_seconds: int = _get_int("MIN_CLIP_LENGTH_SECONDS", 15)
     max_clip_length_seconds: int = _get_int("MAX_CLIP_LENGTH_SECONDS", 90)
     clip_detector_model: str = os.getenv("CLIP_DETECTOR_MODEL", "openai/gpt-oss-120b")
+    clip_detector_fallback_model: str = os.getenv("CLIP_DETECTOR_FALLBACK_MODEL", "openai/gpt-4o")
     whisper_model: str = "whisper-1"
     job_retry_limit: int = 3
     chunk_upload_size_bytes: int = 1024 * 1024

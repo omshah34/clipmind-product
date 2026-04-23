@@ -9,6 +9,8 @@ import logging
 import json
 from uuid import UUID
 
+import httpx
+from openai import APIConnectionError, APITimeoutError, RateLimitError
 from celery.exceptions import SoftTimeLimitExceeded
 from workers.celery_app import celery_app
 from db.repositories.clip_sequences import (
@@ -21,10 +23,12 @@ from services.llm_integration import detect_sequences_with_llm, is_llm_available
 
 logger = logging.getLogger(__name__)
 
+TRANSIENT_ERRORS = (httpx.TimeoutException, APIConnectionError, APITimeoutError, RateLimitError)
+
 
 @celery_app.task(
     bind=True, 
-    max_retries=2,
+    max_retries=4,
     soft_time_limit=300,   # Graceful timeout at 5 minutes
     time_limit=360,        # Hard kill at 6 minutes
 )
@@ -107,14 +111,20 @@ def detect_clip_sequences(
         update_job(job_id, status="failed", error_message="Task timed out")
         return {"status": "failed", "error": "Task timed out"}
 
+    except TRANSIENT_ERRORS as exc:
+        logger.warning(f"Transient error in sequence detection for job {job_id}: {exc}")
+        # Gap 19: Exponential backoff (60s, 120s, 240s...)
+        countdown = 2 ** self.request.retries * 60
+        raise self.retry(exc=exc, countdown=countdown)
+
     except Exception as exc:
         logger.exception(f"Sequence detection failed: {exc}")
         
         try:
             update_job(job_id, status="failed", error_message=str(exc))
-            raise self.retry(exc=exc, countdown=2 ** self.request.retries)
         except Exception:
-            return {"status": "failed", "error": str(exc)}
+            pass
+        return {"status": "failed", "error": str(exc)}
 
 
 def detect_sequences_heuristic(clips, clip_descriptions: list) -> list[dict]:

@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from pathlib import Path
 from string import Template
-from typing import TypedDict
+from typing import TypedDict, Any
 
 from openai import APIConnectionError, APITimeoutError, OpenAI, RateLimitError
 from tenacity import (
@@ -51,9 +51,9 @@ logger = logging.getLogger(__name__)
 SCORE_WEIGHTS: dict[str, float] = {
     "hook_score":     0.30,
     "emotion_score":  0.25,
-    "clarity_score":  0.20,
-    "story_score":    0.15,
-    "virality_score": 0.10,
+    "virality_score": 0.25,
+    "clarity_score":  0.10,
+    "story_score":    0.10,
 }
 
 # Fail loudly at import time rather than silently miscalculating every score.
@@ -371,29 +371,19 @@ def select_top_clips(candidates: list[dict], limit: int = 3) -> list[dict]:
 
 @lru_cache(maxsize=8)
 def _load_prompt_cached(path: str) -> PromptTemplate:
-    """Load, parse, and cache a PromptTemplate. Keyed by resolved path string.
-
-    Caches the PromptTemplate object (not just the raw string) so Template
-    construction is not repeated on every detect_clips call.
-    """
+    """Load, parse, and cache a PromptTemplate. Keyed by resolved path string."""
     raw = Path(path).read_text(encoding="utf-8")
     return PromptTemplate(raw)
 
 
 def _render_prompt(template: PromptTemplate, transcript_chunk: str, source_path: str) -> str:
-    """Render a PromptTemplate, converting KeyError into a readable ClipDetectionError.
-
-    Template.substitute() raises KeyError if the prompt file contains any
-    @@{variable} placeholder other than @@{transcript_chunk}. Without this
-    wrapper, that KeyError propagates as an opaque exception that gives no
-    indication of which file is at fault or what the unexpected key was.
-    """
+    """Render a PromptTemplate, converting KeyError into a readable ClipDetectionError."""
     try:
         return template.substitute(transcript_chunk=transcript_chunk)
     except KeyError as exc:
         raise ClipDetectionError(
             f"Prompt file '{source_path}' contains unknown placeholder @@{{{exc.args[0]}}}. "
-            "Only @@{transcript_chunk} is supported. Check the prompt file for typos."
+            "Only @@{transcript_chunk} is supported."
         ) from exc
 
 
@@ -405,14 +395,6 @@ class ClipDetectorService:
         self.client = make_openai_client()
 
     def load_prompt(self, prompt_version: str) -> tuple[PromptTemplate, str]:
-        """Return a cached (PromptTemplate, resolved_path_str) for the given version.
-
-        The resolved path string is returned alongside the template so callers
-        can include it in error messages without re-computing it.
-
-        Prompt files must use @@{transcript_chunk} as the substitution placeholder.
-        Raises FileNotFoundError if the file does not exist.
-        """
         path = (
             Path(__file__).resolve().parent.parent
             / "prompts"
@@ -423,24 +405,25 @@ class ClipDetectorService:
         resolved = str(path)
         return _load_prompt_cached(resolved), resolved
 
+    def _call_llm(self, prompt: str, model: str) -> tuple[str, Any]:
+        """Low-level LLM call."""
+        response = self.client.chat.completions.create(
+            model=model,
+            temperature=0.4,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.choices[0].message.content or "[]", response
+
     @retry(
         reraise=True,
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=8),
         retry=retry_if_exception_type((APIConnectionError, APITimeoutError, RateLimitError)),
     )
-    def score_chunk(self, rendered_prompt: str) -> tuple[list[dict], float]:
-        """Call the LLM, parse candidates, and return (candidates, cost).
-
-        Scores are coerced and validated in a single pass. Malformed or
-        out-of-range candidates are logged and skipped rather than crashing.
-        """
-        response = self.client.chat.completions.create(
-            model=settings.clip_detector_model,
-            temperature=0.4,
-            messages=[{"role": "user", "content": rendered_prompt}],
-        )
-        raw_content = response.choices[0].message.content or "[]"
+    def score_chunk(self, rendered_prompt: str, model_override: str | None = None) -> tuple[list[dict], float]:
+        """Call the LLM, parse candidates, and return (candidates, cost)."""
+        model = model_override or settings.clip_detector_model
+        raw_content, response = self._call_llm(rendered_prompt, model)
 
         # Parse — attempt repair on failure
         try:
@@ -454,13 +437,9 @@ class ClipDetectorService:
                 candidates = []
 
         if not isinstance(candidates, list):
-            logger.warning(
-                "LLM response was not a JSON array (got %s); skipping chunk.",
-                type(candidates).__name__,
-            )
+            logger.warning("LLM response was not a JSON array; skipping chunk.")
             candidates = []
 
-        # Schema + range validation — coerce once, skip bad candidates
         valid: list[dict] = []
         for i, candidate in enumerate(candidates):
             try:
@@ -470,18 +449,14 @@ class ClipDetectorService:
                 logger.warning("Candidate %d failed validation: %s; skipping.", i, exc)
                 continue
 
-        # Cost tracking
         usage = getattr(response, "usage", None)
         llm_cost = estimate_llm_cost_from_tokens(
-            settings.clip_detector_model,
+            model,
             getattr(usage, "prompt_tokens", None),
             getattr(usage, "completion_tokens", None),
         )
 
-        logger.debug(
-            "Chunk scored: %d raw candidates, %d valid, cost=$%.6f",
-            len(candidates), len(valid), llm_cost,
-        )
+        logger.debug("Chunk scored (%s): %d valid, cost=$%.6f", model, len(valid), llm_cost)
         return valid, llm_cost
 
     def _score_chunk_safe(
@@ -490,20 +465,26 @@ class ClipDetectorService:
         rendered_prompt: str,
     ) -> tuple[int, list[dict], float, bool]:
         """Wrapper for thread pool use: returns (chunk_index, candidates, cost, failed).
-
-        The `failed` flag is True only when score_chunk raises after exhausting
-        all tenacity retries. This lets detect_clips distinguish a genuine API
-        outage from a chunk that simply produced no viable candidates.
+        Gap 40: Fallback to secondary model on persistent failure.
         """
         try:
             candidates, cost = self.score_chunk(rendered_prompt)
             return chunk_index, candidates, cost, False
-        except Exception as exc:
-            logger.error(
-                "Chunk %d failed scoring after all retries: %s",
-                chunk_index, exc, exc_info=True,
+        except Exception as primary_exc:
+            logger.warning(
+                "Chunk %d primary model (%s) failed: %s. Trying fallback (%s)...",
+                chunk_index, settings.clip_detector_model, primary_exc, 
+                settings.clip_detector_fallback_model
             )
-            return chunk_index, [], 0.0, True
+            try:
+                candidates, cost = self.score_chunk(
+                    rendered_prompt, 
+                    model_override=settings.clip_detector_fallback_model
+                )
+                return chunk_index, candidates, cost, False
+            except Exception as fallback_exc:
+                logger.error("Chunk %d fallback model also failed: %s", chunk_index, fallback_exc)
+                return chunk_index, [], 0.0, True
 
     def refine_clip_boundaries(
         self,
@@ -511,16 +492,11 @@ class ClipDetectorService:
         words: list[dict],
         context_window_s: float = 45.0,
     ) -> tuple[float, float, str | None, float]:
-        """
-        Refines the start/end times of a clip by analyzing the surrounding context.
-        Returns: (final_start, final_end, refinement_reason, cost)
-        """
         orig_start = float(candidate_clip["start_time"])
         orig_end = float(candidate_clip["end_time"])
         
-        # 1. Extract context window
         window_start = max(0.0, orig_start - context_window_s)
-        window_end = orig_end + (context_window_s / 3) # Less context needed after
+        window_end = orig_end + (context_window_s / 3)
         
         relevant_words = [
             w for w in words 
@@ -528,10 +504,8 @@ class ClipDetectorService:
         ]
         context_text = format_transcript_chunk(relevant_words)
         
-        # 2. Prepare prompt
         prompt_path = Path(__file__).resolve().parent.parent / "prompts" / "clip_refinement.txt"
         if not prompt_path.exists():
-            logger.warning("Refinement prompt not found at %s. Skipping refinement.", prompt_path)
             return orig_start, orig_end, None, 0.0
             
         template = PromptTemplate(prompt_path.read_text(encoding="utf-8"))
@@ -544,48 +518,34 @@ class ClipDetectorService:
             transcript_context=context_text
         )
         
-        # 3. Call LLM
         try:
             response = self.client.chat.completions.create(
                 model=settings.clip_detector_model,
-                temperature=0.2, # Low temperature for precision
+                temperature=0.2,
                 messages=[{"role": "user", "content": rendered}],
             )
             raw_content = response.choices[0].message.content or "{}"
-            # Extract JSON from potential preamble
             json_match = re.search(r"\{.*\}", raw_content, re.DOTALL)
-            if json_match:
-                refined_data = json.loads(json_match.group(0))
-            else:
-                refined_data = json.loads(raw_content)
+            refined_data = json.loads(json_match.group(0)) if json_match else json.loads(raw_content)
                 
             new_start = float(refined_data.get("start_time", orig_start))
             new_end = float(refined_data.get("end_time", orig_end))
             reason = refined_data.get("refinement_reason", "Refined to capture story arc.")
             
-            # 4. Safety checks (Robustness)
-            # Ensure new times are within the extracted window and valid
             if not (window_start <= new_start < new_end <= window_end + 1.0):
-                logger.warning("LLM proposed invalid refinement times: [%.1f, %.1f]. Falling back.", new_start, new_end)
                 return orig_start, orig_end, None, 0.0
                 
-            # Duration limit check
             if not (settings.min_clip_length_seconds <= (new_end - new_start) <= settings.max_clip_length_seconds):
-                logger.warning("Refined clip duration (%.1fs) out of bounds. Falling back.", new_end - new_start)
                 return orig_start, orig_end, None, 0.0
 
-            # Cost calculation
             usage = getattr(response, "usage", None)
             llm_cost = estimate_llm_cost_from_tokens(
                 settings.clip_detector_model,
                 getattr(usage, "prompt_tokens", None),
                 getattr(usage, "completion_tokens", None),
             )
-            
             return new_start, new_end, reason, llm_cost
-
-        except Exception as exc:
-            logger.error("Refinement failed for clip at %.1f: %s. Falling back to original.", orig_start, exc)
+        except Exception:
             return orig_start, orig_end, None, 0.0
 
     def detect_clips(
@@ -597,47 +557,19 @@ class ClipDetectorService:
         limit: int = 5,
         user_id: str | None = None,
     ) -> tuple[list[ScoredClip], float]:
-        """Run the full clip detection pipeline over all transcript chunks.
-
-        Chunks are scored in parallel (up to MAX_SCORE_WORKERS threads).
-        Emits a warning when >= CHUNK_FAILURE_WARN_RATIO of chunks fail so
-        operators can distinguish "no viral content" from "API was broken".
-        
-        Args:
-            transcript_json: Transcript data with word timestamps
-            prompt_version: Which prompt file to use (e.g., "v4")
-            custom_score_weights: Override SCORE_WEIGHTS for this detection
-            custom_prompt_instruction: Append instruction to the system prompt
-            limit: Number of clips to return
-            user_id: If provided, fetches personalized weights via Content DNA
-
-        Returns:
-            (final_clips, total_llm_cost_usd)
-        """
         prompt_template, prompt_path = self.load_prompt(prompt_version)
         words = flatten_words(transcript_json)
         chunks = chunk_transcript(words)
 
-        # ─── Content DNA Weight Resolution ───────────────────────────────────
-        # Use explicit overrides first, then personalized weights, then defaults
         effective_weights = custom_score_weights
         if not effective_weights and user_id:
-            logger.info("Clip detection: fetching personalized DNA weights for user %s", user_id)
             effective_weights = get_personalized_weights(user_id)
-        
         if not effective_weights:
             effective_weights = SCORE_WEIGHTS
 
-        logger.info("Clip detection: processing %d transcript chunk(s).", len(chunks))
-
-        # Early return guards ThreadPoolExecutor(max_workers=0) crash
         if not chunks:
-            logger.warning("Transcript produced zero chunks; returning no clips.")
             return [], 0.0
 
-        # Build rendered prompts upfront (cheap; avoids doing it inside threads).
-        # _render_prompt wraps substitute() so unknown @@{variables} surface as
-        # ClipDetectionError with the filename, not an opaque KeyError.
         rendered_prompts: list[tuple[int, str]] = []
         for i, chunk_words in enumerate(chunks):
             prompt_text = _render_prompt(
@@ -645,91 +577,47 @@ class ClipDetectorService:
                 format_transcript_chunk(chunk_words),
                 prompt_path,
             )
-            
-            # Append custom instruction if provided
             if custom_prompt_instruction:
                 prompt_text += f"\n\nAdditional instruction: {custom_prompt_instruction}"
-            
             rendered_prompts.append((i, prompt_text))
 
-        # Score chunks in parallel
         workers = min(MAX_SCORE_WORKERS, len(rendered_prompts))
         chunk_results: dict[int, tuple[list[dict], float, bool]] = {}
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(self._score_chunk_safe, i, prompt): i
-                for i, prompt in rendered_prompts
-            }
+            futures = {pool.submit(self._score_chunk_safe, i, p): i for i, p in rendered_prompts}
             for future in as_completed(futures):
                 idx, candidates, cost, failed = future.result()
                 chunk_results[idx] = (candidates, cost, failed)
 
-        # Warn when a significant fraction of chunks failed — helps distinguish
-        # "no good clips in this video" from "the API was unreachable"
-        failed_count = sum(1 for _, _, failed in chunk_results.values() if failed)
-        if failed_count > 0:
-            ratio = failed_count / len(chunks)
-            log_fn = logger.warning if ratio >= CHUNK_FAILURE_WARN_RATIO else logger.info
-            log_fn(
-                "%d/%d chunk(s) failed scoring (%.0f%%). Results may be incomplete.",
-                failed_count, len(chunks), ratio * 100,
-            )
-
-        # Aggregate in chunk order for deterministic dedup behaviour.
-        # Candidates are never mutated in-place — a fresh dict is constructed
-        # so that chunk_results entries remain clean for any future inspection.
         all_candidates: list[dict] = []
         total_cost = 0.0
 
         for i in sorted(chunk_results):
             candidates, chunk_cost, _ = chunk_results[i]
             total_cost += chunk_cost
-
             for candidate in candidates:
                 start = float(candidate["start_time"])
                 end = float(candidate["end_time"])
                 duration = end - start
-
-                if duration < settings.min_clip_length_seconds:
-                    logger.debug("Candidate too short (%.1fs); skipping.", duration)
+                if not (settings.min_clip_length_seconds <= duration <= settings.max_clip_length_seconds):
                     continue
-                if duration > settings.max_clip_length_seconds:
-                    logger.debug("Candidate too long (%.1fs); skipping.", duration)
-                    continue
-
                 coerced_scores = {k: float(candidate[k]) for k in SCORE_WEIGHTS}
-                # Build a new dict — never mutate the candidate from chunk_results
                 scored = {
                     **candidate,
                     "duration": round(duration, 2),
                     "final_score": calculate_final_score(coerced_scores, weights=effective_weights),
                 }
-
-                if scored["final_score"] < SCORE_THRESHOLD:
-                    logger.debug(
-                        "Candidate score %.2f below threshold %.1f; skipping.",
-                        scored["final_score"], SCORE_THRESHOLD,
-                    )
-                    continue
-
-                all_candidates.append(scored)
-
-        logger.info(
-            "Clip detection complete: %d candidates → deduping → selecting top %d.",
-            len(all_candidates), limit,
-        )
+                if scored["final_score"] >= SCORE_THRESHOLD:
+                    all_candidates.append(scored)
 
         deduped = dedupe_candidates(all_candidates)
         selected = select_top_clips(deduped, limit=limit)
 
         results: list[ScoredClip] = []
         for index, candidate in enumerate(selected, start=1):
-            # ─── Arc Detection Refinement ───────────────────────────────────
-            logger.info("Refining clip %d (original: %.1f - %.1f)...", index, candidate["start_time"], candidate["end_time"])
             r_start, r_end, r_reason, r_cost = self.refine_clip_boundaries(candidate, words)
             total_cost += r_cost
-
             results.append(
                 ScoredClip(
                     clip_index=index,
@@ -749,11 +637,6 @@ class ClipDetectorService:
                     refinement_reason=r_reason
                 )
             )
-
-        logger.info(
-            "Selected %d clip(s). Total LLM cost: $%.6f",
-            len(results), total_cost,
-        )
         return results, round(total_cost, 6)
 
 

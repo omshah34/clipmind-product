@@ -17,11 +17,13 @@ import {
 } from "@/lib/api";
 import PerformanceSummaryCards from "@/components/performance-summary";
 import PerformanceCharts from "@/components/performance-charts";
+import { ErrorBoundary } from "@/components/error-boundary";
 
 export default function IntelligenceContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const jobId = searchParams.get("job_id");
+  const clipIndex = searchParams.get("clip_index");
 
   const [userId] = useState(() => {
     if (typeof window !== "undefined") {
@@ -192,8 +194,12 @@ export default function IntelligenceContent() {
         {/* Summary Tab */}
         {activeTab === "summary" && (
           <div className="space-y-6">
-            <PerformanceSummaryCards data={performanceSummary} />
-            <PerformanceCharts data={performanceSummary} />
+            <ErrorBoundary name="Summary Cards">
+              <PerformanceSummaryCards data={performanceSummary} clipIndex={clipIndex} />
+            </ErrorBoundary>
+            <ErrorBoundary name="Performance Charts">
+              <PerformanceCharts data={performanceSummary} clipIndex={clipIndex} />
+            </ErrorBoundary>
           </div>
         )}
 

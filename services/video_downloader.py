@@ -11,6 +11,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from core.config import settings
+
 try:
     import yt_dlp
 except ModuleNotFoundError:  # pragma: no cover - optional dependency guard
@@ -25,6 +27,10 @@ ALLOWED_DOMAINS = [
     "youtu.be",
     "m.youtube.com"
 ]
+
+# Gap 94: Max resolution cap — 1080p is sufficient for vertical clip generation
+# and avoids unnecessary 4K bandwidth/storage costs
+_MAX_HEIGHT = int(os.getenv("YTDLP_MAX_HEIGHT", "1080"))
 
 class VideoDownloaderError(Exception):
     """Base exception for video downloader service."""
@@ -67,18 +73,45 @@ def get_video_info(url: str) -> dict[str, Any]:
         raise VideoDownloaderError(f"Could not fetch video info: {str(e)}")
 
 def download_video(url: str, output_path: Path) -> Path:
-    """Download a video from YouTube to the specified path."""
+    """Download a video from YouTube to the specified path.
+
+    Gap 96: Raises VideoDownloaderError immediately if the URL is a live stream
+    to prevent the worker from hanging indefinitely.
+    Gap 94: Resolution capped at _MAX_HEIGHT (default 1080p) to avoid 4K storage waste.
+    """
     if not validate_url(url):
         raise VideoDownloaderError("Domain not allowed.")
 
-    # We want a single file, preferably mp4, with decent quality but not 4K (save bandwidth)
+    # Gap 96: Pre-flight live stream detection — avoids indefinite hang
+    try:
+        info = get_video_info(url)
+        if info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming"):
+            raise VideoDownloaderError(
+                "Live streams and upcoming broadcasts cannot be processed. "
+                "Please wait until the stream has ended and the VOD is available."
+            )
+    except VideoDownloaderError:
+        raise
+    except Exception as e:
+        logger.warning("Live-stream pre-check failed (continuing anyway): %s", e)
+
+    # Gap 94: Quality capped at _MAX_HEIGHT to save bandwidth and storage
     ydl_opts = {
-        'format': 'bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'format': f'bestvideo[ext=mp4][height<={_MAX_HEIGHT}]+bestaudio[ext=m4a]/best[ext=mp4][height<={_MAX_HEIGHT}]/best[height<={_MAX_HEIGHT}]/best',
         'outtmpl': str(output_path),
         'quiet': True,
         'no_warnings': True,
         'merge_output_format': 'mp4',
     }
+
+    # Gap 92: Support authenticated downloads for age-restricted/private videos
+    if settings.ytdlp_cookies_file:
+        cookie_path = Path(settings.ytdlp_cookies_file)
+        if cookie_path.exists():
+            ydl_opts['cookiefile'] = str(cookie_path)
+            logger.info("Using yt-dlp cookies from: %s", cookie_path)
+        else:
+            logger.warning("YTDLP_COOKIES_FILE configured but not found: %s", cookie_path)
 
     try:
         ytdlp = _require_yt_dlp()
@@ -94,6 +127,8 @@ def download_video(url: str, output_path: Path) -> Path:
                 raise VideoDownloaderError("Download finished but output file was not found.")
         
         return output_path
+    except VideoDownloaderError:
+        raise
     except Exception as e:
         logger.error("Failed to download video: %s", e)
         raise VideoDownloaderError(f"Download failed: {str(e)}")

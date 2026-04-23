@@ -42,7 +42,9 @@ PYTHON = str(VENV_PYTHON) if VENV_PYTHON.exists() else sys.executable
 LOG_DIR = ROOT / "log"
 LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / "app.log"
-LOG_FILE.write_text("", encoding="utf-8")   # Fresh log on each start
+# Gap 21: Prevent Log Destruction - Append session marker instead of clearing
+with open(LOG_FILE, "a", encoding="utf-8") as f:
+    f.write(f"\n\n{'='*80}\nNEW SESSION: {time.strftime('%Y-%m-%d %H:%M:%S')}\n{'='*80}\n")
 
 # Colour helpers (works on Windows 10+ terminals)
 def _c(code: str, text: str) -> str:
@@ -245,7 +247,13 @@ def check_redis() -> bool:
     print(f"{yellow('[CHECK]')} Verifying Redis at {redis_url} ...")
 
     if _is_redis_alive(redis_url):
-        print(f"{green('[OK]')}    Redis is ready\n")
+        print(f"{green('[OK]')}    Redis is ready")
+        # Gap 73: Warn if Redis has no password set on a non-TLS local URL
+        if redis_url.startswith("redis://") and "@" not in redis_url:
+            print(f"{yellow('[WARN]')}  Redis has no authentication. Set REDIS_URL=redis://:password@localhost:6379/0")
+            print(f"         or configure 'requirepass' in redis.conf to harden your dev environment.\n")
+        else:
+            print()
         return True
 
     # Not running - try to start it
@@ -369,11 +377,32 @@ def log_stream(proc: subprocess.Popen, label: str, color_fn):
             f.flush()
 
 
+def is_port_in_use(port: int) -> bool:
+    """Check if a port is in use by attempting to bind to it."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("0.0.0.0", port))
+            return False
+        except socket.error:
+            return True
+
+
 def start_service(key: str, svc: dict) -> subprocess.Popen | None:
     label = svc["label"]
     color = svc["color"]
     cmd   = svc["cmd"]
     cwd   = svc.get("cwd", str(ROOT))
+    
+    # Gap 67: Unstable Port Checks - Verify port availability before launch
+    port_match = [arg for i, arg in enumerate(cmd) if i > 0 and cmd[i-1] == "--port"]
+    if not port_match and key == "web": port_match = ["3000"] # Default Next.js
+    
+    if port_match:
+        port = int(port_match[0])
+        if is_port_in_use(port):
+            print(f"{red('[FAIL]')} {label} - Port {port} is already in use or restricted.")
+            return None
 
     exe = cmd[0]
     if shutil.which(str(exe)) is None and not Path(str(exe)).exists():
@@ -382,12 +411,17 @@ def start_service(key: str, svc: dict) -> subprocess.Popen | None:
 
     print(f"{color('[START]')} {bold(label)}")
 
+    # Gap 30: Celery worker/beat must use NullPool — signal via env var
+    child_env = {**os.environ}
+    if key in ("worker", "beat"):
+        child_env["CELERY_WORKER_RUNNING"] = "1"
+
     proc = subprocess.Popen(
         cmd,
         cwd=cwd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        env={**os.environ},
+        env=child_env,
     )
     processes.append(proc)
 
@@ -452,10 +486,31 @@ def shutdown(sig=None, frame=None):
     time.sleep(1)
     for proc in processes:
         if proc and proc.poll() is None:
-            proc.kill()
+            # Gap 66: Zombie Process Accumulation - Use taskkill on Windows for tree cleanup
+            if IS_WINDOWS:
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                               capture_output=True, check=False)
+            else:
+                proc.kill()
+
+    # Gap 120: Graceful cleanup — remove temp files that could corrupt the index on restart
+    try:
+        tmp_dir = ROOT / ".clipmind_runtime" / "tmp"
+        cleaned = 0
+        for pattern in ("*.mp4", "*.jbl", "*.part"):
+            for f in tmp_dir.glob(pattern):
+                try:
+                    f.unlink(missing_ok=True)
+                    cleaned += 1
+                except Exception:
+                    pass
+        if cleaned:
+            print(yellow(f"[CLEANUP] Removed {cleaned} temporary file(s) from {tmp_dir}"))
+    except Exception:
+        pass
+
     try:
         print(green("[DONE] All services stopped."))
-        LOG_FILE.write_text("", encoding="utf-8")
     except Exception:
         pass
     sys.exit(0)
@@ -535,17 +590,61 @@ def main():
     print(f"{green(bold('>>> CLIPMIND IS READY <<<'))}\n")
 
     # -- Monitor & auto-restart crashed services -------------------------------
+    # Gap 114: Added hot-reload for workers via watchfiles
+    def watch_for_changes():
+        try:
+            from watchfiles import watch
+            print(f"{cyan('[WATCH]')}  Monitoring {ROOT / 'services'} and {ROOT / 'workers'} for changes...")
+            for changes in watch(str(ROOT / "services"), str(ROOT / "workers")):
+                # Filter for .py files
+                if any(c[1].endswith(".py") for c in changes):
+                    print(f"\n{yellow('[RELOAD]')} Code change detected. Restarting workers...")
+                    for key in ["worker", "beat"]:
+                        for k, p in list(started):
+                            if k == key:
+                                if p.poll() is None:
+                                    if IS_WINDOWS:
+                                        subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], capture_output=True, check=False)
+                                    else:
+                                        p.terminate()
+                                started.remove((k, p))
+                                if p in processes:
+                                    processes.remove(p)
+                                
+                                new_p = start_service(k, SERVICES[k])
+                                if new_p:
+                                    started.append((k, new_p))
+        except ImportError:
+            print(f"{yellow('[WARN]')}  'watchfiles' not installed. Worker hot-reload disabled.")
+            print(f"         Install it with: {bold('pip install watchfiles')}")
+        except Exception as e:
+            print(f"{red('[ERROR]')} Watcher failed: {e}")
+
+    import threading
+    watcher_thread = threading.Thread(target=watch_for_changes, daemon=True)
+    watcher_thread.start()
+
     while True:
         time.sleep(2)
         for key, proc in list(started):
             if proc.poll() is not None:
+                # If it's the web server, it might have finished or crashed
+                if key == "web" and proc.returncode == 0:
+                    continue # Next.js might exit cleanly if it's just a build
+                
                 svc = SERVICES[key]
                 print(f"\n{red('[CRASH]')} {svc['label']} exited (code {proc.returncode}). Restarting in 3s...")
                 time.sleep(3)
                 new_proc = start_service(key, svc)
                 if new_proc:
-                    idx = started.index((key, proc))
-                    started[idx] = (key, new_proc)
+                    idx = -1
+                    for i, (k, p) in enumerate(started):
+                        if k == key and p == proc:
+                            idx = i; break
+                    if idx != -1:
+                        started[idx] = (key, new_proc)
+                    else:
+                        started.append((key, new_proc))
                     if proc in processes:
                         processes.remove(proc)
 

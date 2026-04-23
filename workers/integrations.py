@@ -19,7 +19,7 @@ Event types:
 import logging
 from uuid import UUID
 from services.integration_adapters import get_adapter
-from db import queries
+from db.repositories import integrations as queries
 from workers.celery_app import celery_app as app
 import requests
 from typing import Optional

@@ -57,7 +57,21 @@ _conf: dict = dict(
         "socket_keepalive_intvl": 30,
         "retry_on_timeout": True,
         "max_retries": 5,
+        # Gap 95: Prevent long-running render tasks (>1hr) from being re-queued
+        # The visibility_timeout must exceed the longest expected task runtime.
+        "visibility_timeout": 7200,  # 2 hours in seconds
     },
+    # Gap 97: Route exhausted tasks to a Dead Letter Queue for manual inspection
+    # Tasks that exceed max retries will be routed to the 'dlq' queue.
+    task_routes={
+        "workers.pipeline.*": {"queue": "pipeline"},
+        "workers.render_clips.*": {"queue": "renders"},
+        "workers.publish_social.*": {"queue": "publishing"},
+    },
+    # Gap 97: DLQ — when a task raises after all retries, Celery rejects it.
+    # Setting task_reject_on_worker_lost ensures it goes to DLQ instead of disappearing.
+    task_reject_on_worker_lost=True,
+    task_acks_late=True,  # Required for reject_on_worker_lost to work correctly
 )
 
 # When using rediss:// (TLS), Celery requires explicit ssl_cert_reqs.
@@ -80,7 +94,7 @@ _conf["beat_schedule"] = {
         "schedule": crontab(hour=0, minute=0, day_of_week=0), # Sunday midnight
     },
     "poll_content_sources": {
-        "task": "workers.source_poller.poll_sources",
+        "task": "workers.source_poller.poll_all_sources",  # Gap 70: Fixed name mismatch
         "schedule": 3600.0, # Every hour
     },
     "reclaim_stale_jobs": {

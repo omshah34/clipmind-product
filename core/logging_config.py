@@ -11,6 +11,7 @@ Usage:
 
 import logging
 import os
+import re
 import sys
 
 from core.request_context import current_context
@@ -22,6 +23,19 @@ LOG_FORMAT = (
 )
 LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
+# Regex patterns for PII redaction (Gap 47)
+_EMAIL_RE = re.compile(r"([a-zA-Z0-9_.+-])([a-zA-Z0-9_.+-]*)@([a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)")
+_FILEPATH_RE = re.compile(r"(?:/home/|/Users/|C:\\\\Users\\\\)[^/\\\\\s]+")
+
+
+def _redact_pii(text: str) -> str:
+    """Mask emails and personal file paths in log messages."""
+    # Mask email: keep first char + *** before @
+    text = _EMAIL_RE.sub(lambda m: f"{m.group(1)}***@{m.group(3)}", text)
+    # Mask personal file paths
+    text = _FILEPATH_RE.sub("[REDACTED_PATH]", text)
+    return text
+
 
 class ContextFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
@@ -29,6 +43,9 @@ class ContextFilter(logging.Filter):
         record.request_id = context.request_id or "-"
         record.job_id = context.job_id or "-"
         record.user_id = context.user_id or "-"
+        # Gap 47: Redact PII from the log message itself
+        if isinstance(record.msg, str):
+            record.msg = _redact_pii(record.msg)
         return True
 
 

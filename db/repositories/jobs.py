@@ -7,6 +7,7 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from api.models.job import JobRecord
 from db.connection import engine
@@ -16,6 +17,7 @@ JSON_FIELDS = {"transcript_json", "clips_json", "timeline_json"}
 UPDATABLE_FIELDS = {
     "status",
     "source_video_url",
+    "proxy_video_url",
     "audio_url",
     "transcript_json",
     "clips_json",
@@ -57,7 +59,17 @@ def get_job_timeline(job_id: UUID | str) -> dict | None:
     query = text("SELECT timeline_json FROM jobs WHERE id = :job_id")
     with engine.connect() as connection:
         row = connection.execute(query, {"job_id": str(job_id)}).one_or_none()
-    return row[0] if row else None
+    
+    if not row:
+        return None
+    
+    data = row[0]
+    if isinstance(data, str):
+        try:
+            return json.loads(data)
+        except json.JSONDecodeError:
+            return {}
+    return data or {}
 
 
 def update_job_timeline(job_id: UUID | str, timeline_data: dict) -> JobRecord:
@@ -81,6 +93,7 @@ def create_job(
     source_video_url: str,
     prompt_version: str = "v4",
     brand_kit_id: UUID | str | None = None,
+    campaign_id: UUID | str | None = None,
     estimated_cost_usd: float = 0.0,
     status: str = "uploaded",
     language: str | None = "en",
@@ -92,6 +105,7 @@ def create_job(
         "estimated_cost_usd",
         "user_id",
         "brand_kit_id",
+        "campaign_id",
         "language",
     ]
     values = [
@@ -101,9 +115,12 @@ def create_job(
         ":estimated_cost_usd",
         ":user_id",
         ":brand_kit_id",
+        ":campaign_id",
         ":language",
     ]
 
+    # Gap 33: Use an UPSERT-like pattern to return existing job if it exists
+    # This prevents redundant processing of the same video/prompt version.
     query = text(
         f"""
         INSERT INTO jobs (
@@ -112,23 +129,48 @@ def create_job(
         VALUES (
             {", ".join(values)}
         )
+        ON CONFLICT (user_id, source_video_url, prompt_version) WHERE user_id IS NOT NULL
+        DO UPDATE SET updated_at = NOW() -- No-op update to ensure RETURNING * works
         RETURNING *
         """
     )
-    with engine.begin() as connection:
-        row = connection.execute(
-            query,
-            {
-                "status": status,
-                "source_video_url": source_video_url,
-                "prompt_version": prompt_version,
-                "estimated_cost_usd": estimated_cost_usd,
-                "user_id": str(user_id) if user_id else None,
-                "brand_kit_id": str(brand_kit_id) if brand_kit_id else None,
-                "language": language or "en",
-            },
-        ).one()
-    return _row_to_job_record(row)
+    
+    params = {
+        "status": status,
+        "source_video_url": source_video_url,
+        "prompt_version": prompt_version,
+        "estimated_cost_usd": estimated_cost_usd,
+        "user_id": str(user_id) if user_id else None,
+        "brand_kit_id": str(brand_kit_id) if brand_kit_id else None,
+        "campaign_id": str(campaign_id) if campaign_id else None,
+        "language": language or "en",
+    }
+
+    try:
+        with engine.begin() as connection:
+            row = connection.execute(query, params).one_or_none()
+            
+            # If no-user (anonymous) conflict occurs, the above ON CONFLICT won't catch it
+            # since it's filtered. We handle anon conflict here.
+            if not row and not user_id:
+                query_anon = text("""
+                    INSERT INTO jobs (status, source_video_url, prompt_version, estimated_cost_usd, language)
+                    VALUES (:status, :source_video_url, :prompt_version, :estimated_cost_usd, :language)
+                    ON CONFLICT (source_video_url, prompt_version) WHERE user_id IS NULL
+                    DO UPDATE SET updated_at = NOW()
+                    RETURNING *
+                """)
+                row = connection.execute(query_anon, params).one()
+
+        if not row:
+             # Fallback if both fail (should not happen with logic above)
+             raise RuntimeError("Failed to create or retrieve job")
+
+        return _row_to_job_record(row)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error("Database error in create_job: %s", e)
+        raise
 
 
 def update_job(job_id: UUID | str, **fields: Any) -> JobRecord:
@@ -170,3 +212,11 @@ def update_job(job_id: UUID | str, **fields: Any) -> JobRecord:
             payload={key: value for key, value in fields.items() if key != "status"},
         )
     return updated
+
+
+def delete_job(job_id: UUID | str) -> bool:
+    """Delete a job by ID from the database."""
+    query = text("DELETE FROM jobs WHERE id = :job_id")
+    with engine.begin() as connection:
+        result = connection.execute(query, {"job_id": str(job_id)})
+    return result.rowcount > 0

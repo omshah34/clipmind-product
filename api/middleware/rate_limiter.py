@@ -51,13 +51,17 @@ class SlidingWindowRateLimiter(BaseHTTPMiddleware):
         app, 
         limit: int = 100, 
         window_seconds: int = 60,
-        exclude_paths: list[str] = None
+        exclude_paths: list[str] = None,
+        allowlist_ips: list[str] = None,
+        allowlist_limit: int = 500,
     ):
         super().__init__(app)
         self.limit = limit
         self.window_ms = window_seconds * 1000
         self.ttl = window_seconds + 10
         self.exclude_paths = exclude_paths or ["/health", "/docs", "/openapi.json"]
+        self.allowlist_ips = allowlist_ips or []
+        self.allowlist_limit = allowlist_limit
         
         # Initialize Redis client lazily
         self.redis = None
@@ -77,6 +81,13 @@ class SlidingWindowRateLimiter(BaseHTTPMiddleware):
                     self._lua_sha = sha
         return self.redis
 
+    async def close(self):
+        """Close Redis connection on shutdown."""
+        if self.redis:
+            await self.redis.aclose()
+            self.redis = None
+            logger.info("Rate limiter Redis connection closed.")
+
     async def dispatch(
         self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
@@ -89,14 +100,30 @@ class SlidingWindowRateLimiter(BaseHTTPMiddleware):
         # runs before dependencies. We extract from state or headers.
         user_id = "anonymous"
         auth_header = request.headers.get("Authorization")
+        client_ip = request.client.host if request.client else "unknown"
+        
         if auth_header:
             # Simple hash of token as user identifier if we can't decode it yet
             import hashlib
             user_id = hashlib.sha256(auth_header.encode()).hexdigest()[:16]
         else:
-            user_id = request.client.host if request.client else "unknown"
+            import hashlib
+            user_id = hashlib.sha256(client_ip.encode()).hexdigest()[:16]
 
-        # 3. Apply Limit
+        # 3. Check Allowlist for elevated limits (Gap 23: Webhook DoS Protection)
+        current_limit = self.limit
+        if client_ip != "unknown" and self.allowlist_ips:
+            import ipaddress
+            try:
+                ip_obj = ipaddress.ip_address(client_ip)
+                for cidr in self.allowlist_ips:
+                    if ip_obj in ipaddress.ip_network(cidr):
+                        current_limit = self.allowlist_limit
+                        break
+            except ValueError:
+                pass
+
+        # 4. Apply Limit
         key = f"ratelimit:{user_id}:{request.url.path}"
         now_ms = int(time.time() * 1000)
 
@@ -106,7 +133,7 @@ class SlidingWindowRateLimiter(BaseHTTPMiddleware):
                 raise ValueError("Rate limiter LUA script SHA is missing")
                 
             # Execute atomic LUA script
-            result = await r.evalsha(self._lua_sha, 1, key, now_ms, self.window_ms, self.limit, self.ttl)
+            result = await r.evalsha(self._lua_sha, 1, key, now_ms, self.window_ms, current_limit, self.ttl)
             if result is None:
                 raise ValueError("Rate limiter LUA script returned None")
             count, allowed = result

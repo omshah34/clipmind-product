@@ -10,12 +10,12 @@ from datetime import datetime, timezone, timedelta
 from typing import Any
 from uuid import UUID
 
-from db.queries import (
+from db.repositories.performance import (
     upsert_clip_performance,
     create_performance_alert,
-    get_platform_credentials,
-    engine,
 )
+from db.repositories.users import get_platform_credentials
+from db.connection import engine
 from sqlalchemy import text
 
 from services.data_providers.base import DataProvider
@@ -159,12 +159,17 @@ class PerformanceEngine:
             # Handle standard Auth failures
             err_msg = str(e)
             if "quota" in err_msg.lower():
-                logger.error("[perf] Quota hit for platform %s", platform)
+                logger.error("[perf] Quota hit for platform %s. Marking inactive.", platform)
+                with engine.begin() as conn:
+                    conn.execute(
+                        text("UPDATE platform_credentials SET is_active = 0, last_error = :err WHERE user_id = :u AND platform = :p"),
+                        {"err": "API Quota Exceeded", "u": str(user_id), "p": platform}
+                    )
             elif any(x in err_msg.lower() for x in ["401", "invalid_grant", "revoked", "invalid_token"]):
                 logger.warning("[perf] Credentials revoked for %s. Marking inactive.", platform)
                 with engine.begin() as conn:
                     conn.execute(
-                        text("UPDATE platform_credentials SET is_active = FALSE, last_error = :err WHERE user_id = :u AND platform = :p"),
+                        text("UPDATE platform_credentials SET is_active = 0, last_error = :err WHERE user_id = :u AND platform = :p"),
                         {"err": err_msg, "u": str(user_id), "p": platform}
                     )
                 create_performance_alert(

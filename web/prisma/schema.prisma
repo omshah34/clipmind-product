@@ -11,7 +11,7 @@ datasource db {
 }
 
 model User {
-  id            String    @id @default(cuid())
+  id            String    @id @default(uuid())
   name          String?
   email         String?   @unique
   emailVerified DateTime?
@@ -30,7 +30,7 @@ model User {
 }
 
 model Account {
-  id                 String  @id @default(cuid())
+  id                 String  @id @default(uuid())
   userId             String
   type               String
   provider           String
@@ -50,7 +50,7 @@ model Account {
 }
 
 model Session {
-  id           String   @id @default(cuid())
+  id           String   @id @default(uuid())
   sessionToken String   @unique
   userId       String
   expires      DateTime
@@ -70,7 +70,7 @@ model VerificationToken {
 
 // Workspace-related models
 model Workspace {
-  id          String    @id @default(cuid())
+  id          String    @id @default(uuid())
   name        String
   description String?
   createdAt   DateTime  @default(now())
@@ -85,7 +85,7 @@ model Workspace {
 }
 
 model WorkspaceMember {
-  id          String    @id @default(cuid())
+  id          String    @id @default(uuid())
   userId      String
   workspaceId String
   role        String    @default("editor") // owner, editor, viewer
@@ -99,7 +99,7 @@ model WorkspaceMember {
 }
 
 model WorkspaceClient {
-  id          String    @id @default(cuid())
+  id          String    @id @default(uuid())
   workspaceId String
   clientName  String
   contactEmail String
@@ -113,7 +113,7 @@ model WorkspaceClient {
 }
 
 model PortalToken {
-  id          String    @id @default(cuid())
+  id          String    @id @default(uuid())
   token       String    @unique
   workspaceId String
   clientId    String?

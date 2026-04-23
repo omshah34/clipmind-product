@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import json
 import subprocess
+import random
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -59,8 +60,6 @@ class SourceIngestionService:
                     logger.debug("[source=%s] Video %s already processed. Skipping.", source_id, vid)
                     continue
                 
-                logger.info("[source=%s] New video found: %s. Creating job...", source_id, vid)
-                
                 # Transactional Ingestion
                 # Note: We use a default 'v4' prompt for Autopilot
                 new_job_id = record_ingestion_atomic(
@@ -70,10 +69,20 @@ class SourceIngestionService:
                     video_url=vurl
                 )
                 
+                # Gap 93: Stagger ingestion tasks by 10-60s to avoid thundering herd.
+                # Autopilot polling happens in bursts; staggering prevents
+                # resource exhaustion on the worker cluster.
+                countdown = random.randint(10, 60)
+                logger.info(
+                    "[source=%s] New video found: %s. Scheduling job %s with %ds stagger...",
+                    source_id, vid, new_job_id, countdown
+                )
+                
                 # Dispatch to AI Pipeline
                 dispatch_task(
                     "workers.pipeline.process_job",
-                    job_id=new_job_id
+                    job_id=new_job_id,
+                    countdown=countdown  # Delay execution
                 )
                 
                 # Notify User

@@ -251,7 +251,7 @@ class ExportEngine:
 
     def _get_clip_data(self, clip_id: str) -> dict:
         """Fetch clip details from the clips_json of its parent job."""
-        from db.queries import engine
+        from db.connection import engine
         # Since clips are stored in JSON arrays in the jobs table, 
         # we need to find the job that contains this clip_id (in this case, clip_index)
         # Actually, in this project, clips often refer to indices. 

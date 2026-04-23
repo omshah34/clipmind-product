@@ -37,6 +37,9 @@ class BrandKitCreate(BaseModel):
     intro_clip_url: Optional[str] = Field(default=None, description="URL to intro video bumper")
     outro_clip_url: Optional[str] = Field(default=None, description="URL to outro video bumper")
     
+    # Gap 72: Transcription vocab
+    vocabulary_hints: Optional[list[str]] = Field(default=None, description="Custom words to bias Whisper toward")
+    
     is_default: bool = Field(default=False, description="Set as default brand kit")
     
     @field_validator('font_name')
@@ -61,6 +64,7 @@ class BrandKitUpdate(BaseModel):
     watermark_url: Optional[str] = None
     intro_clip_url: Optional[str] = None
     outro_clip_url: Optional[str] = None
+    vocabulary_hints: Optional[list[str]] = None
     is_default: Optional[bool] = None
 
 
@@ -80,6 +84,7 @@ class BrandKitRecord(BaseModel):
     watermark_url: Optional[str]
     intro_clip_url: Optional[str]
     outro_clip_url: Optional[str]
+    vocabulary_hints: Optional[list[str]]
     is_default: bool
     created_at: datetime
     updated_at: datetime

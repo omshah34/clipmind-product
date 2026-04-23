@@ -6,12 +6,17 @@ import os
 from pathlib import Path
 from uuid import UUID
 
+import httpx
+from openai import APIConnectionError, APITimeoutError, RateLimitError
 from workers.celery_app import celery_app
 from services.token_manager import TokenManager
 from services.youtube_publisher import upload_to_youtube, YouTubeApiError
 from services.tiktok_publisher import upload_to_tiktok, TikTokApiError
 
 logger = logging.getLogger(__name__)
+
+TRANSIENT_ERRORS = (httpx.TimeoutException, APIConnectionError, APITimeoutError, RateLimitError)
+
 
 # Standardized return schema for all platforms
 def make_response(status="failed", platform_id=None, url=None, error=None, error_code=None):
@@ -23,7 +28,7 @@ def make_response(status="failed", platform_id=None, url=None, error=None, error
         "error_code": error_code
     }
 
-@celery_app.task(bind=True, max_retries=3)
+@celery_app.task(bind=True, max_retries=4)
 def publish_to_platform(
     self,
     user_id: str | UUID,
@@ -91,10 +96,24 @@ def publish_to_platform(
             return make_response(error=str(e), error_code="youtube_api_error")
 
     except TikTokApiError as e:
+        # Gap 110: Handle TikTok specific error codes for better UX
         if e.error_code == "spam_risk_too_many_requests":
-            # Use Celery's built-in retry mechanism for transient spam risks
-            raise self.retry(exc=e, countdown=60)
-        return make_response(error=str(e), error_code="tiktok_api_error")
+            # Use standardized exponential backoff for transient spam risks
+            countdown = 2 ** self.request.retries * 60
+            raise self.retry(exc=e, countdown=countdown)
+        elif e.error_code == "video_too_short":
+            return make_response(error="TikTok requires videos to be at least 3 seconds long.", error_code="tiktok_video_too_short")
+        elif e.error_code == "permission_denied":
+            return make_response(error="TikTok permission denied. Please reconnect your account.", error_code="tiktok_permission_denied")
+        elif e.error_code == "account_banned":
+            return make_response(error="Your TikTok account appears to be restricted or banned.", error_code="tiktok_account_restricted")
+        
+        return make_response(error=str(e), error_code=f"tiktok_{e.error_code or 'api_error'}")
+
+    except TRANSIENT_ERRORS as exc:
+        logger.warning(f"Transient network error during %s publishing: %s", platform, exc)
+        countdown = 2 ** self.request.retries * 60
+        raise self.retry(exc=exc, countdown=countdown)
 
     except Exception as e:
         logger.exception("Unexpected error during %s publishing", platform)

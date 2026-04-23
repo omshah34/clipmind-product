@@ -37,6 +37,9 @@ WHISPER_MODELS = [
     "whisper-large-v3-turbo",
 ]
 
+# Gap 42: OpenAI Whisper as final fallback when all Groq models are exhausted
+OPENAI_FALLBACK_MODEL = "whisper-1"
+
 # Groq limit is 25MB; use 24MB as safe threshold
 _MAX_FILE_SIZE_BYTES = 24 * 1024 * 1024
 
@@ -188,24 +191,49 @@ def _merge_transcripts(
 def _deduplicate_words(words: list[dict]) -> list[dict]:
     """Remove duplicate words from overlapping chunk boundaries.
     
-    Words are considered duplicates if they have very similar timestamps
-    and the same text.
+    Words are considered duplicates if they overlap in time and have the same text.
+    Uses a windowed approach to handle sub-second jitter at chunk boundaries (Gap 44).
     """
     if not words:
         return words
 
-    # Sort by start time
-    words.sort(key=lambda w: float(w["start"]))
+    # Sort by start time then by text length (prefer longer/better segments if available)
+    words.sort(key=lambda w: (float(w["start"]), -len(w.get("word", ""))))
 
-    deduped: list[dict] = [words[0]]
-    for word in words[1:]:
-        prev = deduped[-1]
-        # If start times are within 0.5s and same word text, skip (duplicate)
-        time_diff = abs(float(word["start"]) - float(prev["start"]))
-        same_text = word.get("word", "").strip().lower() == prev.get("word", "").strip().lower()
-        if time_diff < 0.5 and same_text:
+    deduped: list[dict] = []
+    seen_hashes: set[str] = set()
+
+    for word in words:
+        text = word.get("word", "").strip().lower()
+        if not text:
             continue
-        deduped.append(word)
+            
+        start = round(float(word["start"]), 2)
+        end = round(float(word["end"]), 2)
+        
+        # Create a fuzzy hash based on text and rounded start time (0.2s window)
+        # This catches words that are the same but slightly shifted due to FFmpeg drift
+        fuzzy_start = round(start * 5) / 5.0 # Round to nearest 0.2s
+        word_hash = f"{text}_{fuzzy_start}"
+        
+        if word_hash in seen_hashes:
+            continue
+            
+        # Check against the last few words for physical overlap
+        is_duplicate = False
+        for prev in deduped[-10:]: # Check last 10 words
+            prev_text = prev.get("word", "").strip().lower()
+            if text == prev_text:
+                # Same word, check if they overlap significantly
+                overlap = min(end, float(prev["end"])) - max(start, float(prev["start"]))
+                duration = end - start
+                if overlap > 0 and (overlap / duration) > 0.5:
+                    is_duplicate = True
+                    break
+        
+        if not is_duplicate:
+            deduped.append(word)
+            seen_hashes.add(word_hash)
 
     return deduped
 
@@ -222,10 +250,21 @@ class TranscriptionService:
         wait=wait_exponential(multiplier=1, min=1, max=8),
         retry=retry_if_exception_type((APIConnectionError, APITimeoutError)),
     )
-    def _call_whisper(self, audio_path: Path, model: str, language: str | None = None) -> dict:
-        """Call a single Whisper model. Retries on connection/timeout errors only."""
+    def _call_whisper(
+        self,
+        audio_path: Path,
+        model: str,
+        language: str | None = None,
+        vocabulary_hints: list[str] | None = None,
+        client=None,
+    ) -> dict:
+        """Call a single Whisper model. Retries on connection/timeout errors only.
+
+        Gap 72: vocabulary_hints is passed as the 'prompt' field to bias Whisper
+        toward correct spellings of brand names and technical terms.
+        """
+        c = client or self.client
         with audio_path.open("rb") as audio_file:
-            # Prepare arguments
             params = {
                 "model": model,
                 "file": audio_file,
@@ -234,30 +273,35 @@ class TranscriptionService:
             }
             if language:
                 params["language"] = language
-                
-            response = self.client.audio.transcriptions.create(**params)
+            # Gap 72: inject custom vocabulary as a prompt hint
+            if vocabulary_hints:
+                params["prompt"] = ", ".join(vocabulary_hints[:50])  # Whisper prompt is capped
+
+            response = c.audio.transcriptions.create(**params)
         return response.model_dump() if hasattr(response, "model_dump") else dict(response)
 
-    def _transcribe_single(self, audio_path: Path, language: str | None = None) -> dict:
-        """Try each Whisper model in order for a single audio file."""
+    def _transcribe_single(
+        self,
+        audio_path: Path,
+        language: str | None = None,
+        vocabulary_hints: list[str] | None = None,
+    ) -> dict:
+        """Try each Groq Whisper model in order; fall back to OpenAI if all fail (Gap 42)."""
         last_error: Exception | None = None
 
         for i, model in enumerate(WHISPER_MODELS):
             try:
                 logger.info("Transcribing with model '%s' (%d/%d) [lang=%s]", model, i + 1, len(WHISPER_MODELS), language)
-                transcript = self._call_whisper(audio_path, model, language)
+                transcript = self._call_whisper(audio_path, model, language, vocabulary_hints)
 
-                # CRITICAL FIX: Validate response has minimum required fields
                 if not transcript or not isinstance(transcript, dict):
                     raise ValueError(f"Invalid transcript from model {model}: not a valid dict")
 
                 if "text" not in transcript:
                     raise ValueError(f"Transcript missing 'text' field from model {model}")
 
-                # DEBUG: Show what fields we got
                 logger.info("Transcript keys: %s", list(transcript.keys()))
 
-                # AUTO-GENERATE segments if missing or None (Groq API doesn't guarantee them)
                 if not transcript.get("segments"):
                     logger.warning("No segments or segments=None from model %s — auto-creating empty list", model)
                     transcript["segments"] = []
@@ -274,17 +318,45 @@ class TranscriptionService:
                         model, remaining,
                     )
                 else:
-                    logger.error("All %d Whisper models rate-limited.", len(WHISPER_MODELS))
+                    logger.error("All %d Groq Whisper models rate-limited. Trying OpenAI fallback.", len(WHISPER_MODELS))
 
             except Exception as exc:
                 logger.error("Model '%s' failed: %s", model, exc)
                 last_error = exc
                 continue
 
+        # Gap 42: All Groq models exhausted — try OpenAI Whisper as a final fallback
+        openai_key = settings.openai_api_key
+        if openai_key:
+            try:
+                logger.warning("All Groq models failed. Falling back to OpenAI whisper-1.")
+                from services.openai_client import make_openai_client
+                openai_client = make_openai_client(for_whisper=False)  # OpenAI base client
+                transcript = self._call_whisper(
+                    audio_path, OPENAI_FALLBACK_MODEL, language, vocabulary_hints,
+                    client=openai_client
+                )
+                if transcript and "text" in transcript:
+                    transcript.setdefault("segments", [])
+                    logger.info("OpenAI fallback transcription succeeded.")
+                    return transcript
+            except Exception as fallback_exc:
+                logger.error("OpenAI fallback also failed: %s", fallback_exc)
+                last_error = fallback_exc
+
         raise last_error  # type: ignore[misc]
 
-    def transcribe_audio(self, audio_path: Path, language: str | None = None) -> tuple[dict, float]:
-        """Transcribe audio with automatic chunking for large files."""
+    def transcribe_audio(
+        self,
+        audio_path: Path,
+        language: str | None = None,
+        vocabulary_hints: list[str] | None = None,
+    ) -> tuple[dict, float]:
+        """Transcribe audio with automatic chunking for large files.
+
+        Gap 72: Optional vocabulary_hints list biases Whisper toward correct
+        spellings of brand names, product terms, and speaker names.
+        """
         # Create temp dir for chunks within the audio's parent dir
         chunk_dir = Path(tempfile.mkdtemp(
             prefix="whisper_chunks_",
@@ -296,7 +368,7 @@ class TranscriptionService:
 
             if len(chunks) == 1:
                 # Single file — no chunking needed
-                transcript_json = self._transcribe_single(chunks[0][0], language)
+                transcript_json = self._transcribe_single(chunks[0][0], language, vocabulary_hints)
                 transcript_json["words"] = flatten_words(transcript_json)
                 words = transcript_json["words"]
                 duration = float(words[-1]["end"]) if words else 0.0
@@ -309,7 +381,7 @@ class TranscriptionService:
                     "Transcribing chunk %d/%d (offset=%.1fs, lang=%s)...",
                     idx + 1, len(chunks), offset, language
                 )
-                transcript = self._transcribe_single(chunk_path, language)
+                transcript = self._transcribe_single(chunk_path, language, vocabulary_hints)
                 
                 # FIX 3: Filter bad chunks — skip if transcription failed
                 if transcript is None or not _is_valid_transcript(transcript):

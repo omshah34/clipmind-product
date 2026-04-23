@@ -1,13 +1,21 @@
-# DEV ONLY — REVERT BEFORE DEPLOY
 from __future__ import annotations
 from datetime import datetime, timezone
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from api.dependencies import AuthenticatedUser, get_current_user
+from core.config import settings
 
 router = APIRouter(tags=['billing'])
 
+def _guard_production():
+    if settings.environment == "production":
+        raise HTTPException(
+            status_code=503, 
+            detail="Billing service is currently being migrated. Please check back later."
+        )
+
 @router.get('/status')
 def billing_status(user: AuthenticatedUser = Depends(get_current_user)) -> dict:
+    _guard_production()
     return {
         'plan': 'pro',
         'status': 'active',
@@ -20,6 +28,7 @@ def billing_status(user: AuthenticatedUser = Depends(get_current_user)) -> dict:
 
 @router.get('/usage')
 def billing_usage(user: AuthenticatedUser = Depends(get_current_user)) -> dict:
+    _guard_production()
     return {
         'videos_processed': 0,
         'clips_generated': 0,

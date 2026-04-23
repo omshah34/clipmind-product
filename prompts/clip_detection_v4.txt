@@ -28,8 +28,9 @@ HOOK SCORE — Judge only the first 3 seconds of the clip:
   • Claim that challenges conventional wisdom
   • A number or stat that shocks ("I lost $50,000 in one day")
 
-EMOTION SCORE — Judge the energy arc of the full clip:
+EMOTION SCORE — Judge the energy arc and sentiment peak of the full clip:
   • Visible spike in pace, emphasis, or repetition
+  • **SENTIMENT PEAK: Look for the most intense emotional shift or "breakthrough" moment.**
   • Genuine vulnerability, frustration, excitement, or conviction
   • Unexpected or self-deprecating humor
   • A passionate rant or strong opinion

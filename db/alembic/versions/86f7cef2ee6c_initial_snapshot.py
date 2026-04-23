@@ -19,26 +19,36 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # 000 Enable UUID
-    op.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp";')
+    bind = op.get_bind()
+    is_postgres = bind.dialect.name == 'postgresql'
+
+    # 000 Enable UUID (Postgres only)
+    if is_postgres:
+        op.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp";')
 
     # 001 Users
-    op.execute("""
+    # Note: gen_random_uuid() is Postgres-specific. 
+    # For SQLite, it will just be a default string or handled by the app.
+    id_default = "(gen_random_uuid()::text)" if is_postgres else "NULL"
+    timestamptz = "TIMESTAMPTZ" if is_postgres else "DATETIME"
+    now = "NOW()" if is_postgres else "CURRENT_TIMESTAMP"
+
+    op.execute(f"""
         CREATE TABLE IF NOT EXISTS users (
-            id                  TEXT    PRIMARY KEY DEFAULT (gen_random_uuid()::text),
+            id                  TEXT    PRIMARY KEY DEFAULT {id_default},
             email               TEXT    UNIQUE NOT NULL,
             full_name           TEXT,
             password_hash       TEXT,
             stripe_customer_id  TEXT    UNIQUE,
-            created_at          TIMESTAMPTZ DEFAULT NOW(),
-            updated_at          TIMESTAMPTZ DEFAULT NOW()
+            created_at          {timestamptz} DEFAULT {now},
+            updated_at          {timestamptz} DEFAULT {now}
         );
     """)
 
     # 002 Jobs
-    op.execute("""
+    op.execute(f"""
         CREATE TABLE IF NOT EXISTS jobs (
-            id                      TEXT        PRIMARY KEY DEFAULT (gen_random_uuid()::text),
+            id                      TEXT        PRIMARY KEY DEFAULT {id_default},
             status                  TEXT        NOT NULL DEFAULT 'uploaded',
             source_video_url        TEXT        NOT NULL,
             audio_url               TEXT,
@@ -54,18 +64,18 @@ def upgrade() -> None:
             user_id                 TEXT,
             brand_kit_id            TEXT,
             campaign_id             TEXT,
-            scheduled_publish_date  TIMESTAMPTZ,
-            created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            scheduled_publish_date  {timestamptz},
+            created_at              {timestamptz} NOT NULL DEFAULT {now},
+            updated_at              {timestamptz} NOT NULL DEFAULT {now}
         );
     """)
     op.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);")
     op.execute("CREATE INDEX IF NOT EXISTS idx_jobs_user_id ON jobs(user_id);")
 
     # 003 Brand Kits
-    op.execute("""
+    op.execute(f"""
         CREATE TABLE IF NOT EXISTS brand_kits (
-            id                TEXT       PRIMARY KEY DEFAULT (gen_random_uuid()::text),
+            id                TEXT       PRIMARY KEY DEFAULT {id_default},
             user_id           TEXT       NOT NULL,
             name              TEXT       NOT NULL DEFAULT 'Default Brand',
             font_name         TEXT       NOT NULL DEFAULT 'Arial',
@@ -79,68 +89,68 @@ def upgrade() -> None:
             intro_clip_url    TEXT,
             outro_clip_url    TEXT,
             is_default        INTEGER    NOT NULL DEFAULT 0,
-            created_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-            updated_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+            created_at        {timestamptz}  NOT NULL DEFAULT {now},
+            updated_at        {timestamptz}  NOT NULL DEFAULT {now}
         );
     """)
 
     # 004 Campaigns
-    op.execute("""
+    op.execute(f"""
         CREATE TABLE IF NOT EXISTS campaigns (
-            id                TEXT       PRIMARY KEY DEFAULT (gen_random_uuid()::text),
+            id                TEXT       PRIMARY KEY DEFAULT {id_default},
             user_id           TEXT       NOT NULL,
             name              TEXT       NOT NULL,
             description       TEXT,
-            schedule_config   TEXT       NOT NULL DEFAULT '{"publish_interval_days": 1, "publish_hour": 9, "publish_timezone": "UTC"}',
+            schedule_config   TEXT       NOT NULL DEFAULT '{{"publish_interval_days": 1, "publish_hour": 9, "publish_timezone": "UTC"}}',
             status            TEXT       NOT NULL DEFAULT 'active',
-            created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            created_at        {timestamptz} NOT NULL DEFAULT {now},
+            updated_at        {timestamptz} NOT NULL DEFAULT {now}
         );
     """)
 
     # 005 API Key / Watchdog tables
-    op.execute("""
+    op.execute(f"""
         CREATE TABLE IF NOT EXISTS connected_sources (
-            id               TEXT        PRIMARY KEY DEFAULT (gen_random_uuid()::text),
+            id               TEXT        PRIMARY KEY DEFAULT {id_default},
             user_id          TEXT        NOT NULL,
             name             TEXT        NOT NULL,
             source_type      TEXT        NOT NULL,
-            config_json      TEXT        NOT NULL DEFAULT '{}',
+            config_json      TEXT        NOT NULL DEFAULT '{{}}',
             is_active        BOOLEAN     DEFAULT TRUE,
-            last_polled_at   TIMESTAMPTZ,
+            last_polled_at   {timestamptz},
             last_error       TEXT,
-            last_success_at  TIMESTAMPTZ,
-            created_at       TIMESTAMPTZ DEFAULT NOW(),
-            updated_at       TIMESTAMPTZ DEFAULT NOW()
+            last_success_at  {timestamptz},
+            created_at       {timestamptz} DEFAULT {now},
+            updated_at       {timestamptz} DEFAULT {now}
         );
     """)
 
-    op.execute("""
+    op.execute(f"""
         CREATE TABLE IF NOT EXISTS processed_videos (
-            id               TEXT        PRIMARY KEY DEFAULT (gen_random_uuid()::text),
+            id               TEXT        PRIMARY KEY DEFAULT {id_default},
             source_id        TEXT        NOT NULL REFERENCES connected_sources(id) ON DELETE CASCADE,
             video_id         TEXT        NOT NULL,
             job_id           TEXT        REFERENCES jobs(id) ON DELETE SET NULL,
-            created_at       TIMESTAMPTZ DEFAULT NOW()
+            created_at       {timestamptz} DEFAULT {now}
         );
     """)
     op.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_source_video ON processed_videos(source_id, video_id);")
 
     # 006 Content DNA & Intelligence
-    op.execute("""
+    op.execute(f"""
         CREATE TABLE IF NOT EXISTS user_score_weights (
             user_id          TEXT       PRIMARY KEY,
-            weights          TEXT       DEFAULT '{"hook_weight": 1.0, "emotion_weight": 1.0, "clarity_weight": 1.0, "story_weight": 1.0, "virality_weight": 1.0}',
+            weights          TEXT       DEFAULT '{{"hook_weight": 1.0, "emotion_weight": 1.0, "clarity_weight": 1.0, "story_weight": 1.0, "virality_weight": 1.0}}',
             manual_overrides TEXT       DEFAULT '[]',
             signal_count     INTEGER    DEFAULT 0,
             confidence_score REAL       DEFAULT 0.0,
-            last_updated     TIMESTAMPTZ DEFAULT NOW()
+            last_updated     {timestamptz} DEFAULT {now}
         );
     """)
 
-    op.execute("""
+    op.execute(f"""
         CREATE TABLE IF NOT EXISTS dna_learning_logs (
-            id               TEXT        PRIMARY KEY DEFAULT (gen_random_uuid()::text),
+            id               TEXT        PRIMARY KEY DEFAULT {id_default},
             user_id          TEXT        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             log_type         TEXT        NOT NULL,
             dimension        TEXT,
@@ -148,7 +158,7 @@ def upgrade() -> None:
             new_value        FLOAT,
             reasoning_code   TEXT        NOT NULL,
             sample_size      INT         DEFAULT 0,
-            created_at       TIMESTAMPTZ DEFAULT NOW()
+            created_at       {timestamptz} DEFAULT {now}
         );
     """)
     op.execute("CREATE INDEX IF NOT EXISTS idx_dna_logs_user ON dna_learning_logs(user_id);")

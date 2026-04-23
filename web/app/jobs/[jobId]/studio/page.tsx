@@ -9,8 +9,10 @@ export const metadata: Metadata = { title: 'Clip Studio — ClipMind' };
 
 export default async function StudioPage({
   params,
+  searchParams,
 }: {
   params: { jobId: string };
+  searchParams: { clip?: string };
 }) {
   // const session = await auth();
 
@@ -92,7 +94,7 @@ export default async function StudioPage({
           </p>
         </div>
 
-        <ClipTimelineEditor jobId={params.jobId} userId={userId} />
+        <ClipTimelineEditor jobId={params.jobId} userId={userId} searchParams={searchParams} />
 
         {/* ── Tips panel (from File 2) ── */}
         <div style={{

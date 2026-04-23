@@ -25,7 +25,7 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     -- 009  users  (created first — many tables reference it)
     -- ====================================================================
     CREATE TABLE IF NOT EXISTS users (
-        id                  TEXT    PRIMARY KEY DEFAULT (gen_random_uuid()::text),
+        id                  UUID    PRIMARY KEY DEFAULT gen_random_uuid(),
         email               TEXT    UNIQUE NOT NULL,
         full_name           TEXT,
         password_hash       TEXT,
@@ -47,15 +47,15 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     );
 
     CREATE TABLE IF NOT EXISTS job_state_events (
-        id               TEXT PRIMARY KEY DEFAULT (gen_random_uuid()::text),
-        job_id           TEXT NOT NULL,
+        id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        job_id           UUID NOT NULL,
         previous_status   TEXT,
         new_status        TEXT NOT NULL,
         stage            TEXT,
         payload_json     TEXT NOT NULL DEFAULT '{}',
         source           TEXT NOT NULL DEFAULT 'system',
         request_id       TEXT,
-        user_id          TEXT,
+        user_id          UUID,
         created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
@@ -66,22 +66,23 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     -- 001  jobs
     -- ====================================================================
     CREATE TABLE IF NOT EXISTS jobs (
-        id                      TEXT        PRIMARY KEY DEFAULT (gen_random_uuid()::text),
+        id                      UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
         status                  TEXT        NOT NULL DEFAULT 'uploaded',
         source_video_url        TEXT        NOT NULL,
+        proxy_video_url         TEXT,
         audio_url               TEXT,
-        transcript_json         TEXT,
-        clips_json              TEXT,
-        timeline_json           TEXT,
+        transcript_json         JSONB,
+        clips_json              JSONB,
+        timeline_json           JSONB,
         failed_stage            TEXT,
         error_message           TEXT,
         retry_count             INTEGER     NOT NULL DEFAULT 0,
         prompt_version          TEXT        NOT NULL DEFAULT 'v4',
         estimated_cost_usd      REAL        NOT NULL DEFAULT 0,
         actual_cost_usd         REAL        NOT NULL DEFAULT 0,
-        user_id                 TEXT,
-        brand_kit_id            TEXT,
-        campaign_id             TEXT,
+        user_id                 UUID,
+        brand_kit_id            UUID,
+        campaign_id             UUID,
         scheduled_publish_date  TIMESTAMPTZ,
         language                TEXT        DEFAULT 'en',
         is_rejected             BOOLEAN     NOT NULL DEFAULT FALSE,
@@ -96,13 +97,17 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     CREATE INDEX IF NOT EXISTS idx_jobs_user_id ON jobs(user_id);
     CREATE INDEX IF NOT EXISTS idx_jobs_brand_kit_id ON jobs(brand_kit_id);
     CREATE INDEX IF NOT EXISTS idx_jobs_campaign_id ON jobs(campaign_id);
+    
+    -- Gap 33: Unique constraints for job deduplication
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedupe_user ON jobs (user_id, source_video_url, prompt_version) WHERE user_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedupe_anon ON jobs (source_video_url, prompt_version) WHERE user_id IS NULL;
 
     -- ====================================================================
     -- 002  brand_kits
     -- ====================================================================
     CREATE TABLE IF NOT EXISTS brand_kits (
-        id                TEXT       PRIMARY KEY DEFAULT (gen_random_uuid()::text),
-        user_id           TEXT       NOT NULL,
+        id                UUID       PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id           UUID       NOT NULL,
         name              TEXT       NOT NULL DEFAULT 'Default Brand',
         font_name         TEXT       NOT NULL DEFAULT 'Arial',
         font_size         INTEGER    NOT NULL DEFAULT 22,
@@ -114,6 +119,7 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
         watermark_url     TEXT,
         intro_clip_url    TEXT,
         outro_clip_url    TEXT,
+        vocabulary_hints  TEXT[],    -- Gap 72: Custom words for Whisper
         is_default        INTEGER    NOT NULL DEFAULT 0,
         created_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
         updated_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW()
@@ -125,8 +131,8 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     -- 004  campaigns
     -- ====================================================================
     CREATE TABLE IF NOT EXISTS campaigns (
-        id                TEXT       PRIMARY KEY DEFAULT (gen_random_uuid()::text),
-        user_id           TEXT       NOT NULL,
+        id                UUID       PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id           UUID       NOT NULL,
         name              TEXT       NOT NULL,
         description       TEXT,
         schedule_config   TEXT       NOT NULL DEFAULT '{"publish_interval_days": 1, "publish_hour": 9, "publish_timezone": "UTC"}',
@@ -142,8 +148,8 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     -- 005  api_keys / webhooks / webhook_deliveries / integrations
     -- ====================================================================
     CREATE TABLE IF NOT EXISTS api_keys (
-        id                 TEXT       PRIMARY KEY DEFAULT (gen_random_uuid()::text),
-        user_id            TEXT       NOT NULL,
+        id                 UUID       PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id            UUID       NOT NULL,
         name               TEXT       NOT NULL,
         key_prefix         TEXT       NOT NULL,
         key_hash           TEXT       NOT NULL,
@@ -160,8 +166,8 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     CREATE INDEX IF NOT EXISTS idx_api_keys_key_prefix ON api_keys(key_prefix);
 
     CREATE TABLE IF NOT EXISTS webhooks (
-        id               TEXT       PRIMARY KEY DEFAULT (gen_random_uuid()::text),
-        user_id          TEXT       NOT NULL,
+        id               UUID       PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id          UUID       NOT NULL,
         url              TEXT       NOT NULL,
         event_types      TEXT       NOT NULL,
         is_active        INTEGER    NOT NULL DEFAULT 1,
@@ -176,8 +182,8 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     CREATE INDEX IF NOT EXISTS idx_webhooks_user_id ON webhooks(user_id);
 
     CREATE TABLE IF NOT EXISTS webhook_deliveries (
-        id               TEXT       PRIMARY KEY DEFAULT (gen_random_uuid()::text),
-        webhook_id       TEXT       NOT NULL REFERENCES webhooks(id) ON DELETE CASCADE,
+        id               UUID       PRIMARY KEY DEFAULT gen_random_uuid(),
+        webhook_id       UUID       NOT NULL REFERENCES webhooks(id) ON DELETE CASCADE,
         event_type       TEXT       NOT NULL,
         event_data       TEXT       NOT NULL,
         http_status      INTEGER,
@@ -194,8 +200,8 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_status ON webhook_deliveries(status);
 
     CREATE TABLE IF NOT EXISTS integrations (
-        id                 TEXT       PRIMARY KEY DEFAULT (gen_random_uuid()::text),
-        user_id            TEXT       NOT NULL,
+        id                 UUID       PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id            UUID       NOT NULL,
         integration_type   TEXT       NOT NULL,
         name               TEXT       NOT NULL,
         config             TEXT       NOT NULL,
@@ -212,9 +218,9 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     -- 006  clip_performance / performance_alerts / platform_credentials
     -- ====================================================================
     CREATE TABLE IF NOT EXISTS clip_performance (
-        id                          TEXT       PRIMARY KEY DEFAULT (gen_random_uuid()::text),
-        user_id                     TEXT       NOT NULL,
-        job_id                      TEXT       NOT NULL,
+        id                          UUID       PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id                     UUID       NOT NULL,
+        job_id                      UUID       NOT NULL,
         clip_index                  INTEGER    NOT NULL,
         platform                    TEXT       NOT NULL,
         platform_clip_id            TEXT,
@@ -242,6 +248,7 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
 
     CREATE INDEX IF NOT EXISTS idx_clip_perf_user_id ON clip_performance(user_id);
     CREATE INDEX IF NOT EXISTS idx_clip_perf_job_id ON clip_performance(job_id);
+    CREATE INDEX IF NOT EXISTS idx_clip_perf_lookup ON clip_performance(user_id, job_id, clip_index);
     
     -- Idempotent column additions for Phase 5
     DO $$ 
@@ -269,8 +276,8 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     END $$;
 
     CREATE TABLE IF NOT EXISTS performance_alerts (
-        id              TEXT       PRIMARY KEY DEFAULT (gen_random_uuid()::text),
-        user_id         TEXT       NOT NULL,
+        id              UUID       PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id         UUID       NOT NULL,
         alert_type      TEXT       NOT NULL, -- 'milestone', 'weight_shift', 'sync_error'
         message         TEXT       NOT NULL,
         is_read         BOOLEAN    DEFAULT FALSE,
@@ -283,15 +290,15 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
 
     -- 24-hour Cooldown Tracker
     CREATE TABLE IF NOT EXISTS alert_cooldowns (
-        user_id         TEXT       NOT NULL,
+        user_id         UUID       NOT NULL,
         alert_type      TEXT       NOT NULL,
         last_alerted_at TIMESTAMPTZ DEFAULT NOW(),
         PRIMARY KEY (user_id, alert_type)
     );
 
     CREATE TABLE IF NOT EXISTS platform_credentials (
-        id                       TEXT       PRIMARY KEY DEFAULT (gen_random_uuid()::text),
-        user_id                  TEXT       NOT NULL,
+        id                       UUID       PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id                  UUID       NOT NULL,
         platform                 TEXT       NOT NULL,
         access_token_encrypted   TEXT,
         refresh_token_encrypted  TEXT,
@@ -321,9 +328,9 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
             END IF;
         END $$;
     CREATE TABLE IF NOT EXISTS content_signals (
-        id              TEXT       PRIMARY KEY DEFAULT (gen_random_uuid()::text),
-        user_id         TEXT       NOT NULL,
-        job_id          TEXT       NOT NULL,
+        id              UUID       PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id         UUID       NOT NULL,
+        job_id          UUID       NOT NULL,
         clip_index      INTEGER    NOT NULL,
         signal_type     TEXT       NOT NULL,
         signal_metadata TEXT,
@@ -334,7 +341,7 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     CREATE INDEX IF NOT EXISTS idx_content_signals_job ON content_signals(job_id);
 
     CREATE TABLE IF NOT EXISTS user_score_weights (
-        user_id          TEXT       PRIMARY KEY,
+        user_id          UUID       PRIMARY KEY,
         weights          TEXT       DEFAULT '{"hook_weight": 1.0, "emotion_weight": 1.0, "clarity_weight": 1.0, "story_weight": 1.0, "virality_weight": 1.0}',
         manual_overrides TEXT       DEFAULT '[]', -- List of weight keys that are locked
         signal_count     INTEGER    DEFAULT 0,
@@ -342,10 +349,34 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
         last_updated     TIMESTAMPTZ DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS dna_learning_logs (
+        id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id          UUID        NOT NULL,
+        log_type         TEXT        NOT NULL, -- 'shift', 'milestone', 'manual_reset'
+        dimension        TEXT,
+        old_value        REAL,
+        new_value        REAL,
+        reasoning_code   TEXT,
+        sample_size      INTEGER     DEFAULT 0,
+        created_at       TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_dna_learning_logs_user ON dna_learning_logs(user_id);
+
+    CREATE TABLE IF NOT EXISTS dna_executive_summaries (
+        id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id          UUID        NOT NULL,
+        summary_text     TEXT        NOT NULL,
+        context_log_ids  TEXT        NOT NULL, -- JSON list of log IDs used
+        created_at       TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_dna_executive_summaries_user ON dna_executive_summaries(user_id);
+
     CREATE TABLE IF NOT EXISTS clip_sequences (
-        id                      TEXT       PRIMARY KEY DEFAULT (gen_random_uuid()::text),
-        user_id                 TEXT       NOT NULL,
-        job_id                  TEXT       NOT NULL,
+        id                      UUID       PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id                 UUID       NOT NULL,
+        job_id                  UUID       NOT NULL,
         sequence_title          TEXT,
         clip_indices            TEXT       NOT NULL,
         series_description      TEXT,
@@ -359,8 +390,8 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     CREATE INDEX IF NOT EXISTS idx_clip_sequences_user ON clip_sequences(user_id);
 
     CREATE TABLE IF NOT EXISTS render_jobs (
-        id              TEXT       PRIMARY KEY DEFAULT (gen_random_uuid()::text),
-        job_id          TEXT       NOT NULL,
+        id              UUID       PRIMARY KEY DEFAULT gen_random_uuid(),
+        job_id          UUID       NOT NULL,
         clip_index      INTEGER    NOT NULL,
         edited_srt      TEXT,
         edited_style    TEXT,
@@ -373,8 +404,8 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     CREATE INDEX IF NOT EXISTS idx_render_jobs_status ON render_jobs(status);
 
     CREATE TABLE IF NOT EXISTS social_accounts (
-        id                       TEXT       PRIMARY KEY DEFAULT (gen_random_uuid()::text),
-        user_id                  TEXT       NOT NULL,
+        id                       UUID       PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id                  UUID       NOT NULL,
         platform                 TEXT       NOT NULL,
         account_id               TEXT       NOT NULL,
         account_username         TEXT,
@@ -391,12 +422,12 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     CREATE INDEX IF NOT EXISTS idx_social_accounts_user ON social_accounts(user_id);
 
     CREATE TABLE IF NOT EXISTS published_clips (
-        id                TEXT       PRIMARY KEY DEFAULT (gen_random_uuid()::text),
-        user_id           TEXT       NOT NULL,
-        job_id            TEXT       NOT NULL,
+        id                UUID       PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id           UUID       NOT NULL,
+        job_id            UUID       NOT NULL,
         clip_index        INTEGER    NOT NULL,
         platform          TEXT       NOT NULL,
-        social_account_id TEXT,
+        social_account_id UUID,
         platform_clip_id  TEXT,
         platform_url      TEXT,
         caption           TEXT,
@@ -414,8 +445,8 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     -- 008  workspaces / member / client / portals / audit / metrics
     -- ====================================================================
     CREATE TABLE IF NOT EXISTS workspaces (
-        id           TEXT       PRIMARY KEY DEFAULT (gen_random_uuid()::text),
-        owner_id     TEXT       NOT NULL,
+        id           UUID       PRIMARY KEY DEFAULT gen_random_uuid(),
+        owner_id     UUID       NOT NULL,
         name         TEXT       NOT NULL,
         slug         TEXT       UNIQUE NOT NULL,
         plan         TEXT       DEFAULT 'starter',
@@ -431,9 +462,9 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     CREATE INDEX IF NOT EXISTS idx_workspaces_slug ON workspaces(slug);
 
     CREATE TABLE IF NOT EXISTS workspace_members (
-        id            TEXT       PRIMARY KEY DEFAULT (gen_random_uuid()::text),
-        workspace_id  TEXT       NOT NULL,
-        user_id       TEXT       NOT NULL,
+        id            UUID       PRIMARY KEY DEFAULT gen_random_uuid(),
+        workspace_id  UUID       NOT NULL,
+        user_id       UUID       NOT NULL,
         role          TEXT       NOT NULL,
         joined_at     TIMESTAMPTZ DEFAULT NOW(),
         UNIQUE (workspace_id, user_id)
@@ -443,8 +474,8 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     CREATE INDEX IF NOT EXISTS idx_workspace_members_user ON workspace_members(user_id);
 
     CREATE TABLE IF NOT EXISTS workspace_clients (
-        id                   TEXT       PRIMARY KEY DEFAULT (gen_random_uuid()::text),
-        workspace_id         TEXT       NOT NULL,
+        id                   UUID       PRIMARY KEY DEFAULT gen_random_uuid(),
+        workspace_id         UUID       NOT NULL,
         client_name          TEXT       NOT NULL,
         client_contact_email TEXT,
         description          TEXT,
@@ -455,9 +486,9 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     CREATE INDEX IF NOT EXISTS idx_workspace_clients_workspace ON workspace_clients(workspace_id);
 
     CREATE TABLE IF NOT EXISTS client_portals (
-        id            TEXT       PRIMARY KEY DEFAULT (gen_random_uuid()::text),
-        workspace_id  TEXT       NOT NULL,
-        client_id     TEXT       NOT NULL,
+        id            UUID       PRIMARY KEY DEFAULT gen_random_uuid(),
+        workspace_id  UUID       NOT NULL,
+        client_id     UUID       NOT NULL,
         portal_slug   TEXT       UNIQUE NOT NULL,
         branding      TEXT       DEFAULT '{}',
         is_active     INTEGER    DEFAULT 1,
@@ -470,9 +501,9 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     CREATE INDEX IF NOT EXISTS idx_client_portals_slug ON client_portals(portal_slug);
 
     CREATE TABLE IF NOT EXISTS portal_submissions (
-        id                   TEXT       PRIMARY KEY DEFAULT (gen_random_uuid()::text),
-        portal_id            TEXT       NOT NULL,
-        job_id               TEXT       NOT NULL,
+        id                   UUID       PRIMARY KEY DEFAULT gen_random_uuid(),
+        portal_id            UUID       NOT NULL,
+        job_id               UUID       NOT NULL,
         submission_token     TEXT       UNIQUE NOT NULL,
         status               TEXT       DEFAULT 'pending',
         client_feedback      TEXT,
@@ -485,12 +516,12 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     CREATE INDEX IF NOT EXISTS idx_portal_submissions_status ON portal_submissions(status);
 
     CREATE TABLE IF NOT EXISTS workspace_audit_logs (
-        id             TEXT       PRIMARY KEY DEFAULT (gen_random_uuid()::text),
-        workspace_id   TEXT       NOT NULL,
-        user_id        TEXT,
+        id             UUID       PRIMARY KEY DEFAULT gen_random_uuid(),
+        workspace_id   UUID       NOT NULL,
+        user_id        UUID,
         action         TEXT       NOT NULL,
         resource_type  TEXT,
-        resource_id    TEXT,
+        resource_id    UUID,
         details        TEXT,
         created_at     TIMESTAMPTZ DEFAULT NOW()
     );
@@ -498,8 +529,8 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     CREATE INDEX IF NOT EXISTS idx_workspace_audit_logs_workspace ON workspace_audit_logs(workspace_id);
 
     CREATE TABLE IF NOT EXISTS workspace_metrics (
-        id                TEXT       PRIMARY KEY DEFAULT (gen_random_uuid()::text),
-        workspace_id      TEXT       NOT NULL,
+        id                UUID       PRIMARY KEY DEFAULT gen_random_uuid(),
+        workspace_id      UUID       NOT NULL,
         period_start      DATE       NOT NULL,
         period_end        DATE       NOT NULL,
         videos_processed  INTEGER    DEFAULT 0,
@@ -518,7 +549,7 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     -- user_preferences
     -- ====================================================================
     CREATE TABLE IF NOT EXISTS user_preferences (
-        user_id               TEXT       PRIMARY KEY,
+        user_id               UUID       PRIMARY KEY,
         goals                 TEXT       DEFAULT '[]',
         target_platform       TEXT,
         preferences_json      TEXT       DEFAULT '{}',
@@ -531,8 +562,8 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     -- 009  subscriptions
     -- ====================================================================
     CREATE TABLE IF NOT EXISTS subscriptions (
-        id                      TEXT       PRIMARY KEY DEFAULT (gen_random_uuid()::text),
-        user_id                 TEXT       NOT NULL,
+        id                      UUID       PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id                 UUID       NOT NULL,
         stripe_subscription_id  TEXT       UNIQUE NOT NULL,
         stripe_price_id         TEXT       NOT NULL,
         status                  TEXT       NOT NULL,
@@ -549,8 +580,8 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     -- 010  Autopilot (Connected Sources & Publish Queue)
     -- ====================================================================
     CREATE TABLE IF NOT EXISTS connected_sources (
-        id               TEXT        PRIMARY KEY DEFAULT (gen_random_uuid()::text),
-        user_id          TEXT        NOT NULL,
+        id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id          UUID        NOT NULL,
         name             TEXT        NOT NULL,
         source_type      TEXT        NOT NULL, -- 'youtube_channel', 'rss_feed', 'manual_batch'
         config_json      TEXT        NOT NULL DEFAULT '{}',
@@ -568,10 +599,10 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     -- 011  Processed Video Deduplication (Watchdog)
     -- ====================================================================
     CREATE TABLE IF NOT EXISTS processed_videos (
-        id               TEXT        PRIMARY KEY DEFAULT (gen_random_uuid()::text),
-        source_id        TEXT        NOT NULL REFERENCES connected_sources(id) ON DELETE CASCADE,
+        id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        source_id        UUID        NOT NULL REFERENCES connected_sources(id) ON DELETE CASCADE,
         video_id         TEXT        NOT NULL,
-        job_id           TEXT        REFERENCES jobs(id) ON DELETE SET NULL,
+        job_id           UUID        REFERENCES jobs(id) ON DELETE SET NULL,
         created_at       TIMESTAMPTZ DEFAULT NOW()
     );
 
@@ -579,9 +610,9 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
     CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_source_video ON processed_videos(source_id, video_id);
 
     CREATE TABLE IF NOT EXISTS publish_queue (
-        id               TEXT        PRIMARY KEY DEFAULT (gen_random_uuid()::text),
-        user_id          TEXT        NOT NULL,
-        job_id           TEXT        NOT NULL,
+        id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id          UUID        NOT NULL,
+        job_id           UUID        NOT NULL,
         clip_index       INTEGER     NOT NULL,
         platform         TEXT        NOT NULL,
         scheduled_for    TIMESTAMPTZ NOT NULL,
@@ -595,6 +626,112 @@ _POSTGRES_SCHEMA = textwrap.dedent("""\
 
     CREATE INDEX IF NOT EXISTS idx_publish_queue_status ON publish_queue(status);
     CREATE INDEX IF NOT EXISTS idx_publish_queue_scheduled ON publish_queue(scheduled_for);
+
+    -- ====================================================================
+    -- Gap 28: Foreign Key Constraints & Cascades
+    -- ====================================================================
+    DO $$ 
+    BEGIN 
+        -- jobs constraints
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_jobs_user_id') THEN
+            ALTER TABLE jobs ADD CONSTRAINT fk_jobs_user_id FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_jobs_brand_kit_id') THEN
+            ALTER TABLE jobs ADD CONSTRAINT fk_jobs_brand_kit_id FOREIGN KEY (brand_kit_id) REFERENCES brand_kits(id) ON DELETE SET NULL;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_jobs_campaign_id') THEN
+            ALTER TABLE jobs ADD CONSTRAINT fk_jobs_campaign_id FOREIGN KEY (campaign_id) REFERENCES campaigns(id) ON DELETE SET NULL;
+        END IF;
+
+        -- brand_kits constraints
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_brand_kits_user_id') THEN
+            ALTER TABLE brand_kits ADD CONSTRAINT fk_brand_kits_user_id FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+        END IF;
+
+        -- campaigns constraints
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_campaigns_user_id') THEN
+            ALTER TABLE campaigns ADD CONSTRAINT fk_campaigns_user_id FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+        END IF;
+
+        -- api_keys constraints
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_api_keys_user_id') THEN
+            ALTER TABLE api_keys ADD CONSTRAINT fk_api_keys_user_id FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+        END IF;
+
+        -- webhooks constraints
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_webhooks_user_id') THEN
+            ALTER TABLE webhooks ADD CONSTRAINT fk_webhooks_user_id FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+        END IF;
+
+        -- integrations constraints
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_integrations_user_id') THEN
+            ALTER TABLE integrations ADD CONSTRAINT fk_integrations_user_id FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+        END IF;
+
+        -- clip_performance constraints
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_clip_perf_user_id') THEN
+            ALTER TABLE clip_performance ADD CONSTRAINT fk_clip_perf_user_id FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_clip_perf_job_id') THEN
+            ALTER TABLE clip_performance ADD CONSTRAINT fk_clip_perf_job_id FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE;
+        END IF;
+
+        -- performance_alerts constraints
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_perf_alerts_user_id') THEN
+            ALTER TABLE performance_alerts ADD CONSTRAINT fk_perf_alerts_user_id FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+        END IF;
+
+        -- alert_cooldowns constraints
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_alert_cooldowns_user_id') THEN
+            ALTER TABLE alert_cooldowns ADD CONSTRAINT fk_alert_cooldowns_user_id FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+        END IF;
+
+        -- platform_credentials constraints
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_platform_creds_user_id') THEN
+            ALTER TABLE platform_credentials ADD CONSTRAINT fk_platform_creds_user_id FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+        END IF;
+
+        -- clip_sequences constraints
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_clip_sequences_user_id') THEN
+            ALTER TABLE clip_sequences ADD CONSTRAINT fk_clip_sequences_user_id FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_clip_sequences_job_id') THEN
+            ALTER TABLE clip_sequences ADD CONSTRAINT fk_clip_sequences_job_id FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE;
+        END IF;
+
+        -- viral_predictions constraints
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_viral_pred_user_id') THEN
+            ALTER TABLE viral_predictions ADD CONSTRAINT fk_viral_pred_user_id FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_viral_pred_job_id') THEN
+            ALTER TABLE viral_predictions ADD CONSTRAINT fk_viral_pred_job_id FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_viral_pred_clip_perf_id') THEN
+            ALTER TABLE viral_predictions ADD CONSTRAINT fk_viral_pred_clip_perf_id FOREIGN KEY (clip_perf_id) REFERENCES clip_performance(id) ON DELETE CASCADE;
+        END IF;
+
+        -- job_state_events constraints
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_job_state_events_job_id') THEN
+            ALTER TABLE job_state_events ADD CONSTRAINT fk_job_state_events_job_id FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_job_state_events_user_id') THEN
+            ALTER TABLE job_state_events ADD CONSTRAINT fk_job_state_events_user_id FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+        END IF;
+
+        -- workspaces constraints
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_workspaces_owner_id') THEN
+            ALTER TABLE workspaces ADD CONSTRAINT fk_workspaces_owner_id FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE;
+        END IF;
+
+        -- workspace_members constraints
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_workspace_members_workspace_id') THEN
+            ALTER TABLE workspace_members ADD CONSTRAINT fk_workspace_members_workspace_id FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_workspace_members_user_id') THEN
+            ALTER TABLE workspace_members ADD CONSTRAINT fk_workspace_members_user_id FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+        END IF;
+
+    END $$;
 """)
 # fmt: on
 
@@ -620,7 +757,7 @@ def init_db_tables(engine) -> None:
             conn.execute(text("""
                 INSERT INTO users (id, email, full_name, created_at, updated_at)
                 VALUES (
-                    :user_id, 
+                    :user_id::UUID, 
                     'local@clipmind.com', 
                     'Local Dev User', 
                     NOW(), NOW()
@@ -632,8 +769,8 @@ def init_db_tables(engine) -> None:
             conn.execute(text("""
                 INSERT INTO workspaces (id, owner_id, name, slug, is_active, created_at, updated_at)
                 VALUES (
-                    :user_id, 
-                    :user_id, 
+                    :user_id::UUID, 
+                    :user_id::UUID, 
                     'Local Dev Workspace', 
                     'local-dev', 
                     1, NOW(), NOW()
@@ -645,9 +782,9 @@ def init_db_tables(engine) -> None:
             conn.execute(text("""
                 INSERT INTO workspace_members (id, workspace_id, user_id, role, joined_at)
                 VALUES (
-                    :user_id, 
-                    :user_id, 
-                    :user_id, 
+                    :user_id::UUID, 
+                    :user_id::UUID, 
+                    :user_id::UUID, 
                     'owner', 
                     NOW()
                 )

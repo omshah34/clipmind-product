@@ -19,13 +19,20 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    bind = op.get_bind()
+    is_postgres = bind.dialect.name == 'postgresql'
+    
+    # Use TEXT for UUIDs on SQLite, UUID type on Postgres
+    id_type = sa.UUID() if is_postgres else sa.String(36)
+    now_func = sa.text('now()') if is_postgres else sa.text('CURRENT_TIMESTAMP')
+
     op.create_table(
         'dna_executive_summaries',
-        sa.Column('id', sa.UUID(), nullable=False),
-        sa.Column('user_id', sa.UUID(), nullable=False),
+        sa.Column('id', id_type, nullable=False),
+        sa.Column('user_id', id_type, nullable=False),
         sa.Column('summary_text', sa.Text(), nullable=False),
         sa.Column('context_log_ids', sa.JSON(), nullable=False), # Store as list of UUID strings
-        sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+        sa.Column('created_at', sa.DateTime(timezone=True), server_default=now_func, nullable=False),
         sa.PrimaryKeyConstraint('id')
     )
     op.create_index('ix_dna_exec_summaries_user_id', 'dna_executive_summaries', ['user_id'])

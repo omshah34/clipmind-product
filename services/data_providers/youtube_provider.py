@@ -13,7 +13,7 @@ from google.auth.transport.requests import Request
 
 from services.data_providers.base import DataProvider, PerformanceMetrics
 from services.data_providers.encryption import SecretManager
-from db.repositories.integrations import get_platform_credentials, save_platform_credentials
+from db.repositories.users import get_platform_credentials, save_platform_credentials
 from core.config import settings
 
 logger = logging.getLogger(__name__)

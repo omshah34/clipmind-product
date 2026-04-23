@@ -30,28 +30,33 @@ export default function SwipeDeck({ jobId, userId, clips, onComplete }: SwipeDec
 
   const currentClip = clips[currentIndex];
 
-  const handleSwipe = async (direction: 'left' | 'right') => {
+  const handleSwipe = (direction: 'left' | 'right') => {
     if (!currentClip) return;
     
     const clipIdx = currentClip.index || currentIndex;
 
-    try {
-      if (direction === 'right') {
-        await approveClip(jobId, clipIdx, userId);
-        setResults(prev => ({ ...prev, approved: prev.approved + 1 }));
-      } else {
-        await discardClip(jobId, clipIdx, userId);
-        setResults(prev => ({ ...prev, discarded: prev.discarded + 1 }));
-      }
-    } catch (err) {
-      console.error(`Swipe action failed for clip ${clipIdx}`, err);
-    }
-
+    // ── Optimistic Update ──────────────────────────────────────────────
+    // Immediately move to the next index without waiting for the API
     if (currentIndex < clips.length - 1) {
       setCurrentIndex(prev => prev + 1);
     } else {
       onComplete();
     }
+
+    // Fire API call in the background
+    const action = direction === 'right' ? approveClip : discardClip;
+    action(jobId, clipIdx, userId)
+      .then(() => {
+        setResults(prev => ({
+          ...prev,
+          [direction === 'right' ? 'approved' : 'discarded']: prev[direction === 'right' ? 'approved' : 'discarded'] + 1
+        }));
+      })
+      .catch(err => {
+        console.error(`Swipe action failed for clip ${clipIdx}`, err);
+        // Note: In a real production app, we might want to "rollback" or show a toast
+        // but for a swipe deck, silent logging is often preferred for flow.
+      });
   };
 
   if (!currentClip) {

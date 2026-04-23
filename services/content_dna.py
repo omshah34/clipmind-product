@@ -9,10 +9,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from db.repositories.jobs import get_job
 from db.repositories.content_dna import (
-    get_job,
     get_user_score_weights,
-    get_user_signal_counts,
     record_content_signal,
     update_user_score_weights,
 )
@@ -75,13 +74,35 @@ def record_signal(
 def _update_weights_from_signal(user_id: str, job_id: str, clip_index: int, signal_type: str) -> None:
     """The 'Brain' of Content DNA. Adjusts weights based on evidence."""
     job = get_job(job_id)
-    if not job or not job.clips_json:
+    if not job or not job.timeline_json: # timeline_json is used for clips in some contexts
+        # Fallback to clips_json if available
+        pass
+
+    # Fetch clips
+    clips_json = getattr(job, "clips_json", []) or []
+    if not clips_json and hasattr(job, "timeline_json"):
+        import json
+        try:
+            timeline = json.loads(job.timeline_json) if isinstance(job.timeline_json, str) else job.timeline_json
+            clips_json = timeline.get("clips", [])
+        except:
+            pass
+
+    if not clips_json:
         return
 
     # Find the specific clip to see its score profile
-    clip = next((c for c in job.clips_json if int(c.get("clip_index", -1)) == clip_index), None)
-    if not clip and signal_type != "regenerate":
+    def _get_clip_index(c):
+        if isinstance(c, dict):
+            return int(c.get("clip_index", -1))
+        return getattr(c, "clip_index", -1)
+
+    clip_obj = next((c for c in clips_json if _get_clip_index(c) == clip_index), None)
+    if not clip_obj and signal_type != "regenerate":
         return
+
+    # Normalize to dict
+    clip = clip_obj if isinstance(clip_obj, dict) else (clip_obj.model_dump() if hasattr(clip_obj, "model_dump") else (vars(clip_obj) if clip_obj else {}))
 
     # Fetch current weights
     dna_data = get_user_score_weights(user_id)
@@ -102,9 +123,6 @@ def _update_weights_from_signal(user_id: str, job_id: str, clip_index: int, sign
         confidence = dna_data["confidence_score"]
 
     # Simple Bayesian-inspired update:
-    # If a user downloads a clip that scored 9.0 on 'hook', 
-    # we increase the 'hook_weight' because they validated the AI's hook detection.
-    
     modifier = 0.0
     if signal_type in POSITIVE_SIGNALS:
         modifier = LEARNING_RATE
@@ -118,7 +136,7 @@ def _update_weights_from_signal(user_id: str, job_id: str, clip_index: int, sign
             if score > 7.0:
                 # Update current weight if not manual override
                 weight_key = dim.replace("_score", "_weight")
-                if weight_key in dna_data.get("manual_overrides", []):
+                if weight_key in (dna_data.get("manual_overrides", []) if dna_data else []):
                     continue
 
                 current_w = weights.get(weight_key, 1.0)
@@ -135,7 +153,7 @@ def _update_weights_from_signal(user_id: str, job_id: str, clip_index: int, sign
     # Confidence grows with signals, caps at 0.95
     confidence = min(0.95, signal_count / 50.0) 
 
-    update_user_score_weights(user_id, weights, signal_count, confidence, dna_data.get("manual_overrides", []))
+    update_user_score_weights(user_id, weights, signal_count, confidence, dna_data.get("manual_overrides", []) if dna_data else [])
     logger.debug("[dna] Updated weights for user %s: %s (confidence: %.2f)", user_id, weights, confidence)
 
 
@@ -150,7 +168,7 @@ def apply_performance_feedback(
     Adjust weights based on real-world performance outcomes.
     Implements dampened updates (+/- 15% cap) and sample size gating (n>=5).
     """
-    from db.repositories.content_dna import engine
+    from db.connection import engine
     from sqlalchemy import text
     
     logger.info("[dna] Applying performance feedback: user=%s job=%s delta=%.2f", user_id, job_id, delta)
@@ -169,21 +187,38 @@ def apply_performance_feedback(
 
     # 2. Logic: Identify which attributes to boost/dampen
     job = get_job(job_id)
-    if not job or not job.clips_json:
+    if not job:
         return
-    clip_obj = next((c for c in job.clips_json if (getattr(c, "clip_index", -1) if hasattr(c, "clip_index") else c.get("clip_index", -1)) == clip_index), None)
+        
+    clips_json = getattr(job, "clips_json", []) or []
+    if not clips_json and hasattr(job, "timeline_json"):
+        import json
+        try:
+            timeline = json.loads(job.timeline_json) if isinstance(job.timeline_json, str) else job.timeline_json
+            clips_json = timeline.get("clips", [])
+        except:
+            pass
+            
+    if not clips_json:
+        return
+        
+    # Find the specific clip to see its score profile
+    def _get_clip_index(c):
+        if isinstance(c, dict):
+            return int(c.get("clip_index", -1))
+        return getattr(c, "clip_index", -1)
+
+    clip_obj = next((c for c in clips_json if _get_clip_index(c) == clip_index), None)
     if not clip_obj:
         return
 
-    # Normalize to dict for easier access
-    clip = clip_obj.model_dump() if hasattr(clip_obj, "model_dump") else (clip_obj if isinstance(clip_obj, dict) else {})
+    # Normalize to dict
+    clip = clip_obj if isinstance(clip_obj, dict) else (clip_obj.model_dump() if hasattr(clip_obj, "model_dump") else vars(clip_obj))
 
     dna_data = get_user_score_weights(user_id)
     weights = dna_data["weights"] if dna_data else {k: 1.0 for k in SCORE_TO_WEIGHT.values()}
     
     # 3. Dampened Update
-    # If delta is positive, we increase weights of high-scoring dimensions for this clip.
-    # If delta is negative, we decrease them.
     modifier = PERFORMANCE_LEARNING_RATE if delta > 0 else -PERFORMANCE_LEARNING_RATE
     
     # Milestone boost
@@ -196,7 +231,7 @@ def apply_performance_feedback(
         if score > 7.5: # Only shift weights for strong attributes
             weight_key = SCORE_TO_WEIGHT.get(dim)
             if weight_key:
-                # Phase 6: Check for manual overrides
+                # Check for manual overrides
                 overrides = dna_data.get("manual_overrides", []) if dna_data else []
                 if weight_key in overrides:
                     continue
@@ -225,9 +260,6 @@ def apply_performance_feedback(
         )
         logger.info("[dna] Performance Loop: Applied shift to user %s weights", user_id)
         
-        # Phase 6: Trigger alert for significant shifts (>10%)
-        # For simplicity, we trigger if any weight changed by more than 0.05 in this cycle
-        # since PERFORMANCE_LEARNING_RATE is 0.10.
         from db.repositories.performance import create_performance_alert
         create_performance_alert(
             user_id=user_id,

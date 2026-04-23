@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import List, Optional
 from uuid import UUID
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from api.dependencies import get_current_user, AuthenticatedUser
 from db.repositories.integrations import (
@@ -13,6 +13,9 @@ from db.repositories.integrations import (
 from sqlalchemy import text
 from services.data_providers.encryption import SecretManager
 from core.config import settings
+import logging
+
+logger = logging.getLogger(__name__)
 
 integrations_router = APIRouter(prefix="/integrations", tags=["integrations"])
 
@@ -137,6 +140,11 @@ def oauth_callback(
             account_name=account_name,
             scopes=token_data.get("scope", "").split(" ")
         )
+        
+        # 3. Trigger immediate sync to populate initial data
+        from workers.analytics import sync_all_active_performance
+        sync_all_active_performance.delay()
+        
         return {"status": "success", "message": "YouTube connected successfully"}
 
     raise HTTPException(status_code=400, detail="Unsupported platform callback")

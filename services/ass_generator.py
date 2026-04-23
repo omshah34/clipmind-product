@@ -90,37 +90,47 @@ class ASSGenerator:
         ]
         return "\n".join(header)
 
-    def words_to_ass(self, words: list[dict], transients: list[float] | None = None, max_words_per_line: int = 3) -> str:
+    def words_to_ass(self, words: list[dict], transients: list[float] | None = None, max_chars_per_line: int = 18) -> str:
         """
         Converts word-level transcript data into word-by-word highlighted Dialogue lines.
-        Ensures zero drift by using discrete timestamped events.
-        
-        Phase 2 Updates:
-        - Injects emojis from VisualEngine.
-        - Adds 'Popping' animation tags.
-        - Uses transients (optional) to nudge highlight starts to nearest audio peak.
+        Uses character-aware wrapping to prevent mobile overflow (Gap 104).
         """
         if not words:
             return ""
 
         from services.visual_engine import VisualEngine
 
-        # Quality Check: Confidence Fallback
-        avg_prob = sum(w.get("probability", 1.0) for w in words) / len(words)
-        if avg_prob < 0.7:
-            logger.info("[ass] Low confidence (%.2f). Falling back to line-level highlighting.", avg_prob)
-            return self._generate_line_level(words, max_words_per_line)
+        # Group words into chunks that fit on screen
+        chunks: list[list[dict]] = []
+        current_chunk: list[dict] = []
+        current_len = 0
+        
+        for w in words:
+            word_text = w["word"].strip()
+            # If word is very long or current line is full, start new chunk
+            if current_len + len(word_text) > max_chars_per_line and current_chunk:
+                chunks.append(current_chunk)
+                current_chunk = []
+                current_len = 0
+            
+            current_chunk.append(w)
+            current_len += len(word_text) + 1
+            
+            # Max 2-3 words per line is still a good viral "rule of thumb"
+            if len(current_chunk) >= 3:
+                chunks.append(current_chunk)
+                current_chunk = []
+                current_len = 0
+        
+        if current_chunk:
+            chunks.append(current_chunk)
 
         dialogue_lines = []
-        
-        for i in range(0, len(words), max_words_per_line):
-            chunk = words[i : i + max_words_per_line]
-            
+        for chunk in chunks:
             for j, target_word in enumerate(chunk):
                 start_raw = float(target_word["start"])
                 end_raw = float(target_word["end"])
                 
-                # Visual Sync: Nudge start to nearest transient within ±100ms
                 if transients:
                     for t in transients:
                         if abs(t - start_raw) < 0.100:
@@ -130,7 +140,6 @@ class ASSGenerator:
                 start = format_ass_time(start_raw)
                 end = format_ass_time(end_raw)
                 
-                # Construct the line text
                 line_text = ""
                 for k, w in enumerate(chunk):
                     word_text = w["word"].strip()
@@ -140,14 +149,12 @@ class ASSGenerator:
                         word_text = word_text.upper()
                         
                     if k == j:
-                        # HIGHLIGHTED WORD + POP ANIMATION
-                        pop_tags = "{\\fscx120\\fscy120\\t(0,100,\\fscx100\\fscy100)}"
+                        # HIGHLIGHTED WORD
+                        pop_tags = "{\\fscx115\\fscy115\\t(0,80,\\fscx100\\fscy100)}"
                         color_tag = f"{{\\1c{self.style.secondary_color}}}"
-                        
                         display_text = f"{pop_tags}{color_tag}{word_text}"
                         if emoji:
                             display_text += f" {emoji}"
-                        
                         line_text += f"{display_text} "
                     else:
                         # NORMAL WORD

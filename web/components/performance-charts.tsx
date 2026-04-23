@@ -30,9 +30,10 @@ import { PerformanceSummary } from "@/lib/api";
 
 interface PerformanceChartsProps {
   data: PerformanceSummary;
+  clipIndex?: string | null;
 }
 
-export default function PerformanceCharts({ data }: PerformanceChartsProps) {
+export default function PerformanceCharts({ data, clipIndex }: PerformanceChartsProps) {
   // Platform comparison data
   const platformData = data.platform_stats.map((p) => ({
     name: p.platform,
@@ -167,17 +168,24 @@ export default function PerformanceCharts({ data }: PerformanceChartsProps) {
             <Tooltip cursor={{ strokeDasharray: '3 3' }} />
             <Legend />
             <Scatter name="Clips" data={scatterData}>
-              {scatterData.map((entry: any, index: number) => (
-                <ReCell 
-                  key={`cell-${index}`} 
-                  fill={
-                    entry.tier === 'viral' ? '#f093fb' :
-                    entry.tier === 'validated' ? '#00ff00' :
-                    entry.tier === 'emerging' ? '#4facfe' : '#94a3b8'
-                  }
-                  fillOpacity={entry.window_complete ? 1.0 : 0.4}
-                />
-              ))}
+              {scatterData.map((entry: any, index: number) => {
+                const isSelected = clipIndex !== null && entry.clip_index === parseInt(clipIndex || "-1", 10);
+                return (
+                  <ReCell 
+                    key={`cell-${index}`} 
+                    stroke={isSelected ? "#000" : "none"}
+                    strokeWidth={isSelected ? 3 : 0}
+                    fill={
+                      isSelected ? "#fff" :
+                      entry.tier === 'viral' ? '#f093fb' :
+                      entry.tier === 'validated' ? '#00ff00' :
+                      entry.tier === 'emerging' ? '#4facfe' : '#94a3b8'
+                    }
+                    fillOpacity={entry.window_complete ? 1.0 : 0.4}
+                    r={isSelected ? 10 : 6}
+                  />
+                );
+              })}
             </Scatter>
           </ScatterChart>
         </ResponsiveContainer>

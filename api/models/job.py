@@ -10,8 +10,12 @@ from datetime import datetime
 from typing import List, Optional
 import uuid
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, model_validator, field_validator
 import json
+
+# Gap 76: Import sanitization utility for XSS prevention
+from core.sanitize import sanitize_text, sanitize_list
+
 
 class ClipResult(BaseModel):
     clip_index: int
@@ -28,6 +32,17 @@ class ClipResult(BaseModel):
     reason: str
     hook_headlines: List[str] = []
     refinement_reason: Optional[str] = None
+
+    # Gap 76: Sanitize LLM-generated text fields to prevent stored XSS
+    @field_validator("reason", "refinement_reason", mode="before")
+    @classmethod
+    def sanitize_reason(cls, v):
+        return sanitize_text(str(v)) if v is not None else v
+
+    @field_validator("hook_headlines", mode="before")
+    @classmethod
+    def sanitize_headlines(cls, v):
+        return sanitize_list(v) if isinstance(v, list) else v
 
 
 class ClipSummary(BaseModel):
@@ -132,7 +147,23 @@ class JobClipsResponse(BaseModel):
 
 
 class ErrorResponse(BaseModel):
-    """Standard error shape for all 4xx responses."""
+    """Standard error shape for all 4xx/5xx responses.
+    
+    Gap 71: 'code' carries a machine-readable ClipMind error identifier (CM-XXXX).
+    """
 
     error: str
     message: str
+    code: str | None = None  # Gap 71: e.g. "CM-4001"
+
+
+class JobRejectionResponse(BaseModel):
+    status: str
+    message: str
+    job_id: str
+
+
+class ClipSearchResponse(BaseModel):
+    status: str
+    query: str
+    results: List[ClipResult]

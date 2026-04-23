@@ -3,9 +3,19 @@ Purpose: Test DNA Intelligence services, triggers, and transparency.
 """
 
 import unittest
+import sys
+import os
 from unittest.mock import MagicMock, patch
+
+# Add project root to path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Import services
 from services.dna.insight_reporter import InsightReporter
 from services.dna.content_advisor import ContentAdvisor
+
+# Force import of workers submodules to help patcher
+import workers.track_signals
 
 class TestDNAIntelligence(unittest.TestCase):
 
@@ -57,9 +67,6 @@ class TestDNAIntelligence(unittest.TestCase):
         mock_get_weights.return_value = {"weights": {"hook": 1.0}}
         mock_get_signals.return_value = [{"signal_type": "published"}] * 10
         
-        # Trigger aggregation (mocking internal calculation isn't easy, so we test the flow)
-        # In actual test we'd control calculate_optimal_weights but here we just check if 
-        # the call is made when weights are updated.
         # Trigger aggregation
         with patch("workers.track_signals.calculate_optimal_weights") as mock_calc:
             mock_calc.return_value = {"hook": 1.2, "story": 1.0}

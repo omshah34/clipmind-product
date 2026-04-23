@@ -27,6 +27,7 @@ type Clip = ClipPreviewData['current_clips'][number] & {
 type ClipTimelineEditorProps = {
   jobId: string;
   userId: string;
+  searchParams?: { clip?: string };
 };
 
 /* ─── Design tokens ────────────────────────────────────────── */
@@ -172,6 +173,7 @@ function ClipCard({
 
   return (
     <div
+      id={`clip-card-${clipNum - 1}`}
       onClick={onSelect}
       style={{
         background: isSelected ? T.cardHover : T.card,
@@ -392,9 +394,35 @@ export default function ClipTimelineEditor({ jobId, userId }: ClipTimelineEditor
   const [loadingHooks, setLoadingHooks] = useState(false);
 
   useEffect(() => { loadData(); }, [jobId]);
+  
+  // Gap 118: Deep link support — select clip from query param on mount
+  useEffect(() => {
+    if (searchParams?.clip && preview?.current_clips) {
+      const idx = parseInt(searchParams.clip, 10);
+      if (!isNaN(idx)) {
+        // Clips in current_clips are 0-indexed in state, 
+        // but search param might be 1-indexed for humans (e.g. ?clip=1)
+        // We check both for robustness.
+        const found = preview.current_clips.findIndex(c => (c as any).index === idx || (c as any).clip_index === idx);
+        if (found !== -1) {
+          setSelectedIdx(found);
+          // Scroll to the card after a short delay for render
+          setTimeout(() => {
+            const el = document.getElementById(`clip-card-${found}`);
+            if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          }, 500);
+        } else if (idx >= 0 && idx < preview.current_clips.length) {
+          setSelectedIdx(idx);
+          setTimeout(() => {
+            const el = document.getElementById(`clip-card-${idx}`);
+            if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          }, 500);
+        }
+      }
+    }
+  }, [searchParams?.clip, preview]);
 
   useEffect(() => {
-    if (preview && preview.current_clips.length > 0) {
       loadHookVariants(selectedIdx);
     }
   }, [selectedIdx, preview]);

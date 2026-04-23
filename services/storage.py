@@ -25,9 +25,13 @@ from core.config import settings
 
 
 def _safe_name(filename: str) -> str:
+    """Sanitize filename to prevent path traversal and shell injection."""
+    # Remove any directory components
+    name = Path(filename).name
+    # Filter for allowed characters
     return "".join(
         char if char.isalnum() or char in {".", "-", "_"} else "_"
-        for char in filename
+        for char in name
     )
 
 
@@ -61,7 +65,40 @@ class StorageService:
         token = signed["token"] if isinstance(signed, dict) else signed.token
         return object_path, signed_url, token
 
+    def create_signed_url(self, object_path: str, expires_in: int = 3600) -> str:
+        """Create a temporary signed URL for private object access (Gap 65)."""
+        if self.supabase is None:
+            # For local storage, just return the public URL (simulated)
+            return self.build_public_url(object_path)
+            
+        res = self.supabase.storage.from_(settings.storage_bucket).create_signed_url(
+            path=object_path,
+            expires_in=expires_in
+        )
+        # Handle both dict and object response formats from different supabase-py versions
+        return res["signed_url"] if isinstance(res, dict) else res
+
+    def get_presigned_url(self, url: str, expires_in: int = 3600) -> str:
+        """Convert a public URL or object path into a signed URL if needed."""
+        if not url or "://" not in url:
+            return url # Already an object path or empty
+            
+        if self.supabase:
+            bucket_prefix = f"/storage/v1/object/public/{settings.storage_bucket}/"
+            parsed = urlparse(url)
+            if bucket_prefix in parsed.path:
+                object_path = parsed.path.split(bucket_prefix)[1]
+                return self.create_signed_url(object_path, expires_in)
+        
+        return url
+
     def upload_file(self, local_path: Path, folder: str, filename: str) -> str:
+        """Upload a file to Supabase storage.
+        
+        Gap 54: For files > 5GB, Supabase requires TUS (Resumable) or Multipart.
+        Standard 'upload' will fail on extremely large source files.
+        Roadmap: Implement TUS protocol via tus-py-client for 5GB+ stability.
+        """
         safe_name = self.build_object_path(folder, filename).split("/", 1)[1]
         if self.supabase is None:
             destination = self.local_root / folder / safe_name
@@ -100,6 +137,50 @@ class StorageService:
                 for chunk in response.iter_bytes():
                     file_handle.write(chunk)
         return local_target
+
+    async def delete_file(self, url: str) -> bool:
+        """Delete a file from storage given its public URL or file URI (Gap 27).
+        
+        Returns:
+            True if deletion was attempted, False if URL was invalid/empty.
+        """
+        import os
+        if not url:
+            return False
+
+        # 1. Handle local file URIs
+        if url.startswith("file://"):
+            parsed = urlparse(url)
+            raw_path = unquote(parsed.path)
+            # Handle Windows leading slash in URIs (e.g., /C:/...)
+            if os.name == "nt" and raw_path.startswith("/") and ":" in raw_path[1:3]:
+                path = Path(raw_path.lstrip("/"))
+            else:
+                path = Path(raw_path)
+            
+            if path.exists():
+                try:
+                    path.unlink()
+                    return True
+                except Exception:
+                    # Reraise or log? Calling code handles it.
+                    raise
+            return False
+
+        # 2. Handle Cloud Storage (Supabase)
+        if self.supabase:
+            bucket_prefix = f"/storage/v1/object/public/{settings.storage_bucket}/"
+            parsed = urlparse(url)
+            if bucket_prefix in parsed.path:
+                object_path = parsed.path.split(bucket_prefix)[1]
+                try:
+                    # Note: Python Supabase client storage methods are currently synchronous
+                    self.supabase.storage.from_(settings.storage_bucket).remove([object_path])
+                    return True
+                except Exception:
+                    raise
+        
+        return False
 
 
 storage_service = StorageService()

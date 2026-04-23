@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
 
 from api.models.job import (
     ClipSummary,
@@ -18,9 +19,24 @@ from api.models.job import (
     JobClipsResponse,
     JobRecord,
     JobStatusResponse,
+    JobRejectionResponse,
+    ClipSearchResponse,
 )
 from db.repositories.jobs import get_job, update_job
+from db.connection import engine
 from services.discovery import get_discovery_service
+
+
+# Gap 71: Machine-readable error code registry
+ERROR_CODES = {
+    "job_not_found": "CM-4001",
+    "job_not_ready": "CM-4002",
+    "job_already_rejected": "CM-4003",
+    "rejection_window_expired": "CM-4004",
+    "completion_timestamp_missing": "CM-4005",
+    "invalid_job_state": "CM-4006",
+    "delete_failed": "CM-5001",
+}
 
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -42,7 +58,9 @@ def build_clip_summaries(job: JobRecord) -> list[ClipSummary] | None:
 
 
 def error_response(error: str, message: str, status_code: int) -> JSONResponse:
-    payload = ErrorResponse(error=error, message=message)
+    # Gap 71: Attach machine-readable error code
+    code = ERROR_CODES.get(error, "CM-5000")  # CM-5000 = unknown error
+    payload = ErrorResponse(error=error, message=message, code=code)
     return JSONResponse(status_code=status_code, content=payload.model_dump())
 
 
@@ -78,46 +96,70 @@ def get_job_clips(job_id: str) -> JobClipsResponse:
 
 @router.post("/{job_id}/reject", status_code=200)
 def reject_job(job_id: str) -> dict:
-    """Mark a job as rejected if within the 5-minute window after completion."""
+    """Mark a job as rejected if within the 5-minute window after completion.
+    
+    Gap 82: Entire operation (update + audit log) runs inside a single transaction.
+    """
+    import logging
+    _logger = logging.getLogger(__name__)
+
     job = get_job(job_id)
     if job is None:
-        raise HTTPException(status_code=404, detail="Job not found")
+        raise HTTPException(status_code=404, detail={"error": "job_not_found", "code": ERROR_CODES["job_not_found"]})
     
     if job.status != "completed":
-        raise HTTPException(status_code=400, detail="Only completed jobs can be rejected")
+        raise HTTPException(status_code=400, detail={"error": "invalid_job_state", "code": ERROR_CODES["invalid_job_state"], "message": "Only completed jobs can be rejected"})
     
     if job.is_rejected:
-        return {"message": "Job already rejected", "job_id": job.id}
+        return {"message": "Job already rejected", "job_id": job.id, "code": ERROR_CODES["job_already_rejected"]}
     
     # Check rejection window: completed_at < 5 minutes
     if not job.completed_at:
-        raise HTTPException(status_code=400, detail="Job completion timestamp missing")
+        raise HTTPException(status_code=400, detail={"error": "completion_timestamp_missing", "code": ERROR_CODES["completion_timestamp_missing"]})
     
-    # Ensure both are UTC if necessary, but here we assume DB stores correctly
     now = datetime.now(timezone.utc)
     comp_at = job.completed_at
     if comp_at.tzinfo is None:
         comp_at = comp_at.replace(tzinfo=timezone.utc)
 
     delta = (now - comp_at).total_seconds()
-    if delta > 300: # 5 minutes
+    if delta > 300:  # 5 minutes
         raise HTTPException(
-            status_code=400, 
-            detail=f"Rejection window expired (elapsed: {int(delta)}s, max: 300s)"
+            status_code=400,
+            detail={
+                "error": "rejection_window_expired",
+                "code": ERROR_CODES["rejection_window_expired"],
+                "message": f"Rejection window expired (elapsed: {int(delta)}s, max: 300s)"
+            }
         )
     
-    # Mark as rejected
-    update_job(
-        job_id, 
-        is_rejected=True, 
-        rejected_at=datetime.now(timezone.utc)
-    )
+    # Gap 82: Atomic transaction — update job + write audit log in a single commit
+    from db.job_state import record_job_transition
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE jobs SET is_rejected = 1, rejected_at = :ts WHERE id = :id"),
+                {"ts": now.isoformat(), "id": str(job_id)},
+            )
+            # Inline audit log insertion to guarantee atomicity
+            conn.execute(
+                text("""
+                    INSERT INTO job_state_events
+                        (job_id, previous_status, new_status, stage, source, created_at)
+                    VALUES
+                        (:job_id, :prev, 'rejected', 'reject', 'user_action', :ts)
+                """),
+                {"job_id": str(job_id), "prev": job.status, "ts": now.isoformat()},
+            )
+    except Exception as exc:
+        _logger.error("Failed to atomically reject job %s: %s", job_id, exc)
+        raise HTTPException(status_code=500, detail="Failed to reject job")
     
-    return {
-        "status": "success",
-        "message": "Job rejected successfully. Mock credit refund logged.",
-        "job_id": job.id
-    }
+    return JobRejectionResponse(
+        status="success",
+        message="Job rejected successfully.",
+        job_id=job.id
+    )
 
 
 @router.get("/search", status_code=200)
@@ -131,8 +173,67 @@ async def semantic_search_clips(q: str, limit: int = 5) -> dict:
     # For MVP, we search globally or use the dev_mock_user_id
     results = await discovery.search_clips(query=q, limit=limit)
     
+    return ClipSearchResponse(
+        status="success",
+        query=q,
+        results=results
+    )
+
+
+@router.delete("/{job_id}", status_code=200)
+async def delete_job_endpoint(job_id: str):
+    """Delete a job and its associated storage files (Gap 27).
+    
+    Order of operations:
+    1. Fetch file URLs.
+    2. Delete DB record (atomic).
+    3. Cleanup files from storage (best effort).
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    # 1. Fetch job to get file URLs before deletion
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Collect all file URLs to delete
+    files_to_delete = []
+    if job.source_video_url:
+        files_to_delete.append(job.source_video_url)
+    if job.audio_url:
+        files_to_delete.append(job.audio_url)
+    
+    # Also collect clip output files from clips_json
+    if job.clips_json:
+        for clip in job.clips_json:
+            if isinstance(clip, dict):
+                url = clip.get("clip_url")
+                if url:
+                    files_to_delete.append(url)
+
+    # 2. Delete from DB first (Critical order: DB record must be gone first)
+    from db.repositories.jobs import delete_job
+    success = delete_job(job_id)
+    
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to delete job record")
+
+    # 3. Clean up storage files (Best effort, individual try-except)
+    from services.storage import storage_service
+    
+    deleted_count = 0
+    for url in files_to_delete:
+        try:
+            await storage_service.delete_file(url)
+            deleted_count += 1
+        except Exception as exc:
+            # We don't fail the whole request if one file fails to delete, 
+            # but we log the orphan for manual cleanup if needed.
+            logger.error(f"Orphaned file after job delete: {url} — {exc}")
+
     return {
         "status": "success",
-        "query": q,
-        "results": results
+        "message": f"Job {job_id} and {deleted_count}/{len(files_to_delete)} associated files deleted.",
+        "job_id": job_id
     }

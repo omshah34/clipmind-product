@@ -2,7 +2,7 @@
 
 import React from "react";
 
-export default function PerformanceSummaryCards({ data }: { data: any }) {
+export default function PerformanceSummaryCards({ data, clipIndex }: { data: any, clipIndex?: string | null }) {
   const formatNumber = (num: number | null): string => {
     if (num === null || num === undefined) return "0";
     if (num >= 1000000) return (num / 1000000).toFixed(1) + "M";
@@ -11,7 +11,27 @@ export default function PerformanceSummaryCards({ data }: { data: any }) {
   };
 
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 24 }}>
+    <div className="space-y-4">
+      {clipIndex && (
+        <div style={{ 
+          background: "rgba(82, 113, 255, 0.1)", 
+          border: "1px solid rgba(82, 113, 255, 0.2)",
+          padding: "8px 16px",
+          borderRadius: 12,
+          display: "flex",
+          alignItems: "center",
+          gap: 12,
+          width: "fit-content",
+          marginBottom: 12
+        }}>
+          <span style={{ fontSize: 18 }}>🎯</span>
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 700, color: "#5271ff" }}>Focused on Clip #{clipIndex}</div>
+            <div style={{ fontSize: 11, color: "var(--muted)" }}>Showing targeted analytics for this specific moment.</div>
+          </div>
+        </div>
+      )}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 24 }}>
       {/* Total Views Card */}
       <div className="panel" style={{ 
         background: "linear-gradient(135deg, rgba(82, 113, 255, 0.05), rgba(0, 0, 0, 0))",
@@ -67,6 +87,7 @@ export default function PerformanceSummaryCards({ data }: { data: any }) {
           Engagement matches AI prediction
         </div>
       </div>
+    </div>
     </div>
   );
 }

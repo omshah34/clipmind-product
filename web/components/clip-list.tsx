@@ -84,6 +84,27 @@ export default function ClipList({ clips, jobId }: { clips: ClipSummary[]; jobId
           <p style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.6, margin: 0 }}>
             {clip.reason}
           </p>
+          {/* Actions */}
+          <div style={{ display: 'flex', gap: 10, marginTop: 'auto' }}>
+             <a 
+               href={`/intelligence?job_id=${jobId}&clip_index=${clip.clip_index}`}
+               style={{ 
+                 fontSize: 11, fontWeight: 700, color: '#5271ff', 
+                 textDecoration: 'none', display: 'flex', alignItems: 'center', gap: 4 
+               }}
+             >
+               <span>📊</span> View Intelligence
+             </a>
+             <a 
+               href={`/jobs/${jobId}/studio?clip=${clip.clip_index}`}
+               style={{ 
+                 fontSize: 11, fontWeight: 700, color: '#a53c2f', 
+                 textDecoration: 'none', display: 'flex', alignItems: 'center', gap: 4 
+               }}
+             >
+               <span>🎬</span> Edit in Studio
+             </a>
+          </div>
         </article>
       ))}
     </div>

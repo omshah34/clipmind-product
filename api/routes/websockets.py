@@ -23,15 +23,22 @@ from services.ws_manager import drain_events
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["websockets"])
 
+# Gap 61: Maximum idle time before the server closes a stale connection
+_WS_IDLE_TIMEOUT_SECONDS = 300.0  # 5 minutes
+
 
 @router.websocket("/ws/jobs/{job_id}")
 async def job_status_ws(websocket: WebSocket, job_id: str) -> None:
-    """Stream real-time pipeline events for a specific job."""
+    """Stream real-time pipeline events for a specific job.
+    
+    Gap 61: Idle connections are closed after _WS_IDLE_TIMEOUT_SECONDS of inactivity.
+    """
     await websocket.accept()
     logger.info("[ws] Client connected for job=%s", job_id)
 
-    cursor = 0.0  # timestamp cursor — only send events after this
-    poll_interval = 0.5  # seconds between polls
+    cursor = 0.0        # timestamp cursor — only send events after this
+    poll_interval = 0.5 # seconds between polls
+    last_activity = time.monotonic()  # Gap 61: track idle time
 
     try:
         # Send any buffered history first (catch-up for late joiners)
@@ -40,14 +47,22 @@ async def job_status_ws(websocket: WebSocket, job_id: str) -> None:
             for event in history:
                 await websocket.send_json(event)
             cursor = history[-1]["timestamp"]
+            last_activity = time.monotonic()
 
         # Main event loop
         while True:
+            # Gap 61: Close stale connections that have been idle too long
+            if time.monotonic() - last_activity > _WS_IDLE_TIMEOUT_SECONDS:
+                logger.info("[ws] Closing idle connection for job=%s (no activity for %.0fs)", job_id, _WS_IDLE_TIMEOUT_SECONDS)
+                await websocket.close(code=1000, reason="Idle timeout")
+                return
+
             # Check for new events
             new_events = drain_events(job_id, after=cursor)
             for event in new_events:
                 await websocket.send_json(event)
                 cursor = event["timestamp"]
+                last_activity = time.monotonic()  # Gap 61: reset idle clock on activity
 
                 # If job completed or errored fatally, close after sending
                 if event["type"] in ("completed", "error"):
@@ -66,6 +81,7 @@ async def job_status_ws(websocket: WebSocket, job_id: str) -> None:
                 if isinstance(msg, dict):
                     if msg.get("type") == "ping":
                         await websocket.send_json({"type": "pong", "timestamp": time.time()})
+                        last_activity = time.monotonic()  # Gap 61: ping counts as activity
             except asyncio.TimeoutError:
                 # No client message — that's normal, continue polling
                 pass

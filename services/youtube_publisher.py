@@ -47,16 +47,18 @@ def upload_to_youtube(file_path: Path, metadata: dict, access_token: str) -> dic
         
         caption = metadata.get("caption", "ClipMind Video")
         tags = metadata.get("hashtags", [])
+        category_id = metadata.get("categoryId", "22")
+        privacy_status = metadata.get("privacyStatus", "private")
         
         body = {
             "snippet": {
                 "title": caption[:100],
                 "description": caption + "\n\n" + " ".join([f"#{t}" for t in tags]),
                 "tags": tags,
-                "categoryId": "22"
+                "categoryId": category_id
             },
             "status": {
-                "privacyStatus": "private",
+                "privacyStatus": privacy_status,
                 "selfDeclaredMadeForKids": False
             }
         }

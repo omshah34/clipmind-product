@@ -20,7 +20,7 @@ import logging
 import shutil
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Generator
@@ -136,6 +136,21 @@ def process_job(self, job_id: str) -> list[dict]:
                 source_video_path,
             )
             emit_progress(job_id, current_stage, progress=15)
+            
+            # -- Gap 63: Generate Preview Proxy ----------------------------
+            try:
+                current_stage = "generating_proxy"
+                with _stage_timer(job_id, current_stage):
+                    update_job(job.id, status=current_stage)
+                    proxy_path = temp_dir / f"{job.id}_proxy.mp4"
+                    from services.video_processor import generate_proxy_video
+                    generate_proxy_video(source_video_path, proxy_path)
+                    proxy_url = storage_service.upload_file(proxy_path, "proxies", f"{job.id}_proxy.mp4")
+                    update_job(job.id, proxy_video_url=proxy_url)
+                    logger.info("[job=%s] Preview proxy generated and uploaded", job_id)
+            except Exception as proxy_exc:
+                # Proxy is non-critical for pipeline success, just for UI smoothness
+                logger.warning("[job=%s] Proxy generation failed: %s", job_id, proxy_exc)
 
         # ------------------------------------------------------------------ #
         # 2. Extract audio (Branch: skip if source is already audio)
@@ -163,9 +178,19 @@ def process_job(self, job_id: str) -> list[dict]:
         emit_stage(job_id, current_stage, progress=35)
         with _stage_timer(job_id, current_stage):
             update_job(job.id, status=current_stage)
+            
+            # Gap 72: Fetch vocabulary hints from brand kit if available
+            vocab_hints = None
+            if job.brand_kit_id:
+                brand_kit = get_brand_kit(job.brand_kit_id)
+                if brand_kit and brand_kit.vocabulary_hints:
+                    vocab_hints = brand_kit.vocabulary_hints
+                    logger.info("[job=%s] Using %d vocabulary hints for transcription", job_id, len(vocab_hints))
+
             transcript_json, transcription_cost = transcription_service.transcribe_audio(
                 audio_path,
-                language=job.language
+                language=job.language,
+                vocabulary_hints=vocab_hints
             )
             actual_cost += transcription_cost
             word_count = sum(len(s.get("words", [])) for s in transcript_json.get("segments", []))
@@ -217,7 +242,7 @@ def process_job(self, job_id: str) -> list[dict]:
                 status="completed",
                 clips_json=[],
                 actual_cost_usd=round(actual_cost, 6),
-                completed_at=datetime.now(),
+                completed_at=datetime.now(timezone.utc),
             )
             emit_completed(job_id, 0, 0.0, time.monotonic() - pipeline_start)
             return []
@@ -237,6 +262,7 @@ def process_job(self, job_id: str) -> list[dict]:
 
             raw_clip_path   = temp_dir / f"clip_{clip_index}_raw.mp4"
             ass_path        = temp_dir / f"clip_{clip_index}.ass"
+            srt_path        = temp_dir / f"clip_{clip_index}.srt"
             final_clip_path = temp_dir / f"clip_{clip_index}_final.mp4"
 
             try:
@@ -343,6 +369,14 @@ def process_job(self, job_id: str) -> list[dict]:
                             transients=transients
                         )
                         
+                        # Gap 107: Also generate a sidecar SRT for the user
+                        write_clip_srt(
+                            job.transcript_json,
+                            clip_start_time=float(clip["start_time"]),
+                            clip_end_time=float(clip["end_time"]),
+                            output_path=srt_path
+                        )
+                        
                         # Handle Watermark
                         watermark_path = None
                         if job.brand_kit_id:
@@ -437,6 +471,12 @@ def process_job(self, job_id: str) -> list[dict]:
                         "clips",
                         f"{job.id}_clip_{clip_index}.mp4",
                     )
+                    # Gap 107: Upload sidecar SRT
+                    srt_url = storage_service.upload_file(
+                        srt_path,
+                        "clips",
+                        f"{job.id}_clip_{clip_index}.srt"
+                    )
 
             except TRANSIENT_ERRORS:
                 # Upload timeouts, rate limits, etc. must reach the outer
@@ -454,7 +494,7 @@ def process_job(self, job_id: str) -> list[dict]:
                 skipped_clip_indices.append(clip_index)
                 continue
 
-            final_clip = {**clip, "clip_url": clip_url}
+            final_clip = {**clip, "clip_url": clip_url, "srt_url": srt_url}
             final_clips.append(final_clip)
 
             # Persist partial progress after each successful clip so a later
@@ -509,7 +549,7 @@ def process_job(self, job_id: str) -> list[dict]:
             actual_cost_usd=round(actual_cost, 6),
             failed_stage=None,
             error_message=None,
-            completed_at=datetime.now(),
+            completed_at=datetime.now(timezone.utc),
         )
         processing_time = time.monotonic() - pipeline_start
         best_score = max((float(c.get("final_score", 0)) for c in final_clips), default=0.0)
@@ -556,7 +596,8 @@ def process_job(self, job_id: str) -> list[dict]:
                 failed_stage=current_stage,
                 error_message=str(exc),
             )
-            countdown = _RETRY_BASE_SECONDS ** retry_count   # 2s, 4s, 8s …
+            # Gap 19: Standardized exponential backoff (60s, 120s, 240s...)
+            countdown = 2 ** self.request.retries * 60
             raise self.retry(exc=exc, countdown=countdown)
 
         update_job(

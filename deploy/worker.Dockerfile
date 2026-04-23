@@ -1,12 +1,13 @@
 # File: Dockerfile.worker
 FROM python:3.10-slim
 
-# Install system dependencies
+# Install system dependencies (nodejs required by yt-dlp for JS challenges)
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     libsm6 \
     libxext6 \
     curl \
+    nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

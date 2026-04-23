@@ -5,6 +5,7 @@
  */
 
 import type { ReactNode } from "react";
+import React from "react";
 import type { Metadata, Viewport } from "next";
 import { Providers } from "./providers";
 
@@ -12,6 +13,8 @@ export const metadata: Metadata = {
   title: "ClipMind — AI Video Studio",
   description: "Turn long videos into ready-to-post clips automatically.",
 };
+
+// ... (rest of metadata/viewport)
 
 export const viewport: Viewport = {
   width: "device-width",
@@ -33,6 +36,10 @@ const globalStyles = `
     --line: rgba(16, 32, 51, 0.1);
     --accent: #ff6f61;
     --accent-soft: rgba(255,111,97,0.12);
+    --accent-strong: #a53c2f;
+    --accent-glow: rgba(255,111,97,0.55);
+    --accent-border: rgba(255,111,97,0.18);
+    --accent-text: #9f3c2f;
     --shadow: 0 12px 28px rgba(16, 32, 51, 0.06);
     --shadow-lg: 0 24px 54px rgba(16, 32, 51, 0.1);
   }
@@ -82,7 +89,7 @@ const globalStyles = `
     height: 12px;
     border-radius: 999px;
     background: linear-gradient(135deg, #ffd4ba, var(--accent));
-    box-shadow: 0 0 24px rgba(255,111,97,0.55);
+    box-shadow: 0 0 24px var(--accent-glow);
   }
   .hero {
     display: grid;
@@ -138,7 +145,7 @@ const globalStyles = `
     min-height: 620px;
     border: 1px solid var(--line);
     background:
-      radial-gradient(circle at top right, rgba(255,111,97,0.18), transparent 32%),
+      radial-gradient(circle at top right, var(--accent-soft), transparent 32%),
       radial-gradient(circle at left center, rgba(78, 144, 226, 0.1), transparent 28%),
       var(--surface-strong);
     border-radius: 32px;
@@ -154,8 +161,8 @@ const globalStyles = `
     inset: 0;
     background:
       linear-gradient(135deg, rgba(255,255,255,0.9), rgba(255,255,255,0.35)),
-      linear-gradient(90deg, rgba(16,32,51,0.04) 1px, transparent 1px),
-      linear-gradient(rgba(16,32,51,0.03) 1px, transparent 1px);
+      linear-gradient(90deg, var(--line) 1px, transparent 1px),
+      linear-gradient(var(--line) 1px, transparent 1px);
     background-size: auto, 72px 72px, 72px 72px;
     opacity: 0.35;
     pointer-events: none;
@@ -167,8 +174,8 @@ const globalStyles = `
     padding: 8px 14px;
     border-radius: 999px;
     background: var(--accent-soft);
-    border: 1px solid rgba(255,111,97,0.2);
-    color: #9f3c2f;
+    border: 1px solid var(--accent-border);
+    color: var(--accent-text);
     font-size: 13px;
     margin-bottom: 18px;
   }
@@ -222,7 +229,7 @@ const globalStyles = `
     gap: 10px;
     padding: 20px;
     border-radius: 22px;
-    border: 1px solid rgba(16, 32, 51, 0.12);
+    border: 1px solid var(--line);
     background:
       linear-gradient(180deg, rgba(255,255,255,0.96), rgba(248,250,255,0.96));
     box-shadow: var(--shadow);
@@ -231,7 +238,7 @@ const globalStyles = `
   }
   .upload-dropzone:hover {
     transform: translateY(-1px);
-    border-color: rgba(255,111,97,0.28);
+    border-color: var(--accent-border);
     box-shadow: 0 18px 34px rgba(16, 32, 51, 0.08);
   }
   .upload-dropzone-top {
@@ -264,9 +271,9 @@ const globalStyles = `
     justify-content: center;
     padding: 10px 14px;
     border-radius: 999px;
-    background: rgba(255, 111, 97, 0.12);
-    color: #a53c2f;
-    border: 1px solid rgba(255, 111, 97, 0.18);
+    background: var(--accent-soft);
+    color: var(--accent-text);
+    border: 1px solid var(--accent-border);
     font-weight: 700;
     font-size: 13px;
     white-space: nowrap;
@@ -289,7 +296,7 @@ const globalStyles = `
   .field {
     padding: 18px;
     border-radius: 18px;
-    border: 1px dashed rgba(16,32,51,0.16);
+    border: 1px dashed var(--line);
     background: rgba(255,255,255,0.9);
   }
   .upload-row {
@@ -320,7 +327,7 @@ const globalStyles = `
     transition: transform 180ms ease, border-color 180ms ease, box-shadow 180ms ease;
     box-shadow: var(--shadow);
   }
-  .subtle-button:hover { transform: translateY(-1px); border-color: rgba(255,111,97,0.2); box-shadow: 0 16px 28px rgba(16, 32, 51, 0.08); }
+  .subtle-button:hover { transform: translateY(-1px); border-color: var(--accent-border); box-shadow: 0 16px 28px rgba(16, 32, 51, 0.08); }
   .section-band {
     display: grid;
     gap: 18px;
@@ -376,7 +383,7 @@ const globalStyles = `
     position: absolute;
     inset: 12px;
     border-radius: 20px;
-    border: 1px solid rgba(255,111,97,0.1);
+    border: 1px solid var(--accent-border);
     pointer-events: none;
   }
   .signal-header {
@@ -419,11 +426,11 @@ const globalStyles = `
   .signal-step em {
     font-style: normal;
     font-size: 12px;
-    color: #a53c2f;
-    background: rgba(255,111,97,0.1);
+    color: var(--accent-text);
+    background: var(--accent-soft);
     padding: 6px 10px;
     border-radius: 999px;
-    border: 1px solid rgba(255,111,97,0.18);
+    border: 1px solid var(--accent-border);
   }
   .signal-meta {
     display: grid;
@@ -458,7 +465,7 @@ const globalStyles = `
     height: 8px;
     width: 100%;
     border-radius: 999px;
-    background: rgba(16,32,51,0.08);
+    background: var(--line);
     overflow: hidden;
   }
   .progress > span {
@@ -483,7 +490,7 @@ const globalStyles = `
   }
   .clip-tile:hover {
     transform: translateY(-2px);
-    border-color: rgba(255,111,97,0.32);
+    border-color: var(--accent-border);
     background: rgba(255,255,255,1);
   }
   .clip-meta {
@@ -507,7 +514,7 @@ const globalStyles = `
     border-radius: 18px;
     overflow: hidden;
     border: 1px solid var(--line);
-    background: #edf2f7;
+    background: var(--bg-soft);
   }
   .player video {
     width: 100%;
@@ -523,9 +530,9 @@ const globalStyles = `
   .alert {
     padding: 14px 16px;
     border-radius: 16px;
-    border: 1px solid rgba(255,111,97,0.24);
-    background: rgba(255,111,97,0.12);
-    color: #8d2f25;
+    border: 1px solid var(--accent-border);
+    background: var(--accent-soft);
+    color: var(--accent-text);
   }
   .shell-header {
     display: flex;
@@ -561,12 +568,14 @@ export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en">
       <body>
-        <Providers>
-          <div className="shell">
-            <style dangerouslySetInnerHTML={{ __html: globalStyles }} />
-            {children}
-          </div>
-        </Providers>
+        <React.StrictMode>
+          <Providers>
+            <div className="shell">
+              <style dangerouslySetInnerHTML={{ __html: globalStyles }} />
+              {children}
+            </div>
+          </Providers>
+        </React.StrictMode>
       </body>
     </html>
   );

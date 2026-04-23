@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 from workers.celery_app import celery_app
 from services.performance_engine import get_performance_engine
-from db.queries import get_all_users_with_active_platforms
+from db.repositories.users import get_all_users_with_active_platforms
 
 logger = logging.getLogger(__name__)
 

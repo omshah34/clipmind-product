@@ -16,10 +16,11 @@ from api.models.job import (
     ErrorResponse,
     UploadResponse,
 )
-from api.dependencies import get_current_user, AuthenticatedUser
+from api.dependencies.auth import get_current_user, AuthenticatedUser
 from core.config import settings
 from db.repositories.jobs import create_job
 from db.repositories.jobs import get_job, update_job
+from db.repositories.users import get_user_credits
 from services.cost_tracker import estimate_job_cost
 from services.storage import storage_service
 from services.task_queue import dispatch_task
@@ -54,7 +55,7 @@ def validate_upload_constraints(
             error="invalid_format",
             message="Accepted formats are MP4 and MOV.",
         )
-    if size_bytes > settings.max_upload_size_bytes:
+    if size_bytes > 0 and size_bytes > settings.max_upload_size_bytes:
         raise UploadValidationError(
             error="file_too_large",
             message="File exceeds maximum allowed size of 2GB.",
@@ -186,6 +187,14 @@ async def upload_video(
     if not file.filename:
         return error_response("invalid_file", "A video file is required.", 400)
 
+    # Gap 74: Plan enforcement — check credits before starting job
+    if get_user_credits(user.user_id) <= 0:
+        return error_response(
+            "insufficient_credits", 
+            "You have 0 credits. Upgrade your plan to continue uploading.", 
+            403
+        )
+
     temp_path: Path | None = None
     try:
         temp_path, size_bytes = await save_upload_to_temp(file)
@@ -199,7 +208,7 @@ async def upload_video(
             prompt_version=settings.clip_prompt_version,
             estimated_cost_usd=estimated_cost_usd,
             user_id=str(user.user_id),
-            language="en"  # Multipart file upload doesn't have a language field yet, defaulting to en
+            language="en"
         )
 
         dispatch_task(
@@ -228,6 +237,15 @@ async def upload_url(
     user: AuthenticatedUser = Depends(get_current_user)
 ) -> UploadResponse | JSONResponse:
     """Download a video from YouTube and create a job."""
+    
+    # Gap 74: Plan enforcement
+    if get_user_credits(user.user_id) <= 0:
+        return error_response(
+            "insufficient_credits", 
+            "You have 0 credits. Upgrade your plan to continue uploading.", 
+            403
+        )
+
     # 1. Validate domain
     if not video_downloader.validate_url(payload.url):
         return error_response("invalid_domain", "Only YouTube links are allowed.", 400)
@@ -243,8 +261,6 @@ async def upload_url(
             return error_response("metadata_failed", f"Could not fetch video info: {str(e)}", 400)
 
         # 3. Validation
-        # Fake a size for validation since we haven't downloaded yet
-        # (or skip size check for URLs as we controls the server-side download overhead)
         try:
             validate_upload_constraints(f"{title}.mp4", 0, duration_seconds)
         except UploadValidationError as exc:

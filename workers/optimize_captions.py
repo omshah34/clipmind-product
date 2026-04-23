@@ -8,6 +8,8 @@ from __future__ import annotations
 import logging
 from uuid import UUID
 
+import httpx
+from openai import APIConnectionError, APITimeoutError, RateLimitError
 from workers.celery_app import celery_app
 from db.repositories.jobs import get_job
 from services.llm_integration import optimize_captions_with_llm, is_llm_available
@@ -15,8 +17,10 @@ from services.llm_integration import optimize_captions_with_llm, is_llm_availabl
 
 logger = logging.getLogger(__name__)
 
+TRANSIENT_ERRORS = (httpx.TimeoutException, APIConnectionError, APITimeoutError, RateLimitError)
 
-@celery_app.task(bind=True, max_retries=2)
+
+@celery_app.task(bind=True, max_retries=4)
 def optimize_captions_for_platforms(
     self,
     user_id: str | UUID,
@@ -89,13 +93,15 @@ def optimize_captions_for_platforms(
             "model": llm_result.get("model"),
         }
     
+    except TRANSIENT_ERRORS as exc:
+        logger.warning(f"Transient error in caption optimization for job {job_id}: {exc}")
+        # Gap 19: Exponential backoff (60s, 120s, 240s...)
+        countdown = 2 ** self.request.retries * 60
+        raise self.retry(exc=exc, countdown=countdown)
+
     except Exception as exc:
         logger.exception(f"Caption optimization failed: {exc}")
-        
-        try:
-            raise self.retry(exc=exc, countdown=2 ** self.request.retries)
-        except Exception:
-            return {"status": "failed", "error": str(exc)}
+        return {"status": "failed", "error": str(exc)}
 
 
 def generate_platform_caption(

@@ -9,7 +9,10 @@ from typing import Optional
 
 # Using the unofficial TikTokApi wrapper
 # pip install TikTokApi
-from TikTokApi import TikTokApi
+try:
+    from TikTokApi import TikTokApi
+except ImportError:
+    TikTokApi = None
 
 from services.data_providers.base import DataProvider, PerformanceMetrics
 from core.config import settings

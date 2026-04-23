@@ -179,7 +179,7 @@ export type UserPreferences = {
   user_id: string;
   goals: string[];
   target_platform: string | null;
-  preferences_json: Record<string, any>;
+  preferences_json: Record<string, string | number | boolean | null>;
   onboarding_completed: boolean;
   created_at?: string;
   updated_at?: string;
@@ -202,7 +202,7 @@ export async function saveUserPreferences(
     goals: string[];
     target_platform?: string | null;
     primary_goal?: string | null;
-    metadata?: Record<string, any>;
+    metadata?: Record<string, string | number | boolean | null>;
     onboarding_completed?: boolean;
   },
 ): Promise<UserPreferences> {
@@ -325,7 +325,7 @@ export type RegenerationResult = {
   completed_at: string;
   weights: Record<string, number>;
   instructions: string | null;
-  clips: Array<Record<string, any>>;
+  clips: ClipSummary[]; // Restored type safety here
   status: "pending" | "completed" | "failed";
   error: string | null;
 };
@@ -544,24 +544,26 @@ export async function deleteCampaign(campaignId: string, userId: string): Promis
   if (!response.ok) throw new Error("Failed to delete campaign");
 }
 
-export async function batchUploadToCampaign(
-  campaignId: string,
-  userId: string,
-  files: File[],
-): Promise<{
+export type BatchUploadResponse = {
   campaign_id: string;
   uploaded_jobs: string[];
   total_uploaded: number;
   errors: Array<{ filename: string; error: string }>;
   message: string;
-}> {
+};
+
+export async function batchUploadToCampaign(
+  campaignId: string,
+  userId: string,
+  files: File[],
+): Promise<BatchUploadResponse> {
   const formData = new FormData();
   files.forEach((file) => formData.append("files", file));
   const response = await fetch(
     `${API_BASE_URL}/campaigns/${campaignId}/upload?user_id=${userId}`,
     { method: "POST", body: formData },
   );
-  return readResponse<any>(response);
+  return readResponse<BatchUploadResponse>(response);
 }
 
 export type ClipCalendar = {
