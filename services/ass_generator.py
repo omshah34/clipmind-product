@@ -69,11 +69,13 @@ def format_ass_time(seconds: float) -> str:
     return f"{h}:{m:02}:{s:02}.{cs:02}"
 
 class ASSGenerator:
-    def __init__(self, preset_name: str = "hormozi"):
+    def __init__(self, preset_name: str = "hormozi", *, layout_type: str = "vertical"):
         self.style = PRESETS.get(preset_name.lower(), PRESETS["hormozi"])
+        self.layout_type = layout_type
 
     def generate_header(self) -> str:
         s = self.style
+        margin_v = self._margin_for_layout()
         header = [
             "[Script Info]",
             "ScriptType: v4.00+",
@@ -83,14 +85,29 @@ class ASSGenerator:
             "",
             "[V4+ Styles]",
             "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-            f"Style: Default,{s.font_name},{s.font_size},{s.primary_color},{s.secondary_color},{s.outline_color},{s.back_color},{s.bold},{s.italic},0,0,100,100,0,0,1,{s.outline},{s.shadow},{s.alignment},10,10,{s.margin_v},1",
+            f"Style: Default,{s.font_name},{s.font_size},{s.primary_color},{s.secondary_color},{s.outline_color},{s.back_color},{s.bold},{s.italic},0,0,100,100,0,0,1,{s.outline},{s.shadow},{s.alignment},10,10,{margin_v},1",
             "",
             "[Events]",
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
         ]
         return "\n".join(header)
 
-    def words_to_ass(self, words: list[dict], transients: list[float] | None = None, max_chars_per_line: int = 18) -> str:
+    def _margin_for_layout(self) -> int:
+        if self.layout_type == "speaker_screen":
+            return max(self.style.margin_v, 260)
+        if self.layout_type == "split_screen":
+            return max(self.style.margin_v, 180)
+        if self.layout_type == "screen_only":
+            return max(self.style.margin_v, 220)
+        return self.style.margin_v
+
+    def words_to_ass(
+        self,
+        words: list[dict],
+        transients: list[float] | None = None,
+        max_chars_per_line: int = 18,
+        max_words_per_line: int = 3,
+    ) -> str:
         """
         Converts word-level transcript data into word-by-word highlighted Dialogue lines.
         Uses character-aware wrapping to prevent mobile overflow (Gap 104).
@@ -100,10 +117,16 @@ class ASSGenerator:
 
         from services.visual_engine import VisualEngine
 
+        probabilities = [float(w.get("probability", 1.0)) for w in words if w.get("probability") is not None]
+        if probabilities and sum(probabilities) / len(probabilities) < 0.5:
+            return self._generate_line_level(words)
+
         # Group words into chunks that fit on screen
         chunks: list[list[dict]] = []
         current_chunk: list[dict] = []
         current_len = 0
+
+        max_chars_per_line = 16 if self.layout_type == "speaker_screen" else max_chars_per_line
         
         for w in words:
             word_text = w["word"].strip()
@@ -117,7 +140,7 @@ class ASSGenerator:
             current_len += len(word_text) + 1
             
             # Max 2-3 words per line is still a good viral "rule of thumb"
-            if len(current_chunk) >= 3:
+            if len(current_chunk) >= max_words_per_line:
                 chunks.append(current_chunk)
                 current_chunk = []
                 current_len = 0

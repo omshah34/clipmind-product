@@ -34,7 +34,7 @@ SCORE_TO_WEIGHT = {
     "emotion_score": "emotion_weight",
     "clarity_score": "clarity_weight",
     "story_score": "story_weight",
-    "virality_weight": "virality_weight", # Consistent naming across tables
+    "virality_score": "virality_weight",
 }
 
 # Signal influence

@@ -8,13 +8,16 @@
 import { ReactNode } from 'react';
 import { SessionProvider } from 'next-auth/react';
 import { AuthProvider } from '@/components/auth-provider';
+import { QueryProvider } from '@/components/query-provider';
 
 export function Providers({ children }: { children: ReactNode }) {
   return (
     <SessionProvider>
-      <AuthProvider>
-        {children}
-      </AuthProvider>
+      <QueryProvider>
+        <AuthProvider>
+          {children}
+        </AuthProvider>
+      </QueryProvider>
     </SessionProvider>
   );
 }

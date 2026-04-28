@@ -1,10 +1,12 @@
 """Canonical publish orchestration service."""
 
 from __future__ import annotations
+import hashlib
 
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 from sqlalchemy import text
@@ -16,6 +18,7 @@ from db.repositories.jobs import get_job
 from db.repositories.publish import (
     add_to_publish_queue,
     create_published_clip,
+    get_publish_queue_entry,
     list_platform_accounts,
     list_social_accounts,
     update_publish_status,
@@ -34,6 +37,44 @@ def _parse_hashtags(value: Any) -> list[str]:
         tokens = value.replace(",", " ").split()
         return [token.lstrip("#") for token in tokens if token.strip()]
     return [str(value).lstrip("#")]
+
+
+def _normalize_scheduled_for(
+    scheduled_for: datetime | None,
+    scheduled_timezone: str | None,
+) -> datetime | None:
+    if scheduled_for is None:
+        return None
+    if scheduled_for.tzinfo is not None:
+        return scheduled_for.astimezone(timezone.utc)
+    if not scheduled_timezone:
+        return scheduled_for.replace(tzinfo=timezone.utc)
+
+    try:
+        tz = ZoneInfo(scheduled_timezone)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid scheduled timezone: {scheduled_timezone}") from exc
+
+    fold_zero = scheduled_for.replace(tzinfo=tz, fold=0)
+    fold_one = scheduled_for.replace(tzinfo=tz, fold=1)
+    valid_candidates: list[datetime] = []
+    for candidate in (fold_zero, fold_one):
+        roundtrip = candidate.astimezone(timezone.utc).astimezone(tz).replace(tzinfo=None)
+        if roundtrip == scheduled_for:
+            valid_candidates.append(candidate)
+
+    if not valid_candidates:
+        raise HTTPException(
+            status_code=422,
+            detail="Scheduled time does not exist in the selected timezone because of a daylight saving transition.",
+        )
+
+    # DECISION: during a DST fallback ambiguity, use the later occurrence so the
+    # requested wall-clock time is never published earlier than the user intended.
+    chosen = valid_candidates[-1]
+    if len(valid_candidates) == 2 and valid_candidates[0].utcoffset() != valid_candidates[1].utcoffset():
+        chosen = fold_one
+    return chosen.astimezone(timezone.utc)
 
 
 def _connected_accounts(user_id: str) -> list[dict]:
@@ -100,20 +141,31 @@ class PublishingService:
         caption: str,
         hashtags: Any,
         scheduled_for: datetime | None,
+        scheduled_timezone: str | None = None,
     ) -> dict:
         from workers.publish_social import publish_to_platform
+        normalized_scheduled_for = _normalize_scheduled_for(scheduled_for, scheduled_timezone)
 
         publish_job_ids: list[str] = []
         for platform in platforms:
+            existing = get_publish_queue_entry(user_id, job_id, clip_index, platform)
+            if existing:
+                publish_job_ids.append(str(existing["id"]))
+                continue
+
             queue_entry = add_to_publish_queue(
                 user_id=user_id,
                 job_id=job_id,
                 clip_index=clip_index,
                 platform=platform,
-                scheduled_for=scheduled_for or datetime.now(timezone.utc),
+                scheduled_for=normalized_scheduled_for or datetime.now(timezone.utc),
             )
             queue_id = queue_entry["id"]
-            eta = scheduled_for if scheduled_for and scheduled_for > datetime.now(timezone.utc) else None
+            eta = (
+                normalized_scheduled_for
+                if normalized_scheduled_for and normalized_scheduled_for > datetime.now(timezone.utc)
+                else None
+            )
             publish_to_platform.apply_async(
                 args=[
                     user_id,
@@ -134,7 +186,7 @@ class PublishingService:
         return {
             "status": "scheduled",
             "publish_job_ids": publish_job_ids,
-            "scheduled_at": scheduled_for or datetime.now(timezone.utc),
+            "scheduled_at": normalized_scheduled_for or datetime.now(timezone.utc),
         }
 
     def publish_clip(
@@ -147,6 +199,7 @@ class PublishingService:
         caption: str,
         hashtags: Any,
         scheduled_for: datetime | None = None,
+        scheduled_timezone: str | None = None,
     ) -> dict:
         job = get_job(job_id)
         if not job or str(job.user_id) != str(user_id):
@@ -156,6 +209,8 @@ class PublishingService:
         if clip is None:
             raise HTTPException(status_code=404, detail="Clip not found")
 
+        clip_data = clip.model_dump() if hasattr(clip, "model_dump") else dict(clip)
+
         platform_name = platform.lower()
         tags = _parse_hashtags(hashtags)
         connected_account = next(
@@ -164,18 +219,17 @@ class PublishingService:
         )
         social_account_id = connected_account["account_id"] if connected_account else str(user_id)
 
-        if scheduled_for and scheduled_for.tzinfo is None:
-            scheduled_for = scheduled_for.replace(tzinfo=timezone.utc)
+        normalized_scheduled_for = _normalize_scheduled_for(scheduled_for, scheduled_timezone)
 
         queue_entry = add_to_publish_queue(
             user_id=str(user_id),
             job_id=job_id,
             clip_index=clip_index,
             platform=platform_name,
-            scheduled_for=scheduled_for or datetime.now(timezone.utc),
+            scheduled_for=normalized_scheduled_for or datetime.now(timezone.utc),
         )
 
-        if scheduled_for and scheduled_for > datetime.now(timezone.utc):
+        if normalized_scheduled_for and normalized_scheduled_for > datetime.now(timezone.utc):
             published_row = create_published_clip(
                 user_id=str(user_id),
                 job_id=job_id,
@@ -184,7 +238,8 @@ class PublishingService:
                 social_account_id=social_account_id,
                 caption=caption,
                 hashtags=tags,
-                scheduled_at=scheduled_for,
+                asset_path=str(clip_data.get("clip_url") or ""),
+                scheduled_at=normalized_scheduled_for,
             )
             published_clip_id = str(published_row.get("id") or queue_entry["id"])
             update_publish_status(queue_entry["id"], "scheduled")
@@ -226,12 +281,60 @@ class PublishingService:
             }
 
         clip_path = self._clip_asset_path(job_id, clip_index, clip)
-        result = adapter.publish(
-            clip_path,
-            user_id=str(user_id),
-            metadata={"caption": caption, "hashtags": tags},
-        )
-        if result.status == "published":
+        
+        # Gap 205: Generate deterministic idempotency key
+        # SHA256(job_id + clip_index + platform)
+        idempotency_key = hashlib.sha256(f"{job_id}:{clip_index}:{platform_name}".encode()).hexdigest()
+        
+        try:
+            result = adapter.publish(
+                clip_path,
+                user_id=str(user_id),
+                metadata={"caption": caption, "hashtags": tags},
+                idempotency_key=idempotency_key,
+            )
+            if result.status == "published":
+                published_row = create_published_clip(
+                    user_id=str(user_id),
+                    job_id=job_id,
+                    clip_index=clip_index,
+                    platform=platform_name,
+                    social_account_id=social_account_id,
+                    caption=caption,
+                    hashtags=tags,
+                    asset_path=str(clip_data.get("clip_url") or clip_path),
+                    published_at=datetime.now(timezone.utc),
+                )
+                published_clip_id = str(published_row.get("id") or queue_entry["id"])
+                update_publish_status(queue_entry["id"], "published", platform_url=result.platform_url)
+                with engine.begin() as connection:
+                    connection.execute(
+                        text(
+                            """
+                            UPDATE published_clips
+                            SET status = 'published',
+                                platform_clip_id = :platform_clip_id,
+                                platform_url = :platform_url,
+                                published_at = :published_at
+                            WHERE id = :published_clip_id
+                            """
+                        ),
+                        {
+                            "platform_clip_id": result.platform_clip_id,
+                            "platform_url": result.platform_url,
+                            "published_at": datetime.now(timezone.utc),
+                            "published_clip_id": published_clip_id,
+                        },
+                    )
+                return {
+                    "published_clip_id": published_clip_id,
+                    "platform": platform_name,
+                    "platform_clip_id": result.platform_clip_id,
+                    "platform_url": result.platform_url,
+                    "status": "published",
+                    "engagement_metrics": {"views": 0, "likes": 0, "shares": 0},
+                }
+
             published_row = create_published_clip(
                 user_id=str(user_id),
                 job_id=job_id,
@@ -240,57 +343,27 @@ class PublishingService:
                 social_account_id=social_account_id,
                 caption=caption,
                 hashtags=tags,
-                published_at=datetime.now(timezone.utc),
+                asset_path=str(clip_data.get("clip_url") or clip_path),
             )
             published_clip_id = str(published_row.get("id") or queue_entry["id"])
-            update_publish_status(queue_entry["id"], "published", platform_url=result.platform_url)
-            with engine.begin() as connection:
-                connection.execute(
-                    text(
-                        """
-                        UPDATE published_clips
-                        SET status = 'published',
-                            platform_clip_id = :platform_clip_id,
-                            platform_url = :platform_url,
-                            published_at = :published_at
-                        WHERE id = :published_clip_id
-                        """
-                    ),
-                    {
-                        "platform_clip_id": result.platform_clip_id,
-                        "platform_url": result.platform_url,
-                        "published_at": datetime.now(timezone.utc),
-                        "published_clip_id": published_clip_id,
-                    },
-                )
+            update_publish_status(queue_entry["id"], "queued")
             return {
                 "published_clip_id": published_clip_id,
                 "platform": platform_name,
-                "platform_clip_id": result.platform_clip_id,
-                "platform_url": result.platform_url,
-                "status": "published",
+                "platform_clip_id": None,
+                "platform_url": "",
+                "status": "queued",
                 "engagement_metrics": {"views": 0, "likes": 0, "shares": 0},
             }
-
-        published_row = create_published_clip(
-            user_id=str(user_id),
-            job_id=job_id,
-            clip_index=clip_index,
-            platform=platform_name,
-            social_account_id=social_account_id,
-            caption=caption,
-            hashtags=tags,
-        )
-        published_clip_id = str(published_row.get("id") or queue_entry["id"])
-        update_publish_status(queue_entry["id"], "queued")
-        return {
-            "published_clip_id": published_clip_id,
-            "platform": platform_name,
-            "platform_clip_id": None,
-            "platform_url": "",
-            "status": "queued",
-            "engagement_metrics": {"views": 0, "likes": 0, "shares": 0},
-        }
+        finally:
+            try:
+                if clip_path.exists():
+                    resolved_clip_path = clip_path.resolve()
+                    resolved_temp_dir = settings.temp_dir.resolve()
+                    if str(resolved_clip_path).startswith(str(resolved_temp_dir)):
+                        clip_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def _clip_asset_path(self, job_id: str, clip_index: int, clip: Any) -> Path:
         clip_data = clip.model_dump() if hasattr(clip, "model_dump") else dict(clip)

@@ -55,7 +55,8 @@ class PerformanceEngine:
         
         # 3. Fetch clips needing sync (those whose feedback window isn't yet complete)
         query = text("""
-            SELECT job_id, clip_index, platform, platform_clip_id, ai_predicted_score
+            SELECT job_id, clip_index, platform, platform_clip_id, ai_predicted_score,
+                   published_date, created_at
             FROM clip_performance
             WHERE user_id = :user_id AND window_complete = FALSE
         """)
@@ -77,6 +78,8 @@ class PerformanceEngine:
                     platform=clip.platform,
                     platform_clip_id=clip.platform_clip_id,
                     predicted_score=clip.ai_predicted_score,
+                    published_date=clip.published_date,
+                    created_at=clip.created_at,
                     provider=provider
                 )
                 results["processed"] += 1
@@ -94,6 +97,8 @@ class PerformanceEngine:
         platform: str,
         platform_clip_id: str | None,
         predicted_score: float,
+        published_date: datetime | None,
+        created_at: datetime | None,
         provider: DataProvider
     ) -> dict[str, Any]:
         """Sync a single clip using the resolved provider and trigger feedback loops."""
@@ -115,10 +120,18 @@ class PerformanceEngine:
                 elif percentage_gain >= MILESTONES["validated"]: milestone = "validated"
                 elif percentage_gain >= MILESTONES["emerging"]: milestone = "emerging"
 
-            # 3. Persistence: Update the feedback record
-            # window_complete is True if we've reached a significant view threshold (e.g. 100 views)
-            # or a time threshold (handled by the caller or provider)
-            window_complete = metrics.views >= 100 
+            # 3. Persistence: Update the feedback record.
+            # Use a maturity gate plus a hard TTL so low-volume clips don't close
+            # too early and slow-burn clips still eventually exit the loop.
+            window_anchor = published_date or created_at or datetime.now(timezone.utc)
+            if isinstance(window_anchor, str):
+                window_anchor = datetime.fromisoformat(window_anchor.replace("Z", "+00:00"))
+            if window_anchor.tzinfo is None:
+                window_anchor = window_anchor.replace(tzinfo=timezone.utc)
+            window_age = datetime.now(timezone.utc) - window_anchor
+            window_complete = metrics.views >= 100 and window_age >= timedelta(hours=24)
+            if window_age >= timedelta(days=14):
+                window_complete = True
             perf = upsert_clip_performance(
                 user_id=str(user_id), 
                 job_id=job_id, 
@@ -131,7 +144,8 @@ class PerformanceEngine:
                 performance_delta=delta, 
                 milestone_tier=milestone,
                 window_complete=window_complete,
-                synced_at=datetime.now(timezone.utc)
+                synced_at=datetime.now(timezone.utc),
+                published_date=published_date or created_at,
             )
 
             # 4. Global Intelligence Alerts: User visibility for wins

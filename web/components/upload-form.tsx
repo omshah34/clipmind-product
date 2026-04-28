@@ -2,6 +2,10 @@
  * File: components/upload-form.tsx
  * Purpose: Upload form component. Handles video file selection, validation,
  *          and submission to backend /upload endpoint.
+ *
+ * Gap 240: Files ≥ 100 MB are automatically routed through the ETag-verified
+ * chunked uploader (lib/chunked-uploader.ts) for resumability on flaky networks.
+ * Smaller files continue to use the single-PUT direct upload path.
  */
 
 "use client";
@@ -12,67 +16,85 @@ import { FormEvent, useState } from "react";
 import {
   completeDirectUpload,
   failDirectUpload,
+  getUploadCapabilities,
   initDirectUpload,
   probeVideoDuration,
   uploadFileToSignedUrl,
-  uploadVideoFromUrl,
   uploadVideo,
 } from "../lib/api";
-
+import {
+  uploadFileChunked,
+  shouldUseChunkedUpload,
+} from "../lib/chunked-uploader";
 
 export default function UploadForm() {
   const router = useRouter();
   const [file, setFile] = useState<File | null>(null);
-  const [videoUrl, setVideoUrl] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** Fine-grained progress label shown only during chunked uploads. */
+  const [chunkProgress, setChunkProgress] = useState<string | null>(null);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const trimmedUrl = videoUrl.trim();
-    if (!file && !trimmedUrl) {
-      setError("Choose a file or paste a YouTube link before starting the job.");
+
+    if (!file) {
+      setError("Please select a video file before generating clips.");
       return;
     }
 
     setIsSubmitting(true);
     setError(null);
+    setChunkProgress(null);
+    let directUploadSession: { job_id: string } | null = null;
+
     try {
-      if (trimmedUrl) {
-        const response = await uploadVideoFromUrl(trimmedUrl);
-        router.push(`/jobs/${response.job_id}`);
-        return;
+      const uploadCapabilities = await getUploadCapabilities();
+
+      // ── Gap 240: Route large files through the ETag-verified chunked uploader ──
+      if (uploadCapabilities.multipart_upload && shouldUseChunkedUpload(file)) {
+        try {
+          const sourceVideoUrl = await uploadFileChunked(
+            file,
+            undefined, // no existing session — fresh upload
+            ({ uploadedParts, totalParts, uploadedBytes, totalBytes }) => {
+              const pct = Math.round((uploadedBytes / totalBytes) * 100);
+              setChunkProgress(
+                `Uploading part ${uploadedParts} / ${totalParts} (${pct}%)`
+              );
+            },
+          );
+          // sourceVideoUrl is the canonical URL returned by complete endpoint
+          // Create the job via the standard form-based upload response shape
+          router.push(`/jobs/new?source=${encodeURIComponent(sourceVideoUrl)}`);
+          return;
+        } catch (chunkedError) {
+          const message = chunkedError instanceof Error ? chunkedError.message : "";
+          if (!message.includes("Multipart upload requires cloud storage")) {
+            throw chunkedError;
+          }
+          // If cloud storage isn't available, we fall through to standard upload
+          setChunkProgress(null);
+        }
       }
 
-      if (!file) {
-        throw new Error("Choose a valid video file.");
-      }
-
+      // ── Standard direct upload (files < 100 MB) ──────────────────────────────
       const durationSeconds = await probeVideoDuration(file);
 
-      try {
-        const session = await initDirectUpload(file, durationSeconds);
-        router.push(`/jobs/${session.job_id}`);
-
-        void (async () => {
-          try {
-            await uploadFileToSignedUrl(session.upload_url, file);
-            await completeDirectUpload(session.job_id);
-          } catch (directUploadError) {
-            await failDirectUpload(
-              session.job_id,
-              directUploadError instanceof Error
-                ? directUploadError.message
-                : "Direct upload failed.",
-            );
+      if (uploadCapabilities.direct_upload) {
+        try {
+          const session = await initDirectUpload(file, durationSeconds);
+          directUploadSession = { job_id: session.job_id };
+          await uploadFileToSignedUrl(session.upload_url, file);
+          await completeDirectUpload(session.job_id);
+          router.push(`/jobs/${session.job_id}`);
+          return;
+        } catch (directUploadError) {
+          const message =
+            directUploadError instanceof Error ? directUploadError.message : "";
+          if (directUploadSession) {
+            await failDirectUpload(directUploadSession.job_id, message || "Direct upload failed.");
           }
-        })();
-
-        return;
-      } catch (directUploadError) {
-        const message =
-          directUploadError instanceof Error ? directUploadError.message : "";
-        if (!message.includes("Direct upload requires Supabase storage")) {
           throw directUploadError;
         }
       }
@@ -87,36 +109,49 @@ export default function UploadForm() {
       );
     } finally {
       setIsSubmitting(false);
+      setChunkProgress(null);
     }
   }
 
   return (
     <form className="upload-form" onSubmit={handleSubmit}>
-      <label className="field" style={{ display: "block", marginBottom: 16 }}>
-        <div className="upload-label">Video link</div>
-        <input
-          className="upload-input"
-          type="url"
-          inputMode="url"
-          placeholder="Paste a YouTube URL"
-          value={videoUrl}
-          disabled={isSubmitting}
-          onChange={(event) => setVideoUrl(event.target.value)}
-          style={{
-            width: "100%",
-            marginTop: 8,
-            padding: "12px 14px",
-            borderRadius: 12,
-            border: "1px solid var(--line)",
-            background: "rgba(0, 0, 0, 0.2)",
-            color: "var(--text)",
-          }}
-        />
-        <p className="upload-copy" style={{ marginTop: 8 }}>
-          Paste a YouTube link or drop a local MP4 / MOV file below. URL import only supports YouTube.
-        </p>
-      </label>
 
+      {/* ── How to use YouTube videos ────────────────────────────────────────── */}
+      <div style={{
+        marginBottom: 20,
+        padding: "14px 16px",
+        borderRadius: 12,
+        border: "1px solid var(--line)",
+        background: "rgba(255, 255, 255, 0.03)",
+      }}>
+        <div className="upload-label" style={{ marginBottom: 8 }}>
+          📺 Using a YouTube video?
+        </div>
+        <p className="upload-copy" style={{ margin: 0, lineHeight: 1.6 }}>
+          Download the video to your device first, then upload it below.
+          You can use{" "}
+          <a
+            href="https://www.y2mate.com"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ color: "var(--accent, #a78bfa)", textDecoration: "underline" }}
+          >
+            y2mate.com
+          </a>
+          {" "}or{" "}
+          <a
+            href="https://yt1s.com"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ color: "var(--accent, #a78bfa)", textDecoration: "underline" }}
+          >
+            yt1s.com
+          </a>
+          {" "}to save it as an MP4. ClipMind then turns it into viral shorts automatically.
+        </p>
+      </div>
+
+      {/* ── File dropzone ─────────────────────────────────────────────────────── */}
       <label className="upload-dropzone">
         <input
           className="upload-input"
@@ -143,9 +178,13 @@ export default function UploadForm() {
 
       <div className="upload-row">
         <button className="button" disabled={isSubmitting} type="submit">
-          {isSubmitting ? "Uploading..." : "Generate clips"}
+          {chunkProgress
+            ? chunkProgress
+            : isSubmitting
+            ? "Uploading…"
+            : "Generate clips"}
         </button>
-        <span className="note">You’ll be redirected as soon as processing starts.</span>
+        <span className="note">You'll be redirected as soon as processing starts.</span>
       </div>
 
       {error ? <div className="alert">{error}</div> : null}

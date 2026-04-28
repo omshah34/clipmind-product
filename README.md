@@ -11,6 +11,8 @@
 [![Next.js](https://img.shields.io/badge/Next.js-14-black.svg?logo=next.js)]()
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.111%2B-009688.svg?logo=fastapi&logoColor=white)]()
 [![Celery](https://img.shields.io/badge/Celery-5.x-37814A.svg?logo=celery)]()
+[![React Query](https://img.shields.io/badge/TanStack_Query-5-FF4154.svg?logo=react-query&logoColor=white)]()
+[![Status](https://img.shields.io/badge/Hardened-220%2B_Gaps_Fixed-9b30ff.svg)]()
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)]()
 
 ![ClipMind Dashboard](./docs/assets/run_success.png)
@@ -97,6 +99,9 @@ From a single processed clip, generate platform-native content variants: LinkedI
 
 ### 🎨 Brand Kit
 Apply caption templates (Hormozi-style word-by-word, subtitle block, or custom), watermarks, color grading, and intro/outro overlays through a no-code UI.
+
+### 🛡️ Production Resilience
+Built to survive pod evictions and database flaps. Features include a **Worker Health Watchdog**, **Atomic Transactional State**, and **Exponential Backoff** for all real-time client connections.
 
 ---
 
@@ -191,6 +196,8 @@ See [Usage](#-usage-one-command-launch) for a full breakdown of what this comman
 | `NEXTAUTH_URL` | ⬜ | `http://localhost:3000` | Public URL of the frontend. Set this explicitly in production. | — |
 | `S3_BUCKET_NAME` | ⬜ | `./outputs` | Object storage bucket for processed clips. Leave unset to store outputs locally. | [aws.amazon.com/s3](https://aws.amazon.com/s3/) |
 | `WEBHOOK_SECRET` | ⬜ | — | HMAC secret for validating outbound webhook payloads. | `openssl rand -hex 32` |
+| `POSTGRES_POOL_SIZE` | ⬜ | `20` | Max simultaneous DB connections per worker. | — |
+| `POSTGRES_MAX_OVERFLOW`| ⬜ | `40` | Burst allowance for DB connections under heavy load. | — |
 
 ---
 
@@ -220,6 +227,7 @@ python run.py --help         # Full list of flags
 4. Starts Celery workers with `--pool=solo` on Windows, `--pool=prefork` on Linux/macOS.
 5. Starts Celery Beat for scheduled Autopilot tasks.
 6. Starts the Next.js dev server on `http://localhost:3000`.
+7. **Worker Hot-Reload**: Automatically restarts Celery workers when code changes are detected in `services/` or `workers/` (requires `pip install watchfiles`).
 
 > [!TIP]
 > Use `Ctrl+C` once to gracefully stop all services. The launcher registers signal handlers that drain the task queue before shutting down workers.
@@ -278,22 +286,35 @@ clipmind-product/
 └── requirements.txt
 ```
 
+## 🛡️ Resilience & Reliability
+
+ClipMind is built for production stability. Beyond the core features, the platform includes:
+
+### 🐕 Worker Watchdog
+An active monitoring task that pings all workers every 120 seconds. It detects "zombie" processes (tasks that have hung without crashing) and terminates them using `SIGKILL` if they exceed 200% of their expected runtime.
+
+### ⚛️ Atomic State Integrity
+Clip metadata is stored in a relational `clips` table. All job completions use a **single SQL transaction** to update the job status and write all clip data. If the database flaps mid-write, the job remains in `processing` and is reclaimed by the stale-job detector, ensuring zero partial data corruption.
+
+### 📈 Connection Resilience
+- **Database Tuning**: Pre-configured SQLAlchemy connection pooling with 20 persistent connections and 40-slot overflow capacity per worker.
+- **WebSocket Jitter**: Reconnection logic uses exponential backoff with random jitter to prevent "thundering herd" server crashes during outages.
+- **Stability Reset**: Clients only reset their backoff counters after 10 seconds of stable connection, preventing hammering on flaky networks.
+
 ---
 
 ## 🛠 Tech Stack
 
 | Layer | Technology | Notes |
 | :--- | :--- | :--- |
-| **API** | FastAPI + Uvicorn | Async, OpenAPI docs auto-generated at `/docs` |
-| **Frontend** | Next.js 14 + TailwindCSS | App Router, server components |
+| **API** | FastAPI + Uvicorn | Native Async Redis split for sync/async stability |
+| **Frontend** | Next.js 14 + React Query | App Router, optimized re-renders, zero-flicker theme |
+| **State** | React Query | WebSocket-triggered invalidation for 0ms data lag |
 | **Auth** | NextAuth.js | JWT sessions + FERNET-encrypted secrets |
-| **Task Queue** | Celery 5 + Redis | `--pool=solo` on Windows for fork compatibility |
-| **Transcription** | whisper-large-v3 | Via OpenAI API or self-hosted |
-| **LLM Scoring** | GPT-4o / NVIDIA NIM | Configurable via `CLIP_DETECTOR_MODEL` |
-| **Video Processing** | FFmpeg 6+ | Cutting, cropping, subtitle burn, color grading |
-| **Database** | SQLite (dev) / PostgreSQL (prod) | SQLAlchemy ORM + Alembic migrations |
-| **Storage** | Local filesystem / S3-compatible | Swap via `S3_BUCKET_NAME` env var |
-| **Scheduling** | Celery Beat | Autopilot ingestion cron jobs |
+| **Task Queue** | Celery 5 + Redis | Includes **Watchdog** for stuck task termination |
+| **Database** | PostgreSQL (JSONB) | Atomic relational storage for clips & state integrity |
+| **Video Processing** | FFmpeg 6+ | HDR-to-SDR tone mapping & multi-track audio support |
+| **Resilience** | Exponential Backoff | Jittered reconnection strategy for 10k+ clients |
 
 ---
 

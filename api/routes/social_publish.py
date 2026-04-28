@@ -23,6 +23,7 @@ def schedule_clip(
         caption=request.caption,
         hashtags=request.hashtags,
         scheduled_for=request.scheduled_at,
+        scheduled_timezone=request.scheduled_timezone,
     )
 
 

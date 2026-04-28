@@ -17,6 +17,7 @@ const T = {
   bg: '#0d0e14',
   card: '#181a26',
   accent: '#00c9a7',
+  accentDim: 'rgba(0,201,167,0.12)',
   red: '#ef4444',
   text: '#dde0f0',
   muted: '#555870',

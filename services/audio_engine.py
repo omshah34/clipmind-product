@@ -132,6 +132,7 @@ def normalize_audio_file(input_path: Path, output_path: Path, target_lufs: float
         "-i", str(input_path),
         "-af", f"loudnorm=I={target_lufs}:TP=-1.5:LRA=11",
         "-c:v", "copy",       # Pass video through unchanged if present
+        "-ar", "48000",       # Gap 188: Resample to consistent 48kHz to prevent pitch shifting
         str(output_path),
     ]
     logger.info("Normalizing audio: %s → %s (target=%s LUFS)", input_path.name, output_path.name, target_lufs)

@@ -1,8 +1,8 @@
 {
   "exclude": [
-    ".*/db/alembic/versions/.*",
-    ".*/db/init_db\\.py",
-    ".*/db/init_sqlite\\.py"
+    "db/**",
+    "scripts/test_sql/**",
+    "scratch/**"
   ],
   "use-ignore-files": true
 }

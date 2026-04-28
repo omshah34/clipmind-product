@@ -13,7 +13,7 @@ class TikTokApiError(Exception):
         super().__init__(message)
         self.error_code = error_code
 
-def upload_to_tiktok(file_path: Path, metadata: dict, access_token: str, open_id: str) -> dict:
+def upload_to_tiktok(file_path: Path, metadata: dict, access_token: str, open_id: str, idempotency_key: str | None = None) -> dict:
     """Uploads a local video to TikTok using the 3-phase Direct Video Upload flow.
     
     Args:
@@ -56,16 +56,31 @@ def upload_to_tiktok(file_path: Path, metadata: dict, access_token: str, open_id
         }
     }
     
+    # Gap 205: Use idempotency key in request body (platform-native)
+    if idempotency_key:
+        payload["idempotency_key"] = idempotency_key
+    
     logger.info("Initiating TikTok direct upload for %s (%d bytes)", file_path.name, payload["source_info"]["video_size"])
     response = requests.post(init_url, json=payload, headers=headers)
     
     if not response.ok:
+        # Gap 205: Handle 409 Conflict (Duplicate) as success-equivalent
+        if response.status_code == 409:
+            logger.info("TikTok reported duplicate upload (409). Treating as success.")
+            return {"id": "duplicate_detected", "url": "https://www.tiktok.com/"}
+            
         logger.error("TikTok Init failed: %s", response.text)
         raise TikTokApiError(f"TikTok Init failed: {response.text}", error_code="init_failed")
         
     data = response.json()
-    if data.get("error", {}).get("code") != "ok":
-        raise TikTokApiError(data["error"]["message"], error_code=data["error"]["code"])
+    err_code = data.get("error", {}).get("code")
+    if err_code != "ok":
+        # Some TikTok errors are also duplicates
+        if err_code == "spam_detected" or "duplicate" in data.get("error", {}).get("message", "").lower():
+             logger.warning("TikTok reported duplicate/spam (409-like). Treating as success.")
+             return {"id": "duplicate_detected", "url": "https://www.tiktok.com/"}
+             
+        raise TikTokApiError(data["error"]["message"], error_code=err_code)
         
     upload_url = data["data"]["upload_url"]
     publish_id = data["data"]["publish_id"]

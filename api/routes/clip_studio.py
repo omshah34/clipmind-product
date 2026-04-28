@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import mimetypes
 import os
+import tempfile
 from urllib.parse import urlparse, unquote
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -35,9 +36,14 @@ from db.repositories.clip_sequences import (
     update_job,
     update_job_timeline,
 )
+from db.repositories.jobs import normalize_clip_indices
+from db.repositories.render_jobs import create_render_job
 from services.storage import storage_service
 from services.task_queue import dispatch_task
 from services.content_dna import record_signal
+from services.caption_renderer import write_clip_srt
+from services.render_recipe import merge_render_recipe
+from workers.render_clips import render_edited_clip
 from workers.regenerate_clips import regenerate_clips_task
 
 logger = logging.getLogger(__name__)
@@ -310,7 +316,7 @@ def get_job_preview(job_id: str) -> ClipPreviewData:
         stream_url = f"/api/v1/jobs/{job_id}/clips/{i}/stream" if has_clip else ""
 
         current_clips.append({
-            "clip_index": i + 1,
+            "clip_index": i,
             "start_time": float(clip.start_time),
             "end_time": float(clip.end_time),
             "duration": float(clip.duration),
@@ -323,6 +329,11 @@ def get_job_preview(job_id: str) -> ClipPreviewData:
             "reason": str(clip.reason),
             "clip_url": stream_url,          # ← always an HTTP URL now
             "download_url": f"/api/v1/jobs/{job_id}/clips/{i}/download" if has_clip else "",
+            "srt_url": getattr(clip, "srt_url", None),
+            "layout_type": getattr(clip, "layout_type", None),
+            "visual_mode": getattr(clip, "visual_mode", None),
+            "selected_hook": getattr(clip, "selected_hook", None),
+            "render_recipe": getattr(clip, "render_recipe", None),
         })
 
     timeline = get_job_timeline(job_id)
@@ -455,45 +466,45 @@ def adjust_clip_boundary(
     })
     update_job_timeline(job_id, timeline)
 
-    # TODO: queue actual re-render task and return real URL
-
-    # 3. Background fast re-render for dev phase
-    def _dev_re_render():
+    def _queue_rerender() -> None:
         try:
-            from services.caption_renderer import write_clip_srt
-            from core.config import settings
-            import tempfile
-            from pathlib import Path
-            
             latest_job = get_job(job_id)
-            source_name = Path(latest_job.source_video_url).name
-            local_source = Path(settings.local_storage_dir) / "sources" / source_name
-            
-            if local_source.exists() and getattr(latest_job, "transcript_json", None):
-                export_dir = Path(settings.local_storage_dir) / "exports" / f"adj_{job_id}_{clip_index}"
-                export_dir.mkdir(parents=True, exist_ok=True)
-                srt_path = export_dir / "temp.srt"
-                
-                write_clip_srt(latest_job.transcript_json, payload.new_start, payload.new_end, srt_path)
-                
-                with open(srt_path, "r", encoding="utf-8") as f:
-                    srt_data = f.read()
-                    
-                from workers.render_clips import render_edited_clip
-                try:
-                    # Sync call for dev locally
-                    render_edited_clip(
-                        render_job_id=str(job_id), 
-                        job_id=str(job_id), 
-                        clip_index=clip_index, 
-                        edited_srt=srt_data
-                    )
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.error(f"Dev auto-render failed: {e}")
+            if not latest_job or not getattr(latest_job, "transcript_json", None):
+                logger.warning("[job=%s] Skipping rerender: transcript not available", job_id)
+                return
 
-    background_tasks.add_task(_dev_re_render)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmpdir_path = Path(tmpdir)
+                srt_path = tmpdir_path / "edited_captions.srt"
+                write_clip_srt(latest_job.transcript_json, payload.new_start, payload.new_end, srt_path)
+                edited_srt = srt_path.read_text(encoding="utf-8")
+
+            render_job = create_render_job(
+                user_id=user.user_id,
+                job_id=job_id,
+                clip_index=clip_index,
+                edited_srt=edited_srt,
+                caption_style=None,
+                render_recipe=merge_render_recipe(getattr(old_clip, "render_recipe", None)),
+            )
+            if not render_job:
+                logger.error("[job=%s] Failed to create render job for clip %d", job_id, clip_index)
+                return
+
+            dispatch_task(
+                render_edited_clip,
+                render_job["id"],
+                job_id,
+                clip_index,
+                edited_srt,
+                None,
+                fallback=lambda *task_args: render_edited_clip.apply(args=task_args, throw=True),
+                task_name="workers.render_clips.render_edited_clip",
+            )
+        except Exception:
+            logger.exception("[job=%s] Rerender queue failed for clip %d", job_id, clip_index)
+
+    background_tasks.add_task(_queue_rerender)
 
     new_clip_url = f"/api/v1/jobs/{job_id}/clips/{clip_index}/stream"
 
@@ -516,7 +527,7 @@ def adjust_clip_boundary(
         message="Clip boundary adjusted",
     )
 
-# ── Regenerations list ────────────────────────────────────────────────────────
+# -- Regenerations list -------------------------------------------------------
 
 @router.get("/{job_id}/regenerations", status_code=200)
 def get_regenerations(
@@ -535,44 +546,84 @@ def get_regenerations(
     regenerations = timeline.get("regeneration_results", [])[:limit]
     return JSONResponse(status_code=200, content={"regenerations": regenerations})
 
+
 @router.post("/{job_id}/clips/{clip_index}/approve", status_code=200)
 def approve_clip(
-    job_id: str, 
-    clip_index: int, 
+    job_id: str,
+    clip_index: int,
     user: AuthenticatedUser = Depends(get_current_user)
 ):
-    """(Feature 5) Approve a clip from the Swipe-to-Approve PWA, queuing it for final export."""
+    """(Feature 5) Approve a clip from the Swipe-to-Approve PWA."""
     job = get_job(job_id)
     if not job or not job.clips_json:
         return error_response("job_not_found", "Job not found", 404)
-        
+
     clips = [c.model_dump() if hasattr(c, "model_dump") else dict(c) for c in job.clips_json]
     if clip_index < 0 or clip_index >= len(clips):
         return error_response("invalid_clip", "Clip index out of range", 400)
-        
+
     clips[clip_index]["user_status"] = "approved"
     update_job(job_id, clips_json=clips)
-    
-    logger.info(f"Clip {clip_index} for job {job_id} APPROVED via PWA.")
+
+    logger.info("Clip %d for job %s APPROVED via PWA.", clip_index, job_id)
     return {"status": "success", "message": "Clip approved and queued for HD export."}
+
 
 @router.post("/{job_id}/clips/{clip_index}/discard", status_code=200)
 def discard_clip(
-    job_id: str, 
-    clip_index: int, 
+    job_id: str,
+    clip_index: int,
     user: AuthenticatedUser = Depends(get_current_user)
 ):
     """(Feature 5) Discard a clip from the Swipe-to-Approve PWA so it is hidden."""
     job = get_job(job_id)
     if not job or not job.clips_json:
         return error_response("job_not_found", "Job not found", 404)
-        
+
     clips = [c.model_dump() if hasattr(c, "model_dump") else dict(c) for c in job.clips_json]
     if clip_index < 0 or clip_index >= len(clips):
         return error_response("invalid_clip", "Clip index out of range", 400)
-        
+
     clips[clip_index]["user_status"] = "discarded"
     update_job(job_id, clips_json=clips)
-    
-    logger.info(f"Clip {clip_index} for job {job_id} DISCARDED via PWA.")
+
+    logger.info("Clip %d for job %s DISCARDED via PWA.", clip_index, job_id)
     return {"status": "success", "message": "Clip discarded."}
+
+
+@router.delete("/{job_id}/clips/{clip_index}", status_code=200)
+def delete_clip(
+    job_id: str,
+    clip_index: int,
+    user: AuthenticatedUser = Depends(get_current_user)
+):
+    """Permanently remove a clip from the job and re-sequence clip_index values.
+
+    Gap 179: After removal the remaining clips are re-indexed so that deep
+    links encoded as /jobs/{id}/clips/{clip_index}/stream always resolve to
+    the correct clip regardless of which earlier clip was deleted.
+    """
+    job = get_job(job_id)
+    if not job or not job.clips_json:
+        return error_response("job_not_found", "Job not found", 404)
+
+    clips = [c.model_dump() if hasattr(c, "model_dump") else dict(c) for c in job.clips_json]
+    if clip_index < 0 or clip_index >= len(clips):
+        return error_response("invalid_clip", "Clip index out of range", 400)
+
+    removed = clips.pop(clip_index)
+    update_job(job_id, clips_json=clips)
+
+    # Gap 179: Re-sequence clip_index so remaining clips stay contiguous (0,1,2,...)
+    normalize_clip_indices(job_id)
+
+    logger.info(
+        "Clip %d permanently deleted from job %s; indices normalised.",
+        clip_index, job_id
+    )
+    return {
+        "status": "success",
+        "message": f"Clip {clip_index} deleted and indices re-sequenced.",
+        "deleted_clip_url": removed.get("clip_url"),
+        "remaining_clips": len(clips),
+    }

@@ -16,6 +16,8 @@ from uuid import UUID
 from datetime import datetime
 from typing import Optional, List
 
+from api.models.job import ClipSummary
+
 
 class PerformanceCreateRequest(BaseModel):
     """Request to submit performance metrics for a clip."""
@@ -118,6 +120,16 @@ class PerformanceSummary(BaseModel):
     best_clip_index: int = Field(description="Clip index with best performance")
     worst_clip_index: int = Field(description="Clip index with worst performance")
     synced_at: datetime = Field(description="When data was last synced")
+    latest_job_id: Optional[UUID] = None
+    top_clips: List[ClipSummary] = Field(default_factory=list)
+    all_clips_performance: List[dict] = Field(default_factory=list)
+    data_source: Optional[str] = None
+
+
+class PerformanceSyncStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    error_message: Optional[str] = None
 
 
 class PerformanceAlertResponse(BaseModel):

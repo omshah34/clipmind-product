@@ -6,11 +6,14 @@ Purpose: Emit webhook events for job and clip completion.
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 from uuid import UUID
 
 from services.task_queue import is_redis_available
 
 logger = logging.getLogger(__name__)
+WEBHOOK_SCHEMA_VERSION = "2026-04-27"
 
 
 def emit_event(event_type: str, event_data: dict, user_id: UUID | str) -> None:
@@ -33,10 +36,10 @@ def emit_event(event_type: str, event_data: dict, user_id: UUID | str) -> None:
     """
     logger.debug(f"[emit] Event: {event_type} for user {user_id}")
 
-    if not is_redis_available():
-        logger.warning(f"[emit] Redis unavailable; skipping event {event_type}")
-        return
-
+    # Gap 205: Generate deterministic idempotency key
+    from core.utils import make_idempotency_key
+    idempotency_key = make_idempotency_key(event_type, event_data)
+    
     from workers.webhooks import deliver_webhook_event
     
     try:
@@ -45,6 +48,7 @@ def emit_event(event_type: str, event_data: dict, user_id: UUID | str) -> None:
             event_type=event_type,
             event_data=event_data,
             user_id=str(user_id),
+            idempotency_key=idempotency_key,
         )
         
         # Also trigger integrations (Zapier, Make, etc)

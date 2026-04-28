@@ -248,6 +248,32 @@ def calculate_final_score(coerced_scores: dict[str, float], weights: dict[str, f
     )
 
 
+def normalize_score_weights(weights: dict[str, float] | None) -> dict[str, float]:
+    """Return scorer weights keyed by score field names and normalized to 1.0.
+
+    Content DNA stores multiplier-style keys such as ``hook_weight`` while the
+    detector scores use ``hook_score``. Apply those multipliers to the base
+    detector weights, then normalize.
+    """
+    if not weights:
+        return SCORE_WEIGHTS
+
+    normalized: dict[str, float] = {}
+    for score_key, base_weight in SCORE_WEIGHTS.items():
+        weight_key = score_key.replace("_score", "_weight")
+        if score_key in weights:
+            normalized[score_key] = float(weights[score_key])
+        elif weight_key in weights:
+            normalized[score_key] = base_weight * float(weights[weight_key])
+        else:
+            normalized[score_key] = base_weight
+
+    total = sum(normalized.values())
+    if total <= 0:
+        return SCORE_WEIGHTS
+    return {key: value / total for key, value in normalized.items()}
+
+
 # ---------------------------------------------------------------------------
 # Transcript formatting
 # ---------------------------------------------------------------------------
@@ -325,6 +351,72 @@ def chunk_transcript(words: list[dict]) -> list[list[dict]]:
     return chunks
 
 
+def build_heuristic_candidates(words: list[dict], limit: int = 5) -> list[dict]:
+    """Generate usable fallback candidates when LLM scoring fails or times out."""
+    if not words:
+        return []
+
+    starts = [float(w["start"]) for w in words]
+    total_end = float(words[-1]["end"])
+    if total_end < settings.min_clip_length_seconds:
+        return []
+
+    target_duration = min(60.0, max(35.0, settings.min_clip_length_seconds + 20.0))
+    spacing = max(target_duration + 20.0, total_end / max(limit, 1))
+    candidates: list[dict] = []
+
+    for index in range(limit):
+        target_start = index * spacing
+        if target_start >= total_end - settings.min_clip_length_seconds:
+            break
+
+        start_idx = bisect.bisect_left(starts, target_start)
+        start_idx = min(start_idx, len(words) - 1)
+
+        target_end = min(total_end, starts[start_idx] + target_duration)
+        end_idx = bisect.bisect_left(starts, target_end)
+        end_idx = min(max(end_idx, start_idx + 1), len(words) - 1)
+
+        # Snap end forward to a nearby sentence boundary when possible.
+        max_end_time = min(total_end, starts[start_idx] + settings.max_clip_length_seconds)
+        for i in range(end_idx, min(len(words), end_idx + 80)):
+            token = str(words[i].get("word", "")).strip()
+            if float(words[i]["end"]) > max_end_time:
+                break
+            if token.endswith((".", "?", "!")):
+                end_idx = i
+                break
+
+        start_time = float(words[start_idx]["start"])
+        end_time = float(words[end_idx]["end"])
+        duration = end_time - start_time
+        if not (settings.min_clip_length_seconds <= duration <= settings.max_clip_length_seconds):
+            continue
+
+        opening_words = " ".join(str(w.get("word", "")).strip() for w in words[start_idx : start_idx + 10]).strip()
+        candidates.append(
+            {
+                "source": "heuristic",
+                "start_time": round(start_time, 2),
+                "end_time": round(end_time, 2),
+                "hook_score": 7.0,
+                "emotion_score": 6.5,
+                "clarity_score": 7.0,
+                "story_score": 6.5,
+                "virality_score": 7.0,
+                "reason": f"Fallback candidate beginning with '{opening_words}' selected after LLM clip detection did not return usable candidates.",
+                "hook_headlines": [
+                    "You can automate this now",
+                    "Stop doing this manually",
+                    "Your workflow can run itself",
+                ],
+                "layout_suggestion": "vertical",
+            }
+        )
+
+    return candidates
+
+
 # ---------------------------------------------------------------------------
 # Deduplication & selection
 # ---------------------------------------------------------------------------
@@ -373,6 +465,7 @@ def select_top_clips(candidates: list[dict], limit: int = 3) -> list[dict]:
 def _load_prompt_cached(path: str) -> PromptTemplate:
     """Load, parse, and cache a PromptTemplate. Keyed by resolved path string."""
     raw = Path(path).read_text(encoding="utf-8")
+    raw = raw.replace("{{transcript_chunk}}", "@@{transcript_chunk}")
     return PromptTemplate(raw)
 
 
@@ -395,13 +488,20 @@ class ClipDetectorService:
         self.client = make_openai_client()
 
     def load_prompt(self, prompt_version: str) -> tuple[PromptTemplate, str]:
-        path = (
-            Path(__file__).resolve().parent.parent
-            / "prompts"
-            / f"clip_detection_{prompt_version}.txt"
-        )
+        prompts_dir = Path(__file__).resolve().parent.parent / "prompts"
+        path = prompts_dir / f"clip_detection_{prompt_version}.txt"
         if not path.exists():
-            raise FileNotFoundError(f"Prompt file not found: {path}")
+            fallback_path = prompts_dir / "clip_detection_v4.txt"
+            if fallback_path.exists():
+                logger.info(
+                    "Prompt version %s not found at %s; falling back to %s",
+                    prompt_version,
+                    path,
+                    fallback_path,
+                )
+                path = fallback_path
+            else:
+                raise FileNotFoundError(f"Prompt file not found: {path}")
         resolved = str(path)
         return _load_prompt_cached(resolved), resolved
 
@@ -416,7 +516,7 @@ class ClipDetectorService:
 
     @retry(
         reraise=True,
-        stop=stop_after_attempt(3),
+        stop=stop_after_attempt(settings.clip_detector_retry_attempts),
         wait=wait_exponential(multiplier=1, min=1, max=8),
         retry=retry_if_exception_type((APIConnectionError, APITimeoutError, RateLimitError)),
     )
@@ -435,6 +535,13 @@ class ClipDetectorService:
             except json.JSONDecodeError:
                 logger.error("JSON repair failed. Raw output:\n%s", raw_content[:500])
                 candidates = []
+
+        if isinstance(candidates, dict):
+            for key in ("clips", "candidates", "results"):
+                nested = candidates.get(key)
+                if isinstance(nested, list):
+                    candidates = nested
+                    break
 
         if not isinstance(candidates, list):
             logger.warning("LLM response was not a JSON array; skipping chunk.")
@@ -471,15 +578,25 @@ class ClipDetectorService:
             candidates, cost = self.score_chunk(rendered_prompt)
             return chunk_index, candidates, cost, False
         except Exception as primary_exc:
-            logger.warning(
+            fallback_model = settings.clip_detector_fallback_model.strip()
+            if not fallback_model or fallback_model == settings.clip_detector_model:
+                logger.info(
+                    "Chunk %d primary model (%s) failed: %s. No fallback model configured.",
+                    chunk_index,
+                    settings.clip_detector_model,
+                    primary_exc,
+                )
+                return chunk_index, [], 0.0, True
+
+            logger.info(
                 "Chunk %d primary model (%s) failed: %s. Trying fallback (%s)...",
                 chunk_index, settings.clip_detector_model, primary_exc, 
-                settings.clip_detector_fallback_model
+                fallback_model
             )
             try:
                 candidates, cost = self.score_chunk(
                     rendered_prompt, 
-                    model_override=settings.clip_detector_fallback_model
+                    model_override=fallback_model
                 )
                 return chunk_index, candidates, cost, False
             except Exception as fallback_exc:
@@ -515,7 +632,8 @@ class ClipDetectorService:
                 "end_time": orig_end,
                 "reason": candidate_clip.get("reason", "")
             }),
-            transcript_context=context_text
+            transcript_context=context_text,
+            prompt_version=settings.clip_prompt_version,
         )
         
         try:
@@ -564,8 +682,7 @@ class ClipDetectorService:
         effective_weights = custom_score_weights
         if not effective_weights and user_id:
             effective_weights = get_personalized_weights(user_id)
-        if not effective_weights:
-            effective_weights = SCORE_WEIGHTS
+        effective_weights = normalize_score_weights(effective_weights)
 
         if not chunks:
             return [], 0.0
@@ -611,12 +728,30 @@ class ClipDetectorService:
                 if scored["final_score"] >= SCORE_THRESHOLD:
                     all_candidates.append(scored)
 
+        if not all_candidates:
+            logger.info("LLM detection produced no valid candidates; using heuristic fallback candidates.")
+            for candidate in build_heuristic_candidates(words, limit=limit):
+                coerced_scores = {k: float(candidate[k]) for k in SCORE_WEIGHTS}
+                all_candidates.append(
+                    {
+                        **candidate,
+                        "duration": round(float(candidate["end_time"]) - float(candidate["start_time"]), 2),
+                        "final_score": calculate_final_score(coerced_scores, weights=effective_weights),
+                    }
+                )
+
         deduped = dedupe_candidates(all_candidates)
         selected = select_top_clips(deduped, limit=limit)
 
         results: list[ScoredClip] = []
         for index, candidate in enumerate(selected, start=1):
-            r_start, r_end, r_reason, r_cost = self.refine_clip_boundaries(candidate, words)
+            if candidate.get("source") == "heuristic":
+                r_start = float(candidate["start_time"])
+                r_end = float(candidate["end_time"])
+                r_reason = "Heuristic fallback boundaries used because LLM detection did not return valid candidates."
+                r_cost = 0.0
+            else:
+                r_start, r_end, r_reason, r_cost = self.refine_clip_boundaries(candidate, words)
             total_cost += r_cost
             results.append(
                 ScoredClip(

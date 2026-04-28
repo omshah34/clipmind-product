@@ -6,7 +6,7 @@
 
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 
@@ -56,6 +56,10 @@ export default function JobStatus({ jobId }: { jobId: string }) {
   const [data, setData] = useState<JobStatusResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [redirecting, setRedirecting] = useState(false);
+
+  const handlePipelineCompleted = useCallback(() => {
+    getJobStatus(jobId).then(setData).catch(() => {});
+  }, [jobId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -110,8 +114,6 @@ export default function JobStatus({ jobId }: { jobId: string }) {
     return <div className="alert">{error}</div>;
   }
 
-  }
-
   // ── Loading state (first fetch not yet returned) ─────────────────────────
   if (!data && !error) {
     return (
@@ -128,6 +130,10 @@ export default function JobStatus({ jobId }: { jobId: string }) {
         </div>
       </div>
     );
+  }
+
+  if (!data) {
+    return null;
   }
 
   // ── Failed state ─────────────────────────────────────────────────────────
@@ -214,10 +220,7 @@ export default function JobStatus({ jobId }: { jobId: string }) {
       <LivePipeline
         jobId={jobId}
         initialData={data}
-        onCompleted={() => {
-          // Re-fetch status to get clips data
-          getJobStatus(jobId).then(setData).catch(() => {});
-        }}
+        onCompleted={handlePipelineCompleted}
       />
 
       <p className="note" style={{ marginTop: 16, fontSize: 12, opacity: 0.6 }}>

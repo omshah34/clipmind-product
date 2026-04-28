@@ -38,7 +38,7 @@ async def export_linkedin_post(
     if str(job.user_id) != str(user.user_id):
         raise HTTPException(status_code=403, detail="Workspace access denied")
 
-    clips = job.get("clips_json", [])
+    clips = job.clips_json or []
     if not clips or req.clip_index >= len(clips):
         raise HTTPException(status_code=404, detail="Clip not found at specified index")
 
@@ -51,9 +51,9 @@ async def export_linkedin_post(
     
     # Simple transcript extraction logic (from words)
     transcript_text = "See video for details."
-    if job.get("transcript_json"):
+    if getattr(job, "transcript_json", None):
         from services.caption_renderer import flatten_words
-        words = flatten_words(job["transcript_json"])
+        words = flatten_words(job.transcript_json)
         start = float(clip["start_time"])
         end = float(clip["end_time"])
         segment_words = [w["word"] for w in words if start <= float(w["start"]) <= end]
@@ -183,7 +183,16 @@ async def get_social_pulse(
         
     engine = get_export_engine()
     clip = job.clips_json[clip_index]
-    pulse = await engine.generate_social_pulse(clip.model_dump())
+    clip_data = clip.model_dump() if hasattr(clip, "model_dump") else dict(clip)
+    if getattr(job, "transcript_json", None):
+        from services.caption_renderer import flatten_words
+        words = flatten_words(job.transcript_json)
+        start = float(clip_data["start_time"])
+        end = float(clip_data["end_time"])
+        clip_data["transcript_text"] = " ".join(
+            w["word"] for w in words if start <= float(w["start"]) <= end
+        )
+    pulse = await engine.generate_social_pulse(clip_data)
     return pulse
 
 @exports_router.get("/job/{job_id}/social-pulse/all")
@@ -201,7 +210,18 @@ async def get_all_social_pulses(
     
     # We could parallelize this with asyncio.gather for speed
     import asyncio
-    tasks = [engine.generate_social_pulse(clip.model_dump()) for clip in job.clips_json]
+    tasks = []
+    for clip in job.clips_json:
+        clip_data = clip.model_dump() if hasattr(clip, "model_dump") else dict(clip)
+        if getattr(job, "transcript_json", None):
+            from services.caption_renderer import flatten_words
+            words = flatten_words(job.transcript_json)
+            start = float(clip_data["start_time"])
+            end = float(clip_data["end_time"])
+            clip_data["transcript_text"] = " ".join(
+                w["word"] for w in words if start <= float(w["start"]) <= end
+            )
+        tasks.append(engine.generate_social_pulse(clip_data))
     pulses = await asyncio.gather(*tasks)
     
     return {

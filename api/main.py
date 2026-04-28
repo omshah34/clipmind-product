@@ -10,13 +10,19 @@ setup_logging()
 
 import logging
 import os
+import time
 import traceback
 
+import redis
 from fastapi import FastAPI, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
+from starlette.middleware.gzip import GZipMiddleware
+from db.connection import DatabaseTimeoutException
+from services.ws_manager import ws_manager
+from services.storage import storage_service
 
 # Gap 21: Prevent Log Destruction - Setup logging handled in setup_logging()
 # but we can add a marker here if needed.
@@ -25,15 +31,21 @@ from contextlib import asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("ClipMind API starting up...")
+    
+    # Gap 208: Initialize shared Redis clients
+    await ws_manager.init_redis(app)
+    
     yield
     # Shutdown
     logger.info("ClipMind API shutting down...")
-    # 3. Gap 104: Close Redis connection on shutdown
+    
+    # Gap 208: Close shared Redis clients
+    await ws_manager.close_redis(app)
+    
+    # Gap 104: Close Redis connection on rate limiter
     for middleware in app.user_middleware:
         if hasattr(middleware, "options") and "cls" in middleware.options:
             if middleware.options["cls"] == SlidingWindowRateLimiter:
-                # We need to find the actual instance. 
-                # Since BaseHTTPMiddleware wraps it, we store it on app.state during init
                 if hasattr(app.state, "rate_limiter"):
                     await app.state.rate_limiter.close()
 try:
@@ -89,7 +101,7 @@ if os.getenv("SENTRY_DSN"):
             environment=os.getenv("ENVIRONMENT", "development"),
         )
 
-app = FastAPI(title="ClipMind API", version="0.1.0")
+app = FastAPI(title="ClipMind API", version="0.1.0", lifespan=lifespan)
 
 # TODO: Fetch these dynamically before launch from:
 # Stripe: https://stripe.com/files/ips/ips_webhooks.json
@@ -102,18 +114,32 @@ PLATFORM_WEBHOOK_CIDRS = [
 ]
 
 # Add Rate Limiter Middleware
-limiter = SlidingWindowRateLimiter(
-    app,  # Pass app to satisfy BaseHTTPMiddleware
+app.add_middleware(
+    SlidingWindowRateLimiter,
     limit=100,           # 100 requests
     window_seconds=60,   # per minute
     allowlist_ips=PLATFORM_WEBHOOK_CIDRS,
-    allowlist_limit=500  # Elevated limit for webhooks
+    allowlist_limit=500,  # Elevated limit for webhooks
 )
-app.add_middleware(SlidingWindowRateLimiter, **limiter.__dict__)
-# Store instance for lifespan cleanup (Gap 104)
-app.state.rate_limiter = limiter
 
 app.add_middleware(RequestContextMiddleware)
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+
+@app.middleware("http")
+async def log_request_summary(request: Request, call_next):
+    started_at = time.perf_counter()
+    response = await call_next(request)
+    duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+    logger.info(
+        "[http] %s %s -> %s (%sms, content-length=%s)",
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration_ms,
+        request.headers.get("content-length", "0"),
+    )
+    return response
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
@@ -130,20 +156,30 @@ async def add_security_headers(request: Request, call_next):
     # XSS Protection for older browsers
     response.headers["X-XSS-Protection"] = "1; mode=block"
     # Basic Content Security Policy
-    response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' *.clipmind.com"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "connect-src 'self' http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:* *.clipmind.com"
+    )
     # Gap 81: Referrer-Policy — prevent leaking internal dashboard URLs to external sites
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     # Permissions Policy — disable access to camera/mic/location by default
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Vary"] = "Origin"
     
     return response
 
+DEV_ORIGINS = [
+    f"http://localhost:{port}" for port in range(3000, 3011)
+] + [
+    f"http://127.0.0.1:{port}" for port in range(3000, 3011)
+]
+
 ALLOWED_ORIGINS = [
     os.getenv("FRONTEND_URL", "http://localhost:3000"),
-    "http://localhost:3000",
-    "http://localhost:3001",
-    "http://127.0.0.1:3000",
-    "http://127.0.0.1:3001",
+    *DEV_ORIGINS,
     "https://app.clipmind.com",
     "https://clipmind.com",
 ]
@@ -173,6 +209,16 @@ if feature_flag_enabled("dev_auth_bypass", default=os.getenv("ENVIRONMENT", "").
 # ---------------------------------------------------------------------------
 # Global exception handler — ensures CORS headers are attached even on 500s
 # ---------------------------------------------------------------------------
+@app.exception_handler(DatabaseTimeoutException)
+async def db_timeout_handler(request: Request, exc: DatabaseTimeoutException):
+    """Gap 207: Handle DB pool exhaustion gracefully."""
+    logger.warning("Database connection pool exhausted: %s", exc)
+    return JSONResponse(
+        status_code=503,
+        content={"message": "Service temporarily unavailable due to high load. Please try again in a few seconds."},
+        headers={"Retry-After": "5"}
+    )
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.exception("Unhandled exception: %s", exc)
@@ -222,7 +268,12 @@ async def healthcheck() -> dict:
     health = {
         "status": "ok",
         "api": "healthy",
-        "dependencies": {}
+        "dependencies": {},
+        "capabilities": {
+            "direct_upload": storage_service.is_cloud_storage_enabled(),
+            "multipart_upload": storage_service.is_cloud_storage_enabled(),
+            "cloud_storage": storage_service.is_cloud_storage_enabled(),
+        },
     }
     status_code = 200
 
@@ -242,11 +293,18 @@ async def healthcheck() -> dict:
     # 2. Check Redis & Workers (Gap 35, 68)
     try:
         from workers.celery_app import celery_app
-        # Ping Redis via celery's connection pool
-        with celery_app.connection_or_acquire() as conn:
-            client = conn.default_channel.connection.client
+
+        # Use redis-py's client API for Redis commands. Celery/Kombu exposes
+        # pooled transport connections here, not a redis.Redis instance.
+        client = redis.Redis.from_url(
+            settings.redis_url,
+            socket_timeout=settings.redis_socket_timeout,
+            socket_connect_timeout=settings.redis_socket_connect_timeout,
+            decode_responses=True,
+        )
+        try:
             client.ping()
-            
+
             # Gap 35: Redis Memory Health
             redis_info = client.info("memory")
             used_mb = round(redis_info.get("used_memory", 0) / (1024 * 1024), 2)
@@ -257,6 +315,8 @@ async def healthcheck() -> dict:
                 "peak_memory_mb": peak_mb,
                 "fragmentation_ratio": redis_info.get("mem_fragmentation_ratio")
             }
+        finally:
+            client.close()
 
         # Gap 68: Check Worker Load & Concurrency (only in non-dev or if forced)
         if os.getenv("ENVIRONMENT") != "development":

@@ -22,6 +22,7 @@ from db.repositories.webhooks import (
     get_webhook,
     get_webhook_delivery,
 )
+from services.event_emitter import WEBHOOK_SCHEMA_VERSION
 from workers.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,7 @@ def deliver_webhook_event(
     event_type: str,
     event_data: dict,
     user_id: str,
+    idempotency_key: str | None = None,
 ) -> dict:
     """Queue webhook deliveries for an event."""
     logger.info(f"[webhook] Processing event: {event_type} for user {user_id}")
@@ -61,9 +63,13 @@ def deliver_webhook_event(
         logger.debug(f"[webhook] No active webhooks for event {event_type}")
         return {"queued": 0, "failed": 0}
     
+    # Gap 205: Use deterministic idempotency key if provided
+    event_id = idempotency_key or f"{event_type}_{int(time.time() * 1000)}"
+    
     event_payload = {
-        "event_id": f"{event_type}_{int(time.time() * 1000)}",
+        "event_id": event_id,
         "event_type": event_type,
+        "schema_version": WEBHOOK_SCHEMA_VERSION,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "user_id": user_id,
         "data": event_data,
@@ -166,6 +172,8 @@ def attempt_webhook_delivery(
     headers = {
         "X-Webhook-Signature": signature,
         "X-Webhook-Timestamp": datetime.now(timezone.utc).isoformat(),
+        "X-Idempotency-Key": event_payload.get("event_id"),
+        "X-ClipMind-Webhook-Version": WEBHOOK_SCHEMA_VERSION,
         "Content-Type": "application/json",
     }
     
@@ -189,6 +197,13 @@ def attempt_webhook_delivery(
         response_time_ms = int((time.time() - start_time) * 1000)
         
         if response.status_code < 400:
+            success = True
+        elif response.status_code == 409:
+            # Gap 205: Handle 409 Conflict as success-equivalent (already delivered)
+            logger.info(
+                "[webhook-deliver] Webhook already delivered (idempotent): key=%s endpoint=%s",
+                event_payload.get("event_id"), webhook["url"]
+            )
             success = True
         else:
             error_message = f"HTTP {response.status_code}"

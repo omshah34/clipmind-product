@@ -3,6 +3,7 @@ import logging
 import json
 import os
 import re
+import warnings
 from typing import List, Dict, Any
 from pathlib import Path
 
@@ -14,6 +15,25 @@ from pathlib import Path
 from core.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _quiet_embedding_dependency_warnings() -> None:
+    """Keep optional embedding downloads from polluting worker logs."""
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*unauthenticated requests to the HF Hub.*",
+    )
+    logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+    logging.getLogger("transformers").setLevel(logging.ERROR)
+    try:
+        from huggingface_hub.utils import logging as hf_logging
+        from transformers.utils import logging as transformers_logging
+
+        hf_logging.set_verbosity_error()
+        transformers_logging.set_verbosity_error()
+    except Exception:
+        pass
 
 class DiscoveryIndexLockError(Exception):
     """Raised when the discovery index lock cannot be acquired."""
@@ -29,16 +49,24 @@ class DiscoveryService:
     def __init__(self):
         self.model_name = "all-MiniLM-L6-v2"
         self._model = None
-        self._index_path = settings.local_storage_dir / "discovery" / "embeddings.jbl"
+        
+        # Gap 191: Isolate index spaces per model to prevent dimension mismatch crashes
+        safe_model_name = self.model_name.replace("/", "_").replace("\\", "_")
+        self._index_path = settings.local_storage_dir / "discovery" / f"embeddings_{safe_model_name}.json"
         self._index_path.parent.mkdir(parents=True, exist_ok=True)
 
     @property
     def model(self):
         """Lazy load the embedding model."""
         if self._model is None:
+            _quiet_embedding_dependency_warnings()
             from sentence_transformers import SentenceTransformer
             logger.info("Loading semantic embedding model: %s", self.model_name)
-            self._model = SentenceTransformer(self.model_name)
+            kwargs = {"token": settings.hf_token} if settings.hf_token else {}
+            try:
+                self._model = SentenceTransformer(self.model_name, **kwargs)
+            except TypeError:
+                self._model = SentenceTransformer(self.model_name)
         return self._model
 
     def generate_embedding(self, text: str) -> List[float]:
@@ -99,30 +127,71 @@ class DiscoveryService:
         # Gap 36: Run CPU-bound encoding in a thread pool so we don't block the event loop
         embeddings = await self._encode_texts_async(texts)
         
-        # Gap 26: Redis-backed atomic lock for concurrent index updates
+        # Gap 203: Robust Redis-backed atomic lock for concurrent index updates
+        from core.redis_utils import RobustRedisLock
         r = redis.from_url(settings.redis_url)
-        lock = r.lock("discovery_index_lock", timeout=120)
+        lock = RobustRedisLock(
+            r, "discovery_index_lock", 
+            timeout=120, heartbeat_interval=30, 
+            blocking=True, blocking_timeout=15
+        )
         
-        if not lock.acquire(blocking=True, blocking_timeout=15):
-            logger.error("Could not acquire discovery index lock for job %s", job_id)
+        try:
+            with lock:
+                index = self._load_index()
+                for i, emb in enumerate(embeddings):
+                    index["embeddings"].append(emb)
+                    index["metadata"].append({
+                        "job_id": job_id,
+                        "start": segments[i].get("start"),
+                        "end": segments[i].get("end"),
+                        "text": segments[i].get("text")
+                    })
+                
+                self._save_index(index)
+                logger.debug("Added %d segments from job %s to semantic index", len(segments), job_id)
+        except RuntimeError as e:
+            # RobustRedisLock.__enter__ raises RuntimeError if acquisition fails
+            logger.error("Could not acquire discovery index lock for job %s: %s", job_id, e)
             raise DiscoveryIndexLockError(f"Could not acquire index lock after 15s")
 
+    async def remove_job_from_index(self, job_id: str):
+        """
+        Gap 198: Remove all vectors associated with a job_id to prevent stale ghost results.
+        """
+        import redis
+        logger.info("Removing job %s from semantic discovery index", job_id)
+        
+        # Gap 203: Robust Redis-backed atomic lock
+        from core.redis_utils import RobustRedisLock
+        r = redis.from_url(settings.redis_url)
+        lock = RobustRedisLock(
+            r, "discovery_index_lock", 
+            timeout=120, heartbeat_interval=30,
+            blocking=True, blocking_timeout=15
+        )
+        
         try:
-            index = self._load_index()
-            for i, emb in enumerate(embeddings):
-                index["embeddings"].append(emb)
-                index["metadata"].append({
-                    "job_id": job_id,
-                    "start": segments[i].get("start"),
-                    "end": segments[i].get("end"),
-                    "text": segments[i].get("text")
-                })
-            
-            self._save_index(index)
-            logger.debug("Added %d segments from job %s to semantic index", len(segments), job_id)
-        finally:
-            # Ensure lock is released even if save fails
-            lock.release()
+            with lock:
+                index = self._load_index()
+                if not index["metadata"]:
+                    return
+                    
+                # Filter out the job
+                keep_indices = [i for i, meta in enumerate(index["metadata"]) if str(meta.get("job_id")) != str(job_id)]
+                
+                if len(keep_indices) == len(index["metadata"]):
+                    return # Nothing to remove
+                    
+                index["embeddings"] = [index["embeddings"][i] for i in keep_indices]
+                index["metadata"] = [index["metadata"][i] for i in keep_indices]
+                
+                self._save_index(index)
+                logger.debug("Removed job %s from semantic index", job_id)
+        except RuntimeError as e:
+            logger.error("Could not acquire discovery index lock to remove job %s: %s", job_id, e)
+            raise DiscoveryIndexLockError(f"Could not acquire index lock after 15s")
+
     async def search_clips(self, query: str, user_id: str = None, limit: int = 5) -> List[Dict[str, Any]]:
         """
         Semantic search across all indexed content.

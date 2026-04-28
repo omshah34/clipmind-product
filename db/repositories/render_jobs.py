@@ -17,13 +17,14 @@ def create_render_job(
     clip_index: int,
     edited_srt: str,
     caption_style: dict | None = None,
+    render_recipe: dict | None = None,
 ) -> dict[str, Any] | None:
     """Create a render job for edited captions."""
     query = text("""
         INSERT INTO render_jobs (
-            user_id, job_id, clip_index, edited_srt, caption_style, status
+            user_id, job_id, clip_index, edited_srt, edited_style, render_recipe_json, status, progress_percent
         ) VALUES (
-            :user_id, :job_id, :clip_index, :edited_srt, :caption_style, 'queued'
+            :user_id, :job_id, :clip_index, :edited_srt, :edited_style, :render_recipe_json, 'queued', 0
         )
         RETURNING *
     """)
@@ -34,10 +35,20 @@ def create_render_job(
             "job_id": str(job_id),
             "clip_index": clip_index,
             "edited_srt": edited_srt,
-            "caption_style": json.dumps(caption_style or {}),
+            "edited_style": json.dumps(caption_style or {}),
+            "render_recipe_json": json.dumps(render_recipe or {}),
         }).fetchone()
     
-    return dict(row._mapping) if row else None
+    if not row:
+        return None
+    payload = dict(row._mapping)
+    for field_name in ("edited_style", "render_recipe_json"):
+        if isinstance(payload.get(field_name), str):
+            try:
+                payload[field_name] = json.loads(payload[field_name])
+            except json.JSONDecodeError:
+                pass
+    return payload
 
 
 def get_render_job(render_job_id: UUID | str) -> dict[str, Any] | None:
@@ -49,7 +60,16 @@ def get_render_job(render_job_id: UUID | str) -> dict[str, Any] | None:
     with engine.begin() as connection:
         row = connection.execute(query, {"render_job_id": str(render_job_id)}).fetchone()
     
-    return dict(row._mapping) if row else None
+    if not row:
+        return None
+    payload = dict(row._mapping)
+    for field_name in ("edited_style", "render_recipe_json"):
+        if isinstance(payload.get(field_name), str):
+            try:
+                payload[field_name] = json.loads(payload[field_name])
+            except json.JSONDecodeError:
+                pass
+    return payload
 
 
 def list_render_jobs(
@@ -70,7 +90,17 @@ def list_render_jobs(
             "limit": limit,
         }).fetchall()
     
-    return [dict(row._mapping) for row in rows]
+    payloads: list[dict[str, Any]] = []
+    for row in rows:
+        payload = dict(row._mapping)
+        for field_name in ("edited_style", "render_recipe_json"):
+            if isinstance(payload.get(field_name), str):
+                try:
+                    payload[field_name] = json.loads(payload[field_name])
+                except json.JSONDecodeError:
+                    pass
+        payloads.append(payload)
+    return payloads
 
 
 def update_render_job_status(
@@ -102,4 +132,13 @@ def update_render_job_status(
             "error_message": error_message,
         }).fetchone()
     
-    return dict(row._mapping) if row else None
+    if not row:
+        return None
+    payload = dict(row._mapping)
+    for field_name in ("edited_style", "render_recipe_json"):
+        if isinstance(payload.get(field_name), str):
+            try:
+                payload[field_name] = json.loads(payload[field_name])
+            except json.JSONDecodeError:
+                pass
+    return payload

@@ -65,20 +65,13 @@ export default function PerformanceCharts({ data, clipIndex }: PerformanceCharts
     },
   ].filter((item) => item.value > 0);
 
-  // Clip performance data
-  const clipData = Array.from({ length: data.total_clips }, (_, i) => ({
-    clip: `Clip ${i}`,
-    index: i,
-    views: Math.floor(Math.random() * data.total_views * 0.3), // Simplified
-  }));
-
   const COLORS = ["#ec4899", "#10b981", "#f59e0b", "#3b82f6", "#8b5cf6"];
 
-  // Decision: Performance vs AI Prediction Scatter Plot
-  // This expects the data to have objects with { predicted: float, actual: float, tier: string, window_complete: bool }
-  // Since the 'data' prop (PerformanceSummary) might not have this in its current form, 
-  // I will assume it's passed or derived. I'll extend the props to accept 'all_clips_performance'.
-  const scatterData = (data as any).all_clips_performance || [];
+  // Performance vs AI Prediction Scatter Plot
+  // Only render when the backend provided real clip-level points.
+  const scatterData = Array.isArray(data.all_clips_performance)
+    ? data.all_clips_performance
+    : [];
 
   return (
     <div className="space-y-8">
@@ -146,53 +139,61 @@ export default function PerformanceCharts({ data, clipIndex }: PerformanceCharts
         <p className="text-sm text-gray-500 mb-6">
           Comparing AI's predicted virality score against actual real-world engagement.
         </p>
-        <ResponsiveContainer width="100%" height={400}>
-          <ScatterChart margin={{ top: 20, right: 20, bottom: 20, left: 20 }}>
-            <CartesianGrid />
-            <XAxis 
-              type="number" 
-              dataKey="predicted" 
-              name="Predicted Score" 
-              unit="" 
-              domain={[0, 10]} 
-              label={{ value: 'Predicted Score', position: 'insideBottom', offset: -10 }}
-            />
-            <YAxis 
-              type="number" 
-              dataKey="actual" 
-              name="Actual Engagement" 
-              unit="" 
-              label={{ value: 'Actual Engagement', angle: -90, position: 'insideLeft' }}
-            />
-            <ZAxis type="number" dataKey="z" range={[60, 400]} />
-            <Tooltip cursor={{ strokeDasharray: '3 3' }} />
-            <Legend />
-            <Scatter name="Clips" data={scatterData}>
-              {scatterData.map((entry: any, index: number) => {
-                const isSelected = clipIndex !== null && entry.clip_index === parseInt(clipIndex || "-1", 10);
-                return (
-                  <ReCell 
-                    key={`cell-${index}`} 
-                    stroke={isSelected ? "#000" : "none"}
-                    strokeWidth={isSelected ? 3 : 0}
-                    fill={
-                      isSelected ? "#fff" :
-                      entry.tier === 'viral' ? '#f093fb' :
-                      entry.tier === 'validated' ? '#00ff00' :
-                      entry.tier === 'emerging' ? '#4facfe' : '#94a3b8'
-                    }
-                    fillOpacity={entry.window_complete ? 1.0 : 0.4}
-                    r={isSelected ? 10 : 6}
-                  />
-                );
-              })}
-            </Scatter>
-          </ScatterChart>
-        </ResponsiveContainer>
-        {!scatterData.some((e: any) => e.window_complete) && (
-            <div className="mt-4 p-4 bg-gray-50 rounded-lg text-xs text-secondary text-center">
-                Note: Faded points indicate ongoing engagement windows.
-            </div>
+        {scatterData.length === 0 ? (
+          <div className="mt-4 p-6 rounded-lg border border-dashed border-gray-200 text-sm text-gray-500 text-center">
+            No clip-level performance points are available yet.
+          </div>
+        ) : (
+          <>
+            <ResponsiveContainer width="100%" height={400}>
+              <ScatterChart margin={{ top: 20, right: 20, bottom: 20, left: 20 }}>
+                <CartesianGrid />
+                <XAxis
+                  type="number"
+                  dataKey="predicted"
+                  name="Predicted Score"
+                  unit=""
+                  domain={[0, 10]}
+                  label={{ value: 'Predicted Score', position: 'insideBottom', offset: -10 }}
+                />
+                <YAxis
+                  type="number"
+                  dataKey="actual"
+                  name="Actual Engagement"
+                  unit=""
+                  label={{ value: 'Actual Engagement', angle: -90, position: 'insideLeft' }}
+                />
+                <ZAxis type="number" dataKey="z" range={[60, 400]} />
+                <Tooltip cursor={{ strokeDasharray: '3 3' }} />
+                <Legend />
+                <Scatter name="Clips" data={scatterData}>
+                  {scatterData.map((entry: any, index: number) => {
+                    const isSelected = clipIndex !== null && entry.clip_index === parseInt(clipIndex || "-1", 10);
+                    return (
+                      <ReCell
+                        key={`cell-${index}`}
+                        stroke={isSelected ? "#000" : "none"}
+                        strokeWidth={isSelected ? 3 : 0}
+                        fill={
+                          isSelected ? "#fff" :
+                          entry.tier === 'viral' ? '#f093fb' :
+                          entry.tier === 'validated' ? '#00ff00' :
+                          entry.tier === 'emerging' ? '#4facfe' : '#94a3b8'
+                        }
+                        fillOpacity={entry.window_complete ? 1.0 : 0.4}
+                        r={isSelected ? 10 : 6}
+                      />
+                    );
+                  })}
+                </Scatter>
+              </ScatterChart>
+            </ResponsiveContainer>
+            {!scatterData.some((e: any) => e.window_complete) && (
+                <div className="mt-4 p-4 bg-gray-50 rounded-lg text-xs text-secondary text-center">
+                    Note: Faded points indicate ongoing engagement windows.
+                </div>
+            )}
+          </>
         )}
       </div>
 

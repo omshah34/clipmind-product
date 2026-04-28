@@ -73,8 +73,9 @@ def oauth_callback(
     mock_account_id = f"acct_{uuid4().hex[:8]}"
     
     with engine.begin() as conn:
+        _ts = "NOW()" if engine.dialect.name == "postgresql" else "CURRENT_TIMESTAMP"
         conn.execute(
-            text("""
+            text(f"""
                 INSERT INTO social_accounts 
                 (user_id, platform, account_id, account_username, access_token_encrypted, refresh_token_encrypted, is_connected)
                 VALUES (:user_id, :platform, :acct_id, :username, :acc_tok, :ref_tok, 1)
@@ -83,7 +84,7 @@ def oauth_callback(
                     access_token_encrypted = EXCLUDED.access_token_encrypted,
                     refresh_token_encrypted = EXCLUDED.refresh_token_encrypted,
                     is_connected = 1,
-                    updated_at = NOW()
+                    updated_at = {_ts}
             """),
             {
                 "user_id": user_id,

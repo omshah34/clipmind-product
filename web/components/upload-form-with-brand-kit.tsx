@@ -21,6 +21,7 @@ import { FormEvent, useState, useEffect } from "react";
 import {
   completeDirectUpload,
   failDirectUpload,
+  getUploadCapabilities,
   initDirectUpload,
   probeVideoDuration,
   uploadFileToSignedUrl,
@@ -111,41 +112,34 @@ export default function UploadFormWithBrandKit({
 
     setIsSubmitting(true);
     setError(null);
+    let directUploadSession: { job_id: string } | null = null;
     try {
       if (onUploadStart) {
         onUploadStart();
       }
 
+      const uploadCapabilities = await getUploadCapabilities();
       const durationSeconds = await probeVideoDuration(file);
 
-      try {
-        const session = await initDirectUpload(
-          file,
-          durationSeconds,
-          userId,
-          selectedBrandKitId || undefined,
-        );
-        router.push(`/jobs/${session.job_id}`);
-
-        void (async () => {
-          try {
-            await uploadFileToSignedUrl(session.upload_url, file);
-            await completeDirectUpload(session.job_id);
-          } catch (directUploadError) {
-            await failDirectUpload(
-              session.job_id,
-              directUploadError instanceof Error
-                ? directUploadError.message
-                : "Direct upload failed.",
-            );
+      if (uploadCapabilities.direct_upload) {
+        try {
+          const session = await initDirectUpload(
+            file,
+            durationSeconds,
+            userId,
+            selectedBrandKitId || undefined,
+          );
+          directUploadSession = { job_id: session.job_id };
+          await uploadFileToSignedUrl(session.upload_url, file);
+          await completeDirectUpload(session.job_id);
+          router.push(`/jobs/${session.job_id}`);
+          return;
+        } catch (directUploadError) {
+          const message =
+            directUploadError instanceof Error ? directUploadError.message : "";
+          if (directUploadSession) {
+            await failDirectUpload(directUploadSession.job_id, message || "Direct upload failed.");
           }
-        })();
-
-        return;
-      } catch (directUploadError) {
-        const message =
-          directUploadError instanceof Error ? directUploadError.message : "";
-        if (!message.includes("Direct upload requires Supabase storage")) {
           throw directUploadError;
         }
       }

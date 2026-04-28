@@ -13,6 +13,41 @@ from openai import OpenAI, RateLimitError, APIError
 from core.config import settings
 from db.repositories.jobs import get_job
 from services.openai_client import make_openai_client
+import re
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Gap 195: Prompt injection guard pattern
+_INJECTION_PATTERN = re.compile(
+    r"(ignore previous|disregard|forget all|system prompt|you are now|act as|jailbreak|bypass)",
+    re.IGNORECASE,
+)
+
+_MAX_TRANSCRIPT_CHARS = 12_000  # Gap 192: safe context window limit
+
+def _sanitize_input(text: str) -> str:
+    """Gap 195: Strip common prompt injection patterns from user-supplied text."""
+    if not isinstance(text, str): return text
+    return _INJECTION_PATTERN.sub("[REDACTED]", text)
+
+def _extract_json(content: str) -> str:
+    """Gap 196: Robustly extract JSON from LLM replies that may include markdown code fences."""
+    m = re.search(r"```(?:json)?\s*([\s\S]+?)```", content)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"(\{[\s\S]+\})", content)
+    if m:
+        return m.group(1).strip()
+    return content.strip()
+
+def _truncate_transcript(transcript_text: str) -> str:
+    """Gap 192: Truncate transcript to safe context window size."""
+    if not isinstance(transcript_text, str): return transcript_text
+    if len(transcript_text) > _MAX_TRANSCRIPT_CHARS:
+        logger.warning("Transcript truncated from %d to %d chars (Gap 192)", len(transcript_text), _MAX_TRANSCRIPT_CHARS)
+        return transcript_text[:_MAX_TRANSCRIPT_CHARS] + "\n...[TRUNCATED]"
+    return transcript_text
 
 def detect_sequences_heuristic(user_id: str, job_id: str) -> dict:
     job = get_job(job_id)
@@ -39,11 +74,6 @@ OPENAI_API_KEY = settings.openai_api_key
 llm_client = make_openai_client() if OPENAI_API_KEY else None
 
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    reraise=True,
-)
 def detect_sequences_with_llm(user_id: str, job_id: str) -> dict:
     """
     Detect clip sequences using GPT-4 semantic understanding.
@@ -109,28 +139,35 @@ Return ONLY valid JSON with this structure:
 }}
 """
         
-        response = llm_client.chat.completions.create(
-            model=settings.clip_detector_model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are an expert video editor analyzing clip sequences for narrative storytelling.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.7,
-            max_tokens=1000,
-        )
+        # Gap 193: Exponential backoff manual retry before fallback
+        import time
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = llm_client.chat.completions.create(
+                    model=settings.clip_detector_model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "You are an expert video editor analyzing clip sequences for narrative storytelling.",
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.7,
+                    max_tokens=1000,
+                )
+                break
+            except (RateLimitError, APIError) as e:
+                if attempt == max_retries - 1:
+                    raise e
+                wait = 2 ** attempt
+                logger.warning("LLM API error (attempt %d/%d), retrying in %ds: %s", attempt + 1, max_retries, wait, e)
+                time.sleep(wait)
         
         # Parse LLM response
         content = response.choices[0].message.content
-        # Extract JSON from markdown code blocks if present
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0]
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0]
-        
-        result = json.loads(content.strip())
+        content = _extract_json(content)
+        result = json.loads(content)
         
         return {
             "method": "llm",
@@ -150,11 +187,6 @@ Return ONLY valid JSON with this structure:
         return detect_sequences_heuristic(user_id, job_id)
 
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=5),
-    reraise=True,
-)
 def optimize_captions_with_llm(
     user_id: str,
     job_id: str,
@@ -250,28 +282,35 @@ Return ONLY valid JSON with this structure:
 Only include keys for platforms in the target list above.
 """
         
-        response = llm_client.chat.completions.create(
-            model=settings.clip_detector_model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are an expert social media strategist optimizing content for maximum engagement.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.8,
-            max_tokens=800,
-        )
+        # Gap 193: Exponential backoff manual retry before fallback
+        import time
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = llm_client.chat.completions.create(
+                    model=settings.clip_detector_model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "You are an expert social media strategist optimizing content for maximum engagement.",
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.8,
+                    max_tokens=800,
+                )
+                break
+            except (RateLimitError, APIError) as e:
+                if attempt == max_retries - 1:
+                    raise e
+                wait = 2 ** attempt
+                logger.warning("LLM API error for captions (attempt %d/%d), retrying in %ds: %s", attempt + 1, max_retries, wait, e)
+                time.sleep(wait)
         
         # Parse LLM response
         content = response.choices[0].message.content
-        # Extract JSON from markdown code blocks if present
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0]
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0]
-        
-        result = json.loads(content.strip())
+        content = _extract_json(content)
+        result = json.loads(content)
         optimized = result.get("optimized_captions", {})
         
         return {
@@ -314,11 +353,6 @@ def is_llm_available() -> bool:
     """Check if LLM is configured and available."""
     return llm_client is not None and OPENAI_API_KEY != ""
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=5),
-    reraise=True,
-)
 def generate_hook_variants(job_id: str, clip_index: int) -> list[dict]:
     """
     Analyzes the transcript segment for a clip and returns 3 distinct start-time variations (Hooks).
@@ -356,6 +390,7 @@ def generate_hook_variants(job_id: str, clip_index: int) -> list[dict]:
             raise ValueError("No transcript words found around the start time.")
             
         transcript_text = " ".join([f"[{w['start']:.2f}] {w['word']}" for w in context_words])
+        transcript_text = _sanitize_input(_truncate_transcript(transcript_text))
         
         prompt = f"""You are an elite YouTube Shorts editor.
 We have a clip that originally starts at timestamp {start_time:.2f}.
@@ -379,16 +414,28 @@ Return ONLY valid JSON with this structure:
   ]
 }}
 """
-        response = llm_client.chat.completions.create(
-            model=settings.clip_detector_model,
-            messages=[
-                {"role": "system", "content": "You optimize short-form video hooks for retention."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.7,
-            max_tokens=500,
-            response_format={"type": "json_object"}
-        )
+        # Gap 193: Exponential backoff manual retry before fallback
+        import time
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = llm_client.chat.completions.create(
+                    model=settings.clip_detector_model,
+                    messages=[
+                        {"role": "system", "content": "You optimize short-form video hooks for retention."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.7,
+                    max_tokens=500,
+                    response_format={"type": "json_object"}
+                )
+                break
+            except (RateLimitError, APIError) as e:
+                if attempt == max_retries - 1:
+                    raise e
+                wait = 2 ** attempt
+                logger.warning("LLM API error for hooks (attempt %d/%d), retrying in %ds: %s", attempt + 1, max_retries, wait, e)
+                time.sleep(wait)
         
         result = json.loads(response.choices[0].message.content.strip())
         return result.get("hooks", [])

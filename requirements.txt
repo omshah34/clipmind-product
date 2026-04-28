@@ -21,6 +21,8 @@ sentry-sdk[fastapi]==2.3.1
 # Update manually and test ingestion after each bump.
 yt-dlp==2026.03.17
 librosa==0.11.0
+pypdf==5.4.0
+PyMuPDF==1.26.0
 
 # -- Optional: Cloud Storage (only needed if using Supabase for file storage) --
 # Remove or skip if running with local filesystem storage

@@ -42,9 +42,9 @@ PYTHON = str(VENV_PYTHON) if VENV_PYTHON.exists() else sys.executable
 LOG_DIR = ROOT / "log"
 LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / "app.log"
-# Gap 21: Prevent Log Destruction - Append session marker instead of clearing
-with open(LOG_FILE, "a", encoding="utf-8") as f:
-    f.write(f"\n\n{'='*80}\nNEW SESSION: {time.strftime('%Y-%m-%d %H:%M:%S')}\n{'='*80}\n")
+# Start each launcher run with a fresh log file.
+with open(LOG_FILE, "w", encoding="utf-8") as f:
+    f.write(f"{'='*80}\nNEW SESSION: {time.strftime('%Y-%m-%d %H:%M:%S')}\n{'='*80}\n")
 
 # Colour helpers (works on Windows 10+ terminals)
 def _c(code: str, text: str) -> str:
@@ -280,9 +280,8 @@ SERVICES = {
             PYTHON, "-m", "uvicorn", "api.main:app",
             "--host", "0.0.0.0",
             "--port", "8000",
-            "--reload",
             "--log-level", "info",
-        ],
+        ] + ([] if IS_WINDOWS else ["--reload"]),
         "cwd": str(ROOT),
     },
     "worker": {
@@ -363,7 +362,18 @@ def log_stream(proc: subprocess.Popen, label: str, color_fn):
                 fname = filepath.replace("\\", "/").split("/")[-1]
                 last_source_file = f"{fname}:{lineno}"
 
-            if any(k in lower for k in ["error", "traceback", "exception", "failed", "x"]):
+            error_markers = [
+                " error",
+                "error:",
+                "[error]",
+                "traceback",
+                "exception",
+                "failed",
+                " eaddrinuse",
+                "permission denied",
+            ]
+
+            if any(marker in lower for marker in error_markers):
                 severity = "[ERROR]"
                 source_tag = f" ({last_source_file})" if last_source_file else ""
             elif "warn" in lower:
@@ -378,31 +388,53 @@ def log_stream(proc: subprocess.Popen, label: str, color_fn):
 
 
 def is_port_in_use(port: int) -> bool:
-    """Check if a port is in use by attempting to bind to it."""
+    """Check if a port is already listening on localhost via IPv4 or IPv6."""
     import socket
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+
+    def _can_connect(family: int, host: str) -> bool:
         try:
-            s.bind(("0.0.0.0", port))
+            with socket.socket(family, socket.SOCK_STREAM) as s:
+                s.settimeout(0.2)
+                return s.connect_ex((host, port)) == 0
+        except OSError:
             return False
-        except socket.error:
-            return True
+
+    return _can_connect(socket.AF_INET, "127.0.0.1") or _can_connect(socket.AF_INET6, "::1")
+
+
+def find_available_port(preferred_port: int, *, max_tries: int = 10) -> int | None:
+    """Return the first available port at or above ``preferred_port``."""
+    for port in range(preferred_port, preferred_port + max_tries):
+        if not is_port_in_use(port):
+            return port
+    return None
 
 
 def start_service(key: str, svc: dict) -> subprocess.Popen | None:
     label = svc["label"]
     color = svc["color"]
-    cmd   = svc["cmd"]
+    cmd   = list(svc["cmd"])
     cwd   = svc.get("cwd", str(ROOT))
     
     # Gap 67: Unstable Port Checks - Verify port availability before launch
     port_match = [arg for i, arg in enumerate(cmd) if i > 0 and cmd[i-1] == "--port"]
-    if not port_match and key == "web": port_match = ["3000"] # Default Next.js
-    
+    if not port_match and key == "web":
+        preferred_port = 3000
+        resolved_port = find_available_port(preferred_port)
+        if resolved_port is None:
+            print(f"{red('[FAIL]')} {label} - No open port found in range {preferred_port}-{preferred_port + 9}.")
+            return None
+        if resolved_port != preferred_port:
+            print(f"{yellow('[PORT]')}  {label} - Port {preferred_port} is busy, using {resolved_port} instead.")
+        cmd.extend(["--", "--port", str(resolved_port)])
+        port_match = [str(resolved_port)]
+
     if port_match:
         port = int(port_match[0])
         if is_port_in_use(port):
             print(f"{red('[FAIL]')} {label} - Port {port} is already in use or restricted.")
             return None
+        svc["_resolved_port"] = port
 
     exe = cmd[0]
     if shutil.which(str(exe)) is None and not Path(str(exe)).exists():
@@ -458,6 +490,21 @@ def load_env():
         if line and not line.startswith("#") and "=" in line:
             key, _, val = line.partition("=")
             os.environ[key.strip()] = val.strip()
+
+
+def ensure_database_ready() -> bool:
+    """Initialize the database schema for local dev before services start."""
+    try:
+        from db.init_db import init_db_tables
+        from db.connection import engine
+
+        print(f"{yellow('[CHECK]')} Ensuring database schema exists...")
+        init_db_tables(engine)
+        print(f"{green('[OK]')}    Database schema is ready\n")
+        return True
+    except Exception as exc:
+        print(f"{red('[FAIL]')}  Database initialization failed: {exc}\n")
+        return False
 
 
 def check_frontend_deps():
@@ -536,6 +583,9 @@ def main():
     load_env()
     check_env()
 
+    if not ensure_database_ready():
+        sys.exit(1)
+
     # -- Determine which services to run --------------------------------------
     run_keys: list[str] = []
 
@@ -586,7 +636,12 @@ def main():
     print(f"\n{green('[RUNNING]')} All services up. Press {bold('Ctrl+C')} to stop.\n")
     print(f"  {bold('API:')}     http://localhost:8000")
     print(f"  {bold('Docs:')}    http://localhost:8000/docs")
-    print(f"  {bold('Web:')}     http://localhost:3000\n")
+    web_port = 3000
+    for key, proc in started:
+        if key == "web":
+            web_port = int(SERVICES[key].get("_resolved_port", 3000))
+            break
+    print(f"  {bold('Web:')}     http://localhost:{web_port}\n")
     print(f"{green(bold('>>> CLIPMIND IS READY <<<'))}\n")
 
     # -- Monitor & auto-restart crashed services -------------------------------

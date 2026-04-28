@@ -63,5 +63,10 @@ class TestASSGenerator(unittest.TestCase):
         # MarginV for Hormozi is 150
         self.assertIn(",10,10,150,1", header)
 
+    def test_speaker_screen_raises_caption_safe_zone(self):
+        gen = ASSGenerator(preset_name="hormozi", layout_type="speaker_screen")
+        header = gen.generate_header()
+        self.assertIn(",10,10,260,1", header)
+
 if __name__ == "__main__":
     unittest.main()

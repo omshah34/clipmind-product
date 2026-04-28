@@ -271,8 +271,10 @@ class TranscriptionService:
                 "response_format": "verbose_json",
                 "timestamp_granularities": ["word", "segment"],
             }
-            if language:
-                params["language"] = language
+            # Gap 199: Ensure language is valid ISO-639-1 and handle "auto"
+            if language and language.lower() != "auto":
+                params["language"] = language[:2].lower()
+            
             # Gap 72: inject custom vocabulary as a prompt hint
             if vocabulary_hints:
                 params["prompt"] = ", ".join(vocabulary_hints[:50])  # Whisper prompt is capped
@@ -376,17 +378,25 @@ class TranscriptionService:
 
             # Multi-chunk: transcribe each and merge
             chunk_results: list[tuple[dict, float]] = []
+            
+            # Gap 199: Lock detected language to prevent switching in mixed-language videos
+            enforced_language = language if language and language.lower() != "auto" else None
+
             for idx, (chunk_path, offset) in enumerate(chunks):
                 logger.info(
                     "Transcribing chunk %d/%d (offset=%.1fs, lang=%s)...",
-                    idx + 1, len(chunks), offset, language
+                    idx + 1, len(chunks), offset, enforced_language or "auto"
                 )
-                transcript = self._transcribe_single(chunk_path, language, vocabulary_hints)
+                transcript = self._transcribe_single(chunk_path, enforced_language, vocabulary_hints)
                 
                 # FIX 3: Filter bad chunks — skip if transcription failed
                 if transcript is None or not _is_valid_transcript(transcript):
                     logger.error("Chunk %d transcription failed — skipping", idx + 1)
                     continue
+
+                # Lock the auto-detected language from the first successful chunk
+                if not enforced_language and transcript.get("language"):
+                    enforced_language = transcript.get("language")
 
                 chunk_results.append((transcript, offset))
 

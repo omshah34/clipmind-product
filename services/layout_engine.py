@@ -4,12 +4,12 @@ Purpose: Modular video layout engine supporting Vertical and Split-Screen (Podca
 
 from __future__ import annotations
 import logging
-from typing import Literal, Dict, Any, List
+from typing import Literal, List
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-LayoutType = Literal["vertical", "split_screen", "pip"]
+LayoutType = Literal["vertical", "split_screen", "speaker_screen", "screen_only", "pip"]
 
 class LayoutEngine:
     """Generates FFmpeg filtergraphs for different social media layouts."""
@@ -20,12 +20,26 @@ class LayoutEngine:
         layout_type: LayoutType, 
         width: int, 
         height: int, 
-        subject_centers: List[float]
+        subject_centers: List[float],
+        screen_focus: str = "center",
     ) -> str:
         """
         Build the filtergraph string based on layout and face positions.
         - subject_centers: List of X-coordinates for detected subjects.
         """
+        subject_centers = [float(center) for center in subject_centers if center is not None]
+
+        if layout_type == "screen_only":
+            return cls._screen_only_filter(width, height, screen_focus=screen_focus)
+
+        if layout_type == "speaker_screen":
+            return cls._speaker_screen_filter(
+                width,
+                height,
+                subject_centers[0] if subject_centers else width / 2,
+                screen_focus=screen_focus,
+            )
+
         if layout_type == "vertical" or not subject_centers:
             return cls._vertical_filter(width, height, subject_centers[0] if subject_centers else width/2)
         
@@ -40,19 +54,44 @@ class LayoutEngine:
         return cls._vertical_filter(width, height, width/2)
 
     @staticmethod
+    def _ensure_even(value: int) -> int:
+        return value if value % 2 == 0 else value - 1
+
+    @classmethod
+    def _crop_width_for_ratio(cls, width: int, height: int, ratio: float) -> int:
+        target_w = min(width, int(height * ratio))
+        target_w = cls._ensure_even(max(2, target_w))
+        return min(target_w, cls._ensure_even(width))
+
+    @staticmethod
+    def _focus_crop_x(width: int, crop_width: int, *, focus: str = "center", x_center: float | None = None) -> int:
+        if x_center is not None:
+            proposed = int(x_center - (crop_width / 2))
+        elif focus == "left":
+            proposed = 0
+        elif focus == "right":
+            proposed = width - crop_width
+        else:
+            proposed = int((width - crop_width) / 2)
+        return max(0, min(width - crop_width, proposed))
+
+    @staticmethod
     def _vertical_filter(width: int, height: int, x_center: float) -> str:
         """Standard 9:16 vertical crop centered on subject."""
-        target_w = int(height * (9/16))
-        # Ensure target_w is even for FFmpeg
-        target_w = target_w if target_w % 2 == 0 else target_w - 1
+        target_w = LayoutEngine._crop_width_for_ratio(width, height, 9 / 16)
 
         if abs(x_center - (width / 2)) < 1e-6:
             return "crop=ih*9/16:ih:(iw-ih*9/16)/2:0"
         
         # Calculate crop x
-        x = int(x_center - (target_w / 2))
-        x = max(0, min(width - target_w, x))
+        x = LayoutEngine._focus_crop_x(width, target_w, x_center=x_center)
         
+        return f"crop={target_w}:{height}:{x}:0"
+
+    @staticmethod
+    def _screen_only_filter(width: int, height: int, screen_focus: str) -> str:
+        target_w = LayoutEngine._crop_width_for_ratio(width, height, 9 / 16)
+        x = LayoutEngine._focus_crop_x(width, target_w, focus=screen_focus)
         return f"crop={target_w}:{height}:{x}:0"
 
     @staticmethod
@@ -62,10 +101,9 @@ class LayoutEngine:
         # Height of total is 'height'. Each half height is height/2.
         # Width remains consistent for 9:16 -> target_w = height * (9/16)
         
-        target_w = int(height * (9/16))
-        target_w = target_w if target_w % 2 == 0 else target_w - 1
+        target_w = LayoutEngine._crop_width_for_ratio(width, height, 9 / 16)
         half_h = int(height / 2)
-        half_h = half_h if half_h % 2 == 0 else half_h - 1
+        half_h = LayoutEngine._ensure_even(half_h)
         
         # Calculate crops for top and bottom. 
         # We crop a 9:8 section from the original.
@@ -73,12 +111,10 @@ class LayoutEngine:
         # Usually faces are in upper half, so we crop top half of original or center it.
         
         # Top Crop logic: center on x1
-        x1_crop = int(x1 - (target_w / 2))
-        x1_crop = max(0, min(width - target_w, x1_crop))
+        x1_crop = LayoutEngine._focus_crop_x(width, target_w, x_center=x1)
         
         # Bottom Crop logic: center on x2
-        x2_crop = int(x2 - (target_w / 2))
-        x2_crop = max(0, min(width - target_w, x2_crop))
+        x2_crop = LayoutEngine._focus_crop_x(width, target_w, x_center=x2)
 
         # Filtergraph: 
         # 1. Split input into two streams
@@ -92,3 +128,24 @@ class LayoutEngine:
             f"[top][bot]vstack=inputs=2"
         )
         return filter_str
+
+    @staticmethod
+    def _speaker_screen_filter(width: int, height: int, x_center: float, screen_focus: str) -> str:
+        """Top speaker strip plus screen-dominant lower panel."""
+        output_width = 1080
+        output_height = 1920
+        speaker_h = LayoutEngine._ensure_even(int(output_height * 0.35))
+        screen_h = output_height - speaker_h
+
+        speaker_crop_w = LayoutEngine._crop_width_for_ratio(width, height, output_width / speaker_h)
+        screen_crop_w = LayoutEngine._crop_width_for_ratio(width, height, output_width / screen_h)
+
+        speaker_x = LayoutEngine._focus_crop_x(width, speaker_crop_w, x_center=x_center)
+        screen_x = LayoutEngine._focus_crop_x(width, screen_crop_w, focus=screen_focus)
+
+        return (
+            f"[0:v]split=2[speaker_raw][screen_raw]; "
+            f"[speaker_raw]crop={speaker_crop_w}:{height}:{speaker_x}:0,scale={output_width}:{speaker_h}[speaker]; "
+            f"[screen_raw]crop={screen_crop_w}:{height}:{screen_x}:0,scale={output_width}:{screen_h}[screen]; "
+            f"[speaker][screen]vstack=inputs=2"
+        )

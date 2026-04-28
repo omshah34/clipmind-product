@@ -51,6 +51,7 @@ export default function PublishContent() {
   const [caption, setCaption] = useState("");
   const [hashtags, setHashtags] = useState("");
   const [scheduledFor, setScheduledFor] = useState("");
+  const [scheduledTimezone, setScheduledTimezone] = useState("UTC");
 
   const [optimizedCaptions, setOptimizedCaptions] = useState<
     Record<string, string>
@@ -64,6 +65,13 @@ export default function PublishContent() {
   useEffect(() => {
     fetchSocialAccounts();
   }, [token]);
+
+  useEffect(() => {
+    const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    if (browserTimezone) {
+      setScheduledTimezone(browserTimezone);
+    }
+  }, []);
 
   const fetchSocialAccounts = async () => {
     try {
@@ -150,6 +158,7 @@ export default function PublishContent() {
             caption: optimizedCaptions[platform] || caption,
             hashtags,
             scheduled_for: scheduledFor || null,
+            scheduled_timezone: scheduledFor ? scheduledTimezone : null,
           }),
         })
       );
@@ -349,6 +358,9 @@ export default function PublishContent() {
               }}
               disabled={isPublishing}
             />
+            <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 6 }}>
+              Timezone: {scheduledTimezone}
+            </div>
           </label>
 
           <button

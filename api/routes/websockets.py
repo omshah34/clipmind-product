@@ -18,7 +18,7 @@ import time
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from services.ws_manager import drain_events
+from services.ws_manager import clear_events, drain_events
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["websockets"])
@@ -42,7 +42,7 @@ async def job_status_ws(websocket: WebSocket, job_id: str) -> None:
 
     try:
         # Send any buffered history first (catch-up for late joiners)
-        history = drain_events(job_id, after=0.0)
+        history = await drain_events(job_id, 0.0)
         if history:
             for event in history:
                 await websocket.send_json(event)
@@ -54,11 +54,12 @@ async def job_status_ws(websocket: WebSocket, job_id: str) -> None:
             # Gap 61: Close stale connections that have been idle too long
             if time.monotonic() - last_activity > _WS_IDLE_TIMEOUT_SECONDS:
                 logger.info("[ws] Closing idle connection for job=%s (no activity for %.0fs)", job_id, _WS_IDLE_TIMEOUT_SECONDS)
+                clear_events(job_id)
                 await websocket.close(code=1000, reason="Idle timeout")
                 return
 
             # Check for new events
-            new_events = drain_events(job_id, after=cursor)
+            new_events = await drain_events(job_id, cursor)
             for event in new_events:
                 await websocket.send_json(event)
                 cursor = event["timestamp"]
@@ -66,6 +67,7 @@ async def job_status_ws(websocket: WebSocket, job_id: str) -> None:
 
                 # If job completed or errored fatally, close after sending
                 if event["type"] in ("completed", "error"):
+                    await clear_events(job_id)
                     await asyncio.sleep(0.5)  # give client time to process
                     await websocket.close()
                     logger.info("[ws] Client disconnected (job %s %s)", job_id, event["type"])
@@ -88,6 +90,12 @@ async def job_status_ws(websocket: WebSocket, job_id: str) -> None:
 
     except WebSocketDisconnect:
         logger.info("[ws] Client disconnected for job=%s", job_id)
+    except RuntimeError as exc:
+        logger.info("[ws] Protocol/runtime error for job=%s: %s", job_id, exc)
+        try:
+            await websocket.close(code=1002, reason="Protocol error")
+        except Exception:
+            pass
     except Exception as exc:
         logger.warning("[ws] WebSocket error for job=%s: %s", job_id, exc)
         try:

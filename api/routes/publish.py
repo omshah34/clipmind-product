@@ -14,15 +14,16 @@ router = APIRouter(prefix="/publish", tags=["publish"])
 
 
 class OptimizeCaptionsPayload(BaseModel):
-    original_caption: str
+    original_caption: str = Field(max_length=2200)
     platforms: list[str] = Field(default_factory=list)
 
 
 class PublishPayload(BaseModel):
-    platform: str
-    caption: str
+    platform: str = Field(max_length=32)
+    caption: str = Field(max_length=2200)
     hashtags: Any = None
     scheduled_for: datetime | None = None
+    scheduled_timezone: str | None = Field(default=None, max_length=64)
 
 
 @router.get("/accounts")
@@ -63,9 +64,9 @@ def publish_clip(
             caption=payload.caption,
             hashtags=payload.hashtags,
             scheduled_for=payload.scheduled_for,
+            scheduled_timezone=payload.scheduled_timezone,
         )
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-

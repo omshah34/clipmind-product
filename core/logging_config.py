@@ -19,7 +19,7 @@ from core.request_context import current_context
 
 LOG_FORMAT = (
     "%(asctime)s | %(levelname)-8s | %(name)s [%(filename)s:%(lineno)d]"
-    " | request_id=%(request_id)s job_id=%(job_id)s user_id=%(user_id)s | %(message)s"
+    " | trace_id=%(trace_id)s request_id=%(request_id)s job_id=%(job_id)s user_id=%(user_id)s | %(message)s"
 )
 LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -41,6 +41,7 @@ class ContextFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         context = current_context()
         record.request_id = context.request_id or "-"
+        record.trace_id = context.trace_id or context.request_id or "-"
         record.job_id = context.job_id or "-"
         record.user_id = context.user_id or "-"
         # Gap 47: Redact PII from the log message itself

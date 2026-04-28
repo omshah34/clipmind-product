@@ -11,8 +11,10 @@ setup_logging()
 import ssl
 
 from celery import Celery
+from celery.signals import before_task_publish, task_postrun, task_prerun
 
 from core.config import settings
+from core.request_context import current_context, reset_request_context, set_request_context
 
 
 celery_app = Celery(
@@ -36,6 +38,8 @@ celery_app = Celery(
 )
 
 # Base Celery config
+from kombu import Queue
+
 _conf: dict = dict(
     task_track_started=True,
     task_serializer="json",
@@ -43,12 +47,27 @@ _conf: dict = dict(
     accept_content=["json"],
     timezone="UTC",
     enable_utc=True,
+    # Gap 202: Prevent Redis memory bloat by expiring results after 24h
+    result_expires=86400,
     # Connection & retry settings
     broker_connection_retry_on_startup=True,
     broker_connection_max_retries=10,
     broker_connection_retry=True,
     broker_connection_retry_delay=5,
     redis_backend_health_check_interval=30,
+    # Gap 206: Worker health & heartbeats
+    worker_send_task_events=True,
+    worker_heartbeat_interval=10,
+    # Gap 209: Priority Queue Support
+    task_queue_max_priority=10,
+    task_default_priority=5,
+    task_queues=[
+        Queue("celery", routing_key="celery"),
+        Queue("pipeline_v2", routing_key="pipeline_v2", queue_arguments={"x-max-priority": 10}),
+        Queue("renders_v2", routing_key="renders_v2", queue_arguments={"x-max-priority": 10}),
+        Queue("publishing", routing_key="publishing"),
+        Queue("dlq", routing_key="dlq"),
+    ],
     # Socket configuration - use settings from config.py
     broker_transport_options={
         "socket_timeout": settings.redis_socket_timeout,
@@ -60,12 +79,13 @@ _conf: dict = dict(
         # Gap 95: Prevent long-running render tasks (>1hr) from being re-queued
         # The visibility_timeout must exceed the longest expected task runtime.
         "visibility_timeout": 7200,  # 2 hours in seconds
+        "queue_order_strategy": "priority",
     },
     # Gap 97: Route exhausted tasks to a Dead Letter Queue for manual inspection
     # Tasks that exceed max retries will be routed to the 'dlq' queue.
     task_routes={
-        "workers.pipeline.*": {"queue": "pipeline"},
-        "workers.render_clips.*": {"queue": "renders"},
+        "workers.pipeline.*": {"queue": "pipeline_v2"},
+        "workers.render_clips.*": {"queue": "renders_v2"},
         "workers.publish_social.*": {"queue": "publishing"},
     },
     # Gap 97: DLQ — when a task raises after all retries, Celery rejects it.
@@ -101,7 +121,49 @@ _conf["beat_schedule"] = {
         "task": "workers.maintenance_tasks.reclaim_stale_jobs",
         "schedule": 900.0, # Every 15 minutes
     },
+    "check_worker_watchdog": {
+        "task": "workers.maintenance_tasks.check_worker_health",
+        "schedule": 120.0, # Every 2 minutes
+    },
+    "cleanup_orphaned_files": {
+        "task": "workers.maintenance_tasks.cleanup_local_storage",
+        "schedule": 86400.0, # Every 24 hours
+    },
 }
 
 celery_app.conf.update(**_conf)
+
+
+@before_task_publish.connect
+def _inject_trace_headers(sender=None, headers=None, body=None, **kwargs):
+    if headers is None:
+        return
+    context = current_context()
+    headers.setdefault("clipmind_trace_id", context.trace_id or context.request_id)
+    headers.setdefault("clipmind_request_id", context.request_id)
+    headers.setdefault("clipmind_job_id", context.job_id)
+    headers.setdefault("clipmind_user_id", context.user_id)
+
+
+@task_prerun.connect
+def _restore_trace_context(task_id=None, task=None, args=None, kwargs=None, **extra):
+    request = getattr(task, "request", None)
+    headers = getattr(request, "headers", {}) or {}
+    tokens = set_request_context(
+        request_id=headers.get("clipmind_request_id") or task_id,
+        trace_id=headers.get("clipmind_trace_id") or task_id,
+        job_id=headers.get("clipmind_job_id"),
+        user_id=headers.get("clipmind_user_id"),
+        source="celery",
+    )
+    if request is not None:
+        setattr(request, "_clipmind_context_tokens", tokens)
+
+
+@task_postrun.connect
+def _clear_trace_context(task_id=None, task=None, args=None, kwargs=None, retval=None, state=None, **extra):
+    request = getattr(task, "request", None)
+    tokens = getattr(request, "_clipmind_context_tokens", None)
+    if tokens is not None:
+        reset_request_context(tokens)
 

@@ -5,6 +5,9 @@ Purpose: Periodic maintenance tasks to keep the system healthy and recover from 
 from __future__ import annotations
 
 import logging
+import os
+import platform
+import time
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -12,10 +15,14 @@ from workers.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
 
-@celery_app.task(name="workers.maintenance_tasks.reclaim_stale_jobs")
+@celery_app.task(
+    name="workers.maintenance_tasks.reclaim_stale_jobs",
+    soft_time_limit=300,
+    time_limit=330
+)
 def reclaim_stale_jobs() -> int:
     """
-    Find jobs stuck in 'processing' or 'queued' for > 45 minutes and mark as failed.
+    Find jobs stuck in 'processing', 'queued', or 'uploading' for > 45 minutes and mark as failed.
     Prevents 'ghost' jobs from cluttering the UI if a worker crashed mid-task.
     Dialect-aware: works on both PostgreSQL and SQLite.
     """
@@ -36,7 +43,7 @@ def reclaim_stale_jobs() -> int:
                             failed_stage = 'pipeline',
                             error_message = 'Job timed out: System reclaimed stale task',
                             updated_at = NOW()
-                        WHERE status IN ('processing', 'queued')
+                        WHERE status IN ('processing', 'queued', 'uploading')
                           AND updated_at < :threshold
                         RETURNING id
                     """),
@@ -48,7 +55,7 @@ def reclaim_stale_jobs() -> int:
                 stale = connection.execute(
                     text("""
                         SELECT id FROM jobs
-                        WHERE status IN ('processing', 'queued')
+                        WHERE status IN ('processing', 'queued', 'uploading')
                           AND updated_at < :threshold
                     """),
                     {"threshold": timeout_threshold.isoformat()},
@@ -84,7 +91,11 @@ def reclaim_stale_jobs() -> int:
     return len(reclaimed_ids)
 
 
-@celery_app.task(name="workers.maintenance_tasks.cleanup_local_storage")
+@celery_app.task(
+    name="workers.maintenance_tasks.cleanup_local_storage",
+    soft_time_limit=600,
+    time_limit=660
+)
 def cleanup_local_storage() -> int:
     """
     Remove temporary files older than 24 hours from local storage.
@@ -123,3 +134,74 @@ def cleanup_local_storage() -> int:
     if count > 0:
         logger.info("Maintenance: Cleaned up %d orphaned files from local storage", count)
     return count
+
+@celery_app.task(
+    name="workers.maintenance_tasks.check_worker_health",
+    soft_time_limit=60,
+    time_limit=90
+)
+def check_worker_health() -> dict:
+    """
+    Gap 206: Active Worker Watchdog.
+    Pings workers and inspects active tasks to identify unresponsive/zombie states.
+    """
+    # 1. Reachability Check
+    pings = None
+    for attempt in range(2):
+        inspector = celery_app.control.inspect()
+        pings = inspector.ping()
+        if pings:
+            break
+        if attempt == 0:
+            time.sleep(1)
+
+    if not pings:
+        stats = celery_app.control.inspect().stats()
+        if stats:
+            logger.warning(
+                "WATCHDOG: ping returned no responses, but %d worker(s) reported stats; treating as transient inspect failure.",
+                len(stats),
+            )
+            return {"status": "degraded", "workers_online": len(stats), "reason": "ping_transient"}
+        if os.getenv("ENVIRONMENT", "development") != "production" or platform.system() == "Windows":
+            logger.info("WATCHDOG: No workers responded to ping after retry; treating as degraded in local/non-production mode.")
+            return {"status": "degraded", "reason": "no_workers_local"}
+        logger.critical("WATCHDOG: No workers responded to ping after retry.")
+        return {"status": "critical", "reason": "no_workers"}
+
+    # 2. Progress Check (Active Tasks)
+    active_tasks = celery_app.control.inspect().active()
+    revoked_count = 0
+    now = datetime.now(timezone.utc).timestamp()
+
+    if active_tasks:
+        for worker, tasks in active_tasks.items():
+            for task in tasks:
+                # task['time_start'] is epoch seconds when task was received
+                start_time = task.get('time_start')
+                if not start_time:
+                    continue
+                
+                # Baseline from task name or default
+                name = task.get('name', '')
+                baseline = 1800 if 'pipeline' in name else 600
+                
+                runtime = now - start_time
+                if runtime > (baseline * 2.0):
+                    logger.critical(
+                        "WATCHDOG: Task %s [%s] on %s has been running for %ds (limit %ds). Revoking with SIGKILL.",
+                        name, task['id'], worker, int(runtime), baseline
+                    )
+                    celery_app.control.revoke(task['id'], terminate=True, signal='SIGKILL')
+                    revoked_count += 1
+                elif runtime > (baseline * 1.5):
+                    logger.warning(
+                        "WATCHDOG: Task %s [%s] on %s is exceeding soft limit (runtime %ds, baseline %ds).",
+                        name, task['id'], worker, int(runtime), baseline
+                    )
+
+    return {
+        "status": "ok",
+        "workers_online": len(pings),
+        "revoked_zombies": revoked_count
+    }

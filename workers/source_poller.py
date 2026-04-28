@@ -6,10 +6,14 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import redis
 from db.repositories.autopilot import list_active_sources_for_polling
 from services.source_ingestion import get_source_ingestion_service
 from workers.celery_app import celery_app
+from core.redis_utils import RobustRedisLock
+from core.config import settings
 
 # Redis lock configuration
 POLLER_LOCK_KEY = "clipmind:poller:lock"
@@ -19,35 +23,40 @@ logger = logging.getLogger(__name__)
 
 @celery_app.task(name="workers.source_poller.poll_all_sources")
 def poll_all_sources() -> dict[str, Any]:
-    """Poller task with Redis locking to prevent overlapping runs."""
-    # 1. Acquire Redis Lock
-    redis_client = celery_app.backend.client
-    lock_acquired = redis_client.set(POLLER_LOCK_KEY, "locked", ex=POLLER_LOCK_EXPIRE, nx=True)
-    
-    if not lock_acquired:
-        logger.warning("[Autopilot] Another poller is already running. Skipping this cycle.")
-        return {"status": "skipped", "reason": "lock_active"}
-    
+    """Poller task that fans out to process all active sources in parallel."""
     try:
         sources = list_active_sources_for_polling()
-        logger.info("[Autopilot] Polling %d active source(s)", len(sources))
+        logger.info("[Autopilot] Polling %d active source(s) using %d workers", len(sources), settings.poller_max_workers)
         
         ingestion_service = get_source_ingestion_service()
         total_new_jobs = 0
         
-        for source in sources:
-            new_jobs = ingestion_service.poll_source(source)
-            total_new_jobs += new_jobs
-            
+        # Gap 204: Fan out polling using a ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=settings.poller_max_workers) as executor:
+                # Map future to source for exception isolation
+                future_to_source = {
+                    executor.submit(ingestion_service.poll_source, source): source 
+                    for source in sources
+                }
+                
+                for future in as_completed(future_to_source):
+                    source = future_to_source[future]
+                    source_id = source.get("id", "unknown")
+                    try:
+                        new_jobs = future.result()
+                        total_new_jobs += new_jobs
+                    except Exception as exc:
+                        # Gap 204: Exception isolation per source
+                        logger.error("[Autopilot] [source=%s] Polling failed: %s", source_id, exc, exc_info=True)
+                
         return {
             "status": "success",
             "sources_polled": len(sources),
             "new_jobs_triggered": total_new_jobs
         }
-    
-    finally:
-        # Release the lock
-        redis_client.delete(POLLER_LOCK_KEY)
+    except Exception as e:
+        logger.error("[Autopilot] Source poller failed: %s", e, exc_info=True)
+        return {"status": "error", "message": str(e)}
 
 @celery_app.task(name="workers.source_poller.check_publish_queue")
 def check_publish_queue() -> dict[str, Any]:

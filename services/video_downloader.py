@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,7 @@ ALLOWED_DOMAINS = [
 # Gap 94: Max resolution cap — 1080p is sufficient for vertical clip generation
 # and avoids unnecessary 4K bandwidth/storage costs
 _MAX_HEIGHT = int(os.getenv("YTDLP_MAX_HEIGHT", "1080"))
+_INFO_TIMEOUT_SECONDS = int(os.getenv("YTDLP_INFO_TIMEOUT_SECONDS", "30"))
 
 class VideoDownloaderError(Exception):
     """Base exception for video downloader service."""
@@ -45,6 +47,26 @@ def _require_yt_dlp() -> Any:
         )
     return yt_dlp
 
+
+def _extract_video_info(url: str) -> dict[str, Any]:
+    """Internal yt-dlp metadata lookup without timeout handling."""
+    if not validate_url(url):
+        raise VideoDownloaderError("Domain not allowed. Only YouTube links are supported.")
+
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+    }
+
+    try:
+        ytdlp = _require_yt_dlp()
+        with ytdlp.YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(url, download=False)
+    except Exception as e:
+        logger.error("Failed to extract video info: %s", e)
+        raise VideoDownloaderError(f"Could not fetch video info: {str(e)}")
+
 def validate_url(url: str) -> bool:
     """Check if the URL belongs to an allowed domain."""
     from urllib.parse import urlparse
@@ -52,25 +74,24 @@ def validate_url(url: str) -> bool:
     domain = parsed.netloc.lower()
     return any(domain == d for d in ALLOWED_DOMAINS)
 
-def get_video_info(url: str) -> dict[str, Any]:
-    """Extract metadata from a YouTube URL without downloading."""
-    if not validate_url(url):
-        raise VideoDownloaderError("Domain not allowed. Only YouTube links are supported.")
+def get_video_info(url: str, timeout_seconds: int = _INFO_TIMEOUT_SECONDS) -> dict[str, Any]:
+    """Extract metadata from a YouTube URL without downloading.
 
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': True,
-    }
-
+    The yt-dlp Python API can block indefinitely on upstream/network stalls.
+    Run the extraction in a worker thread and bound it with a timeout so the
+    caller can fail safely instead of hanging a request or worker.
+    """
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_extract_video_info, url)
     try:
-        ytdlp = _require_yt_dlp()
-        with ytdlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return info
-    except Exception as e:
-        logger.error("Failed to extract video info: %s", e)
-        raise VideoDownloaderError(f"Could not fetch video info: {str(e)}")
+        return future.result(timeout=timeout_seconds)
+    except FuturesTimeoutError as exc:
+        future.cancel()
+        raise VideoDownloaderError(
+            f"Timed out after {timeout_seconds}s while fetching video metadata."
+        ) from exc
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 def download_video(url: str, output_path: Path) -> Path:
     """Download a video from YouTube to the specified path.
@@ -93,7 +114,9 @@ def download_video(url: str, output_path: Path) -> Path:
     except VideoDownloaderError:
         raise
     except Exception as e:
-        logger.warning("Live-stream pre-check failed (continuing anyway): %s", e)
+        raise VideoDownloaderError(
+            f"Could not verify stream status before download: {e}"
+        ) from e
 
     # Gap 94: Quality capped at _MAX_HEIGHT to save bandwidth and storage
     ydl_opts = {

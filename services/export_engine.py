@@ -6,8 +6,11 @@ Purpose: Omnichannel content transformation. Generates LinkedIn posts,
 
 import json
 import logging
+import shutil
+from html import escape
 from pathlib import Path
 from typing import Optional, List, Literal
+from urllib.parse import urlparse
 from sqlalchemy import text
 
 from core.config import settings
@@ -37,7 +40,7 @@ class ExportEngine:
 
         fps = 24
         clips = job.clips_json
-        source_name = Path(job.source_video_url).name
+        source_name = Path(urlparse(job.source_video_url).path).name
         
         # PRO-REQUIREMENT: Absolute paths for local NLE import
         # If it's a URL, we try to use the local cached version if available
@@ -53,7 +56,7 @@ class ExportEngine:
         xml_header = f"""<?xml version="1.0" encoding="UTF-8"?>
 <xmeml version="5">
 <sequence id="sequence-1">
-    <name>ClipMind Viral Cuts - {job_id[:8]}</name>
+    <name>ClipMind Viral Cuts - {escape(job_id[:8])}</name>
     <duration>{int(sum(c.get('duration', 0) for c in clips) * fps)}</duration>
     <rate><timebase>{fps}</timebase></rate>
     <media>
@@ -72,14 +75,14 @@ class ExportEngine:
             
             file_meta = f"""
                             <file id="file-1">
-                                <name>{source_name}</name>
-                                <pathurl>{media_path}</pathurl>
+                                <name>{escape(source_name)}</name>
+                                <pathurl>{escape(media_path)}</pathurl>
                                 <rate><timebase>{fps}</timebase></rate>
                             </file>""" if i == 0 else '<file id="file-1"/>'
 
             item = f"""
                 <clipitem id="clipitem-{i+1}">
-                    <name>{source_name} [Clip {i+1}]</name>
+                    <name>{escape(source_name)} [Clip {i+1}]</name>
                     <duration>{duration_frames}</duration>
                     <rate><timebase>{fps}</timebase></rate>
                     <start>{current_timeline_start}</start>
@@ -100,8 +103,8 @@ class ExportEngine:
             duration = int((float(clip.get("end_time", 0)) - float(clip.get("start_time", 0))) * fps)
             marker = f"""
         <marker>
-            <name>Hook: {clip.get('hook_headlines', [''])[0]}</name>
-            <comment>Virality: {clip.get('final_score', 0)}/10 | {clip.get('reason', '')}</comment>
+            <name>Hook: {escape(str(clip.get('hook_headlines', [''])[0]))}</name>
+            <comment>Virality: {clip.get('final_score', 0)}/10 | {escape(str(clip.get('reason', '')))}</comment>
             <in>{timeline_cursor}</in>
             <out>{timeline_cursor + 1}</out>
         </marker>"""
@@ -126,11 +129,11 @@ class ExportEngine:
 <fcpxml version="1.10">
     <resources>
         <format id="r1" name="FFVideoFormat1080p24" frameDuration="1/{fps}s" width="1920" height="1080"/>
-        <asset id="a1" name="{source_name}" src="{media_path}" start="0s" duration="3600s" hasVideo="1" format="r1"/>
+        <asset id="a1" name="{escape(source_name)}" src="{escape(media_path)}" start="0s" duration="3600s" hasVideo="1" format="r1"/>
     </resources>
     <library>
         <event name="ClipMind Exports">
-            <project name="Viral Sequence - {job_id[:8]}">
+            <project name="Viral Sequence - {escape(job_id[:8])}">
                 <sequence format="r1" tcStart="0s">
                     <spine>"""
         
@@ -142,7 +145,7 @@ class ExportEngine:
             
             xml += f"""
                         <asset-clip ref="a1" offset="{cursor}s" start="{start}s" duration="{dur}s">
-                            <note>Virality Score: {clip.get('final_score', 0)}</note>
+                            <note>Virality Score: {escape(str(clip.get('final_score', 0)))}</note>
                         </asset-clip>"""
             cursor += dur
             
@@ -176,7 +179,7 @@ class ExportEngine:
         elif hasattr(clip, "dict"):
             clip = clip.dict()
 
-        source_name = Path(job.source_video_url).name
+        source_name = Path(urlparse(job.source_video_url).path).name
         local_source = Path(settings.local_storage_dir) / "sources" / source_name
 
         if not local_source.exists():
@@ -187,23 +190,26 @@ class ExportEngine:
 
         export_dir = Path(settings.local_storage_dir) / "exports" / f"capcut_bridge_{job_id}_{clip_index}"
         export_dir.mkdir(parents=True, exist_ok=True)
-        
+
         raw_clip_path = export_dir / f"clip_{clip_index}_raw.mp4"
         srt_path = export_dir / f"clip_{clip_index}.srt"
         zip_path = export_dir.parent / f"clipmind_capcut_{job_id}_{clip_index}.zip"
 
-        # 1. Cut the raw clip
-        cut_clip(local_source, start_time, end_time, raw_clip_path, validate_duration=False)
+        try:
+            # 1. Cut the raw clip
+            cut_clip(local_source, start_time, end_time, raw_clip_path, validate_duration=False)
 
-        # 2. Generate SRT
-        if job.transcript_json:
-            write_clip_srt(job.transcript_json, start_time, end_time, srt_path)
+            # 2. Generate SRT
+            if job.transcript_json:
+                write_clip_srt(job.transcript_json, start_time, end_time, srt_path)
 
-        # 3. Zip them together
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            zipf.write(raw_clip_path, raw_clip_path.name)
-            if srt_path.exists():
-                zipf.write(srt_path, srt_path.name)
+            # 3. Zip them together
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                zipf.write(raw_clip_path, raw_clip_path.name)
+                if srt_path.exists():
+                    zipf.write(srt_path, srt_path.name)
+        finally:
+            shutil.rmtree(export_dir, ignore_errors=True)
 
         return zip_path
 
@@ -219,12 +225,20 @@ class ExportEngine:
                 "hashtags": ["#viral", "#video"]
             }
 
+        transcript_text = (
+            clip_data.get("transcript_text")
+            or clip_data.get("caption_text")
+            or clip_data.get("current_srt")
+            or clip_data.get("transcript")
+            or clip_data.get("reason", "")
+        )
+
         prompt = f"""
         You are a Viral Marketing Strategist. 
-        Analyze the following clip transcript and reasoning.
+        Analyze the following clip transcript and contextual metadata.
         Generate a 'Social Pulse' package to maximize retention and scroll-stopping.
         
-        Transcript: "{clip_data.get('reason', '')}"
+        Transcript: "{transcript_text}"
         
         Requirements:
         1. 3 Scroll-Stopping Headlines (Short, bold, 3-7 words).
@@ -251,12 +265,31 @@ class ExportEngine:
 
     def _get_clip_data(self, clip_id: str) -> dict:
         """Fetch clip details from the clips_json of its parent job."""
-        from db.connection import engine
-        # Since clips are stored in JSON arrays in the jobs table, 
-        # we need to find the job that contains this clip_id (in this case, clip_index)
-        # Actually, in this project, clips often refer to indices. 
-        # For this engine, we assume the API passes the parent job_id and clip_index.
-        pass
+        clip_ref = str(clip_id).strip()
+        if not clip_ref:
+            raise ValueError("clip_id is required")
+
+        if ":" in clip_ref:
+            job_id, clip_index_text = clip_ref.split(":", 1)
+            clip_index = int(clip_index_text)
+            job = get_job(job_id)
+            if not job or not job.clips_json or clip_index >= len(job.clips_json):
+                raise ValueError("Clip not found")
+            clip = job.clips_json[clip_index]
+            return clip.model_dump() if hasattr(clip, "model_dump") else dict(clip)
+
+        if "|" in clip_ref:
+            job_id, clip_index_text = clip_ref.split("|", 1)
+            clip_index = int(clip_index_text)
+            job = get_job(job_id)
+            if not job or not job.clips_json or clip_index >= len(job.clips_json):
+                raise ValueError("Clip not found")
+            clip = job.clips_json[clip_index]
+            return clip.model_dump() if hasattr(clip, "model_dump") else dict(clip)
+
+        raise ValueError(
+            "clip_id must be encoded as 'job_id:clip_index' or 'job_id|clip_index' for internal lookup"
+        )
 
     async def generate_linkedin_post(
         self, 
@@ -309,10 +342,10 @@ class ExportEngine:
     async def generate_newsletter_draft(self, job_id: str) -> str:
         """Aggregates all viral clips from a job into a Substack-ready newsletter blurb."""
         job = get_job(job_id)
-        if not job or not job.get("clips_json"):
+        if not job or not job.clips_json:
             return "No clips found for this job."
 
-        clips = job["clips_json"]
+        clips = job.clips_json
         # Limit to top 3-5 clips
         top_clips = sorted(clips, key=lambda x: x.get("final_score", 0), reverse=True)[:5]
         

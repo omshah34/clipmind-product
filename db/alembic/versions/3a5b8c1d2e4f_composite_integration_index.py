@@ -42,6 +42,11 @@ def upgrade() -> None:
         )
     else:
         # SQLite: regular non-concurrent index
+        integrations_exists = bind.exec_driver_sql(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='integrations'"
+        ).fetchone()
+        if not integrations_exists:
+            return
         op.execute(
             "CREATE INDEX IF NOT EXISTS idx_integrations_user_type "
             "ON integrations (user_id, integration_type)"

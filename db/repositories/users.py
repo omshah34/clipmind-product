@@ -9,6 +9,8 @@ from uuid import UUID
 from sqlalchemy import text
 
 from db.connection import engine
+from db.repositories.jobs import get_job
+from db.repositories.performance import build_performance_summary
 
 
 def get_user_id_by_email(email: str) -> str | None:
@@ -27,44 +29,62 @@ def get_all_users_with_active_platforms() -> list[str]:
     return [str(row[0]) for row in rows]
 
 
-def get_user_performance_summary(user_id: str | UUID) -> dict[str, Any]:
+def get_user_performance_summary(
+    user_id: str | UUID,
+    *,
+    start_date: datetime | None = None,
+    end_date: datetime | None = None,
+) -> dict[str, Any]:
     """Aggregate performance metrics for a user's dashboard."""
-    query = text("""
-        SELECT 
-            COUNT(DISTINCT job_id) as total_jobs,
-            COUNT(*) as total_clips,
-            SUM(views) as total_views,
-            SUM(likes) as total_likes,
-            AVG(engagement_score) as avg_engagement,
-            COUNT(CASE WHEN milestone_tier = 'viral' THEN 1 END) as viral_hits,
-            COUNT(CASE WHEN milestone_tier = 'validated' THEN 1 END) as validated_hits
+    conditions = ["user_id = :user_id"]
+    params: dict[str, Any] = {"user_id": str(user_id)}
+    if start_date is not None:
+        conditions.append("synced_at >= :start_date")
+        params["start_date"] = start_date
+    if end_date is not None:
+        conditions.append("synced_at <= :end_date")
+        params["end_date"] = end_date
+
+    query = text(
+        f"""
+        SELECT *
         FROM clip_performance
-        WHERE user_id = :user_id
-    """)
-    
+        WHERE {" AND ".join(conditions)}
+        ORDER BY synced_at DESC, created_at DESC, clip_index ASC
+        """
+    )
+
     with engine.connect() as connection:
-        row = connection.execute(query, {"user_id": str(user_id)}).fetchone()
-        
-    if not row or row.total_clips == 0:
-        return {
-            "total_views": 0, 
-            "total_likes": 0, 
-            "avg_engagement": 0.0,
-            "viral_hits": 0, 
-            "validated_hits": 0, 
-            "total_clips": 0,
-            "total_jobs": 0
-        }
-        
-    return {
-        "total_views": row.total_views or 0,
-        "total_likes": row.total_likes or 0,
-        "avg_engagement": round(float(row.avg_engagement or 0.0), 4),
-        "viral_hits": row.viral_hits,
-        "validated_hits": row.validated_hits,
-        "total_clips": row.total_clips,
-        "total_jobs": row.total_jobs
-    }
+        rows = connection.execute(query, params).fetchall()
+
+    if not rows:
+        summary = build_performance_summary(
+            job_id="00000000-0000-0000-0000-000000000000",
+            rows=[],
+            top_clips=[],
+            latest_job_id=None,
+            data_source="mock",
+        )
+        summary["avg_engagement"] = 0.0
+        summary["viral_hits"] = 0
+        summary["validated_hits"] = 0
+        return summary
+
+    latest_job_id = str(rows[0]._mapping["job_id"]) if rows[0]._mapping.get("job_id") else None
+    latest_job = get_job(latest_job_id) if latest_job_id else None
+    top_clips = getattr(latest_job, "clips_json", None) if latest_job else None
+    summary = build_performance_summary(
+        job_id=latest_job_id or "00000000-0000-0000-0000-000000000000",
+        rows=rows,
+        top_clips=top_clips,
+        latest_job_id=latest_job_id,
+        data_source="real" if any(row._mapping.get("source_type") == "real" for row in rows) else "mock",
+    )
+    summary["total_jobs"] = len({str(row._mapping["job_id"]) for row in rows if row._mapping.get("job_id")})
+    summary["avg_engagement"] = summary["overall_engagement_score"]
+    summary["viral_hits"] = sum(1 for row in rows if row._mapping.get("milestone_tier") == "viral")
+    summary["validated_hits"] = sum(1 for row in rows if row._mapping.get("milestone_tier") == "validated")
+    return summary
 
 
 def save_platform_credentials(
@@ -146,6 +166,40 @@ def deactivate_platform_credentials(user_id: UUID | str, platform: str, error: s
             "platform": platform,
             "error": error
         })
+
+
+def delete_platform_credentials(user_id: UUID | str, platform: str) -> bool:
+    """Delete stored platform credentials for a user."""
+    query = text("""
+        DELETE FROM platform_credentials
+        WHERE user_id = :user_id AND platform = :platform
+    """)
+    with engine.begin() as connection:
+        result = connection.execute(query, {
+            "user_id": str(user_id),
+            "platform": platform,
+        })
+    return result.rowcount > 0
+
+
+def list_active_users() -> list[dict]:
+    """Return all users that have at least one active platform credential.
+
+    Used by the DNA executive-summary Celery task to fan out per-user jobs.
+    Each dict contains at minimum ``id``, ``email``, and ``full_name``.
+    """
+    query = text(
+        """
+        SELECT DISTINCT u.id, u.email, u.full_name
+        FROM users u
+        INNER JOIN platform_credentials pc ON pc.user_id = u.id
+        WHERE pc.is_active = TRUE
+        ORDER BY u.id
+        """
+    )
+    with engine.connect() as connection:
+        rows = connection.execute(query).fetchall()
+    return [dict(row._mapping) for row in rows]
 
 
 def get_user_credits(user_id: str | UUID) -> float:

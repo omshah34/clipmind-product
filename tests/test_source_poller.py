@@ -68,7 +68,8 @@ class TestSourcePoller(unittest.TestCase):
     @patch("services.source_ingestion.record_ingestion_atomic")
     @patch("services.source_ingestion.dispatch_task")
     @patch("services.source_ingestion.subprocess.run")
-    def test_ingestion_service_dedup(self, mock_run, mock_dispatch, mock_atomic, mock_is_processed):
+    @patch("services.source_ingestion.random.randint", return_value=15)
+    def test_ingestion_service_dedup(self, mock_randint, mock_run, mock_dispatch, mock_atomic, mock_is_processed):
         """Test that the service correctly filters processed videos."""
         from services.source_ingestion import SourceIngestionService
         
@@ -86,7 +87,7 @@ class TestSourcePoller(unittest.TestCase):
         
         self.assertEqual(new_jobs, 1) # Only vid_2 was new
         mock_atomic.assert_called_once() # Only called for vid_2
-        mock_dispatch.assert_called_once_with("workers.pipeline.process_job", job_id="job_new")
+        mock_dispatch.assert_called_once_with("workers.pipeline.process_job", job_id="job_new", countdown=15)
 
 if __name__ == "__main__":
     unittest.main()

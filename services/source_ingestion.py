@@ -9,15 +9,16 @@ import logging
 import json
 import subprocess
 import random
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urljoin
 from typing import Any
 
-from db.repositories.source_ingestion import (
-    update_source_status,
-    record_ingestion_atomic,
-    is_video_processed,
-)
+import httpx
+
+from db.repositories.autopilot import update_source_status, is_video_processed
+from db.repositories.source_ingestion import record_ingestion_atomic
 from services.task_queue import dispatch_task
 from services.event_emitter import emit_event
 
@@ -36,8 +37,19 @@ class SourceIngestionService:
         
         logger.info("[Autopilot] [source=%s] Polling started (%s)", source_id, source_type)
         
+        # Gap 204: Use a source-scoped lock to prevent concurrent polls for the same source
+        from core.redis_utils import RobustRedisLock
+        from core.config import settings
+        import redis
+        
+        r = redis.from_url(settings.redis_url)
+        lock_key = f"lock:source:{source_id}"
+        # 10 minute timeout, fail fast if locked
+        lock = RobustRedisLock(r, lock_key, timeout=600, blocking=False)
+        
         try:
-            video_entries = [] # List of {"id": str, "url": str}
+            with lock:
+                video_entries = [] # List of {"id": str, "url": str}
             
             if source_type == "youtube_channel":
                 video_entries = self._poll_youtube(config)
@@ -102,6 +114,10 @@ class SourceIngestionService:
             update_source_status(source_id, success=True)
             return jobs_created
 
+        except RuntimeError:
+            # Acquisition failed because blocking=False
+            logger.warning("[Autopilot] [source=%s] Source already being polled. Skipping.", source_id)
+            return 0
         except Exception as exc:
             error_msg = f"Polling failed: {str(exc)}"
             logger.error("[source=%s] %s", source_id, error_msg, exc_info=True)
@@ -109,7 +125,7 @@ class SourceIngestionService:
             return 0
 
     def _poll_youtube(self, config: dict) -> list[dict[str, str]]:
-        """Use yt-dlp to get the latest 3 video IDs from a channel."""
+        """Use yt-dlp to get a paginated slice of the latest YouTube uploads."""
         channel_url = config.get("channel_url")
         if not channel_url:
             return []
@@ -119,17 +135,26 @@ class SourceIngestionService:
             cmd = [
                 "yt-dlp",
                 "--get-id",
-                "--playlist-items", "1:3",
                 "--flat-playlist",
+                "--playlist-end", str(config.get("max_items", 20)),
                 channel_url
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30,
+            )
             video_ids = [vid.strip() for vid in result.stdout.split("\n") if vid.strip()]
             
             return [
                 {"id": vid, "url": f"https://www.youtube.com/watch?v={vid}"}
                 for vid in video_ids
             ]
+        except subprocess.TimeoutExpired as exc:
+            logger.error("yt-dlp timed out while polling YouTube channel %s", channel_url)
+            raise RuntimeError(f"yt-dlp timed out while polling {channel_url}") from exc
         except Exception as exc:
             logger.error("yt-dlp failed to poll YouTube channel %s: %s", channel_url, exc)
             raise
@@ -137,7 +162,7 @@ class SourceIngestionService:
         return []
 
     def _poll_tiktok(self, config: dict) -> list[dict[str, str]]:
-        """Use yt-dlp to get latest 3 videos from TikTok (Experimental)."""
+        """Use yt-dlp to get a paginated slice of the latest TikTok videos."""
         channel_url = config.get("channel_url")
         if not channel_url:
             return []
@@ -146,17 +171,26 @@ class SourceIngestionService:
             cmd = [
                 "yt-dlp",
                 "--get-id",
-                "--playlist-items", "1:3",
                 "--flat-playlist",
+                "--playlist-end", str(config.get("max_items", 20)),
                 channel_url
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30,
+            )
             video_ids = [vid.strip() for vid in result.stdout.split("\n") if vid.strip()]
             
             return [
                 {"id": vid, "url": f"https://www.tiktok.com/@user/video/{vid}"}
                 for vid in video_ids
             ]
+        except subprocess.TimeoutExpired as exc:
+            logger.error("yt-dlp timed out while polling TikTok channel %s", channel_url)
+            raise RuntimeError(f"yt-dlp timed out while polling {channel_url}") from exc
         except Exception as exc:
             logger.error("yt-dlp failed to poll TikTok channel %s: %s", channel_url, exc)
             raise 
@@ -164,8 +198,48 @@ class SourceIngestionService:
         return []
 
     def _poll_rss(self, config: dict) -> list[dict[str, str]]:
-        """Stub for RSS polling."""
-        return []
+        """Fetch RSS or Atom entries and convert them into ingestion jobs."""
+        feed_url = config.get("feed_url") or config.get("rss_url") or config.get("url")
+        if not feed_url:
+            return []
+
+        try:
+            response = httpx.get(feed_url, timeout=30.0)
+            response.raise_for_status()
+            root = ET.fromstring(response.text)
+        except Exception as exc:
+            logger.error("RSS poll failed for %s: %s", feed_url, exc)
+            raise
+
+        max_items = int(config.get("max_items", 20))
+        entries: list[dict[str, str]] = []
+
+        if root.tag.endswith("rss") or root.find(".//channel") is not None:
+            for item in root.findall(".//item")[:max_items]:
+                item_id = (
+                    item.findtext("guid")
+                    or item.findtext("link")
+                    or item.findtext("title")
+                    or ""
+                ).strip()
+                link = (item.findtext("link") or feed_url).strip()
+                if not link:
+                    continue
+                entries.append({"id": item_id or link, "url": link})
+            return entries
+
+        atom_ns = "{http://www.w3.org/2005/Atom}"
+        for entry in root.findall(f".//{atom_ns}entry")[:max_items]:
+            item_id = (entry.findtext(f"{atom_ns}id") or "").strip()
+            link_el = entry.find(f"{atom_ns}link[@rel='alternate']")
+            if link_el is None:
+                link_el = entry.find(f"{atom_ns}link")
+            link = (link_el.get("href") if link_el is not None else "") or ""
+            link = link.strip()
+            if not link:
+                continue
+            entries.append({"id": item_id or link, "url": urljoin(feed_url, link)})
+        return entries
 
 def get_source_ingestion_service() -> SourceIngestionService:
     return SourceIngestionService()

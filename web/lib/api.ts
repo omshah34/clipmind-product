@@ -34,14 +34,26 @@ export type JobStatusResponse = {
   clips: ClipSummary[] | null;
 };
 
+export type UploadCapabilities = {
+  direct_upload: boolean;
+  multipart_upload: boolean;
+  cloud_storage: boolean;
+};
+
 type ErrorPayload = {
   error: string;
   message: string;
 };
 
+type HealthResponse = {
+  capabilities?: Partial<UploadCapabilities>;
+};
+
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "/api/v1";
 export const API_BASE_URL = `${API_URL}${API_BASE}`;
+
+let uploadCapabilitiesPromise: Promise<UploadCapabilities> | null = null;
 
 
 async function readResponse<T>(response: Response): Promise<T> {
@@ -140,13 +152,36 @@ export async function initDirectUpload(
 }
 
 
-export async function uploadFileToSignedUrl(uploadUrl: string, file: File): Promise<void> {
-  const formData = new FormData();
-  formData.append("file", file, file.name);
+export async function getUploadCapabilities(): Promise<UploadCapabilities> {
+  if (!uploadCapabilitiesPromise) {
+    uploadCapabilitiesPromise = (async () => {
+      const response = await fetch(`${API_URL}/health`, { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error("Unable to load upload capabilities.");
+      }
+      const payload = (await response.json()) as HealthResponse;
+      return {
+        direct_upload: Boolean(payload.capabilities?.direct_upload),
+        multipart_upload: Boolean(payload.capabilities?.multipart_upload),
+        cloud_storage: Boolean(payload.capabilities?.cloud_storage),
+      };
+    })().catch((error) => {
+      uploadCapabilitiesPromise = null;
+      throw error;
+    });
+  }
 
+  return uploadCapabilitiesPromise;
+}
+
+
+export async function uploadFileToSignedUrl(uploadUrl: string, file: File): Promise<void> {
   const response = await fetch(uploadUrl, {
     method: "PUT",
-    body: formData,
+    headers: {
+      "Content-Type": file.type || "application/octet-stream",
+    },
+    body: file,
   });
 
   if (!response.ok) {
@@ -366,7 +401,17 @@ export async function getHookVariants(
   const response = await fetch(`${API_BASE_URL}/jobs/${jobId}/clips/${clipIndex}/hooks`, {
     cache: "no-store",
   });
-  return readResponse<{ variants: Array<{ start_time: number; label: string; logic: string }> }>(response);
+  const payload = await readResponse<{
+    variants?: Array<{ start_time: number; label: string; logic: string }>;
+    hooks?: Array<{ start_time: number; label: string; logic: string }>;
+  }>(response);
+  return {
+    variants: Array.isArray(payload.variants)
+      ? payload.variants
+      : Array.isArray(payload.hooks)
+        ? payload.hooks
+        : [],
+  };
 }
 
 export async function approveClip(
@@ -653,6 +698,15 @@ export type PerformanceSummary = {
   best_clip_index: number;
   worst_clip_index: number;
   synced_at: string;
+  latest_job_id?: string | null;
+  top_clips?: ClipSummary[];
+  all_clips_performance?: Array<{
+    clip_index: number;
+    predicted: number;
+    actual: number;
+    tier?: string;
+    window_complete?: boolean;
+  }>;
 };
 
 export type PerformanceAlert = {
@@ -691,4 +745,70 @@ export async function markAlertAsRead(alertId: string, userId: string): Promise<
     headers: { Authorization: `Bearer ${userId}` },
   });
   if (!response.ok) throw new Error("Failed to mark alert as read");
+}
+
+
+// ── Gap 240: Multipart upload API helpers ─────────────────────────────────────
+
+export type MultipartInitResponse = {
+  upload_id: string;
+  part_urls: string[];
+};
+
+export type MultipartVerifyResponse = {
+  verified: boolean;
+};
+
+export type MultipartCompleteResponse = {
+  source_video_url: string;
+};
+
+/**
+ * Initialise a server-side multipart upload session.
+ * Returns per-part presigned PUT URLs and a stable upload_id.
+ */
+export async function initMultipartUpload(
+  filename: string,
+  sizeBytes: number,
+  totalParts: number,
+): Promise<MultipartInitResponse> {
+  const response = await fetch(`${API_BASE_URL}/upload/multipart/init`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ filename, size_bytes: sizeBytes, total_parts: totalParts }),
+  });
+  return readResponse<MultipartInitResponse>(response);
+}
+
+/**
+ * Ask the server whether a specific part was committed with the given ETag.
+ * Returns { verified: true } only when the stored ETag matches.
+ */
+export async function verifyMultipartPart(
+  uploadId: string,
+  partNumber: number,
+  etag: string,
+): Promise<MultipartVerifyResponse> {
+  const response = await fetch(`${API_BASE_URL}/upload/multipart/verify`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ upload_id: uploadId, part_number: partNumber, etag }),
+  });
+  return readResponse<MultipartVerifyResponse>(response);
+}
+
+/**
+ * Finalise the multipart upload by sending all committed { part_number, etag }
+ * pairs. Returns the canonical source_video_url for the assembled asset.
+ */
+export async function completeMultipartUpload(
+  uploadId: string,
+  parts: Array<{ part_number: number; etag: string }>,
+): Promise<MultipartCompleteResponse> {
+  const response = await fetch(`${API_BASE_URL}/upload/multipart/complete`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ upload_id: uploadId, parts }),
+  });
+  return readResponse<MultipartCompleteResponse>(response);
 }

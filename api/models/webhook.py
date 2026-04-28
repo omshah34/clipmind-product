@@ -67,6 +67,7 @@ class WebhookEventPayload(BaseModel):
     """Generic webhook event payload structure"""
     event_id: str = Field(..., description="Unique event ID")
     event_type: str = Field(..., description="Type of event: job.completed, clips.generated, etc")
+    schema_version: str = Field(default="2026-04-27", description="Webhook payload schema version")
     timestamp: datetime = Field(..., description="When this event occurred")
     user_id: str = Field(..., description="User ID who triggered this event")
     data: dict = Field(..., description="Event-specific data")

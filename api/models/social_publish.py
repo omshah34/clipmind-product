@@ -2,7 +2,7 @@
 Purpose: Pydantic models for One-Click Publish (direct to TikTok, IG, YouTube)
 """
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, field_validator
 from uuid import UUID
 from typing import Optional, List
 from datetime import datetime
@@ -10,8 +10,8 @@ from datetime import datetime
 
 class SocialAccountRequest(BaseModel):
     """Request to connect social media account via OAuth."""
-    platform: str = Field(description="tiktok, instagram, youtube")
-    account_username: Optional[str] = None
+    platform: str = Field(max_length=32, description="tiktok, instagram, youtube")
+    account_username: Optional[str] = Field(default=None, max_length=255)
 
 
 class SocialAccountResponse(BaseModel):
@@ -38,10 +38,29 @@ class PublishRequest(BaseModel):
     clip_index: int
     platforms: List[str] = Field(description="tiktok, instagram, youtube, linkedin")
     accounts: List[UUID] = Field(description="Account IDs to publish to")
-    caption: str
+    caption: str = Field(max_length=2200)
     hashtags: Optional[List[str]] = None
     publish_immediately: bool = Field(default=False)
     scheduled_at: Optional[datetime] = None
+    scheduled_timezone: Optional[str] = Field(default=None, max_length=64)
+
+    @field_validator("platforms")
+    @classmethod
+    def validate_platform_lengths(cls, value: List[str]) -> List[str]:
+        for platform in value:
+            if len(platform) > 32:
+                raise ValueError("Platform names must be 32 characters or fewer.")
+        return value
+
+    @field_validator("hashtags")
+    @classmethod
+    def validate_hashtags(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is None:
+            return value
+        for hashtag in value:
+            if len(hashtag) > 100:
+                raise ValueError("Hashtags must be 100 characters or fewer.")
+        return value
 
 
 class PlatformCaptionResponse(BaseModel):
@@ -58,7 +77,7 @@ class CaptionOptimizationRequest(BaseModel):
     """Request AI to optimize captions for different platforms."""
     job_id: UUID
     clip_index: int
-    base_caption: str
+    base_caption: str = Field(max_length=2200)
     target_platforms: List[str] = Field(description="tiktok, instagram, youtube")
 
 
@@ -101,7 +120,7 @@ class SmartScheduleRequest(BaseModel):
     job_id: UUID
     clip_indices: List[int]
     platforms: List[str]
-    audience_timezone: str = Field(description="e.g., America/New_York")
+    audience_timezone: str = Field(max_length=64, description="e.g., America/New_York")
 
 
 class SmartScheduleResponse(BaseModel):

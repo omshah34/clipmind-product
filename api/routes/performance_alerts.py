@@ -7,7 +7,7 @@ from typing import List, Optional
 from uuid import UUID
 
 from api.dependencies import get_current_user, AuthenticatedUser
-from db.repositories.performance import get_performance_alerts, mark_alerts_as_read
+from db.repositories.performance import list_performance_alerts, mark_alerts_as_read
 
 router = APIRouter(prefix="/performance/alerts", tags=["Performance"])
 
@@ -19,7 +19,7 @@ async def list_alerts(
 ):
     """List recent performance alerts/insights for the user."""
     user_id = str(user.user_id)
-    alerts = get_performance_alerts(user_id, unread_only=unread_only, limit=limit)
+    alerts = list_performance_alerts(user_id, unread_only=unread_only, limit=limit)
     return alerts
 
 @router.patch("/read")

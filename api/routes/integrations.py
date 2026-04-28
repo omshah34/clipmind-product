@@ -4,11 +4,10 @@ from uuid import UUID
 from datetime import datetime, timezone, timedelta
 
 from api.dependencies import get_current_user, AuthenticatedUser
-from db.repositories.integrations import (
-    get_platform_credentials, 
-    save_platform_credentials, 
+from db.connection import engine
+from db.repositories.users import (
+    save_platform_credentials,
     delete_platform_credentials,
-    engine
 )
 from sqlalchemy import text
 from services.data_providers.encryption import SecretManager

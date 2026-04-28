@@ -48,6 +48,7 @@ def create_published_clip(
     social_account_id: str | None = None,
     caption: str = "",
     hashtags: list[str] | None = None,
+    asset_path: str | None = None,
     scheduled_at: datetime | None = None,
     published_at: datetime | None = None,
 ) -> dict:
@@ -55,11 +56,11 @@ def create_published_clip(
         """
         INSERT INTO published_clips (
             user_id, job_id, clip_index, platform, social_account_id,
-            caption, hashtags, published_at, scheduled_at, status
+            caption, hashtags, asset_path, published_at, scheduled_at, status
         )
         VALUES (
             :user_id, :job_id, :clip_index, :platform, :social_account_id,
-            :caption, :hashtags, :published_at, :scheduled_at,
+            :caption, :hashtags, :asset_path, :published_at, :scheduled_at,
             CASE WHEN :published_at IS NOT NULL THEN 'published'
                  WHEN :scheduled_at IS NOT NULL THEN 'scheduled'
                  ELSE 'queued' END
@@ -78,11 +79,44 @@ def create_published_clip(
                 "social_account_id": social_account_id,
                 "caption": caption,
                 "hashtags": json.dumps(hashtags or []),
+                "asset_path": asset_path,
                 "published_at": published_at,
                 "scheduled_at": scheduled_at,
             },
         ).one()
     return dict(row._mapping)
+
+
+def get_publish_queue_entry(
+    user_id: str,
+    job_id: str,
+    clip_index: int,
+    platform: str,
+) -> dict | None:
+    query = text(
+        """
+        SELECT *
+        FROM publish_queue
+        WHERE user_id = :user_id
+          AND job_id = :job_id
+          AND clip_index = :clip_index
+          AND platform = :platform
+          AND status IN ('pending', 'processing', 'scheduled', 'published')
+        ORDER BY created_at DESC
+        LIMIT 1
+        """
+    )
+    with engine.connect() as connection:
+        row = connection.execute(
+            query,
+            {
+                "user_id": str(user_id),
+                "job_id": str(job_id),
+                "clip_index": clip_index,
+                "platform": platform,
+            },
+        ).fetchone()
+    return dict(row._mapping) if row else None
 
 
 def add_to_publish_queue(

@@ -7,6 +7,8 @@ from __future__ import annotations
 import re
 import logging
 
+from core.config import settings
+
 logger = logging.getLogger(__name__)
 
 # Deterministic mapping for Phase 2 MVP
@@ -78,17 +80,14 @@ class VisualEngine:
         Searches Pexels for B-Roll clips based on extracted keywords.
         Gap Exploited: Visual boredom in long-form talking heads.
         """
-        # In a real app, this would use httpx to call Pexels API
-        # Example: https://api.pexels.com/videos/search?query=nature&per_page=1
-        import random
-        
-        # Mock results for Phase 3 implementation
-        # Real implementation would require PEXELS_API_KEY in .env
-        mock_clips = [
-            {"id": "b1", "url": "https://sample-videos.com/video123/mp4/720/big_buck_bunny_720p_1mb.mp4", "preview": "Finance"},
-            {"id": "b2", "url": "https://sample-videos.com/video123/mp4/720/big_buck_bunny_720p_2mb.mp4", "preview": "Growth"},
-            {"id": "b3", "url": "https://sample-videos.com/video123/mp4/720/big_buck_bunny_720p_5mb.mp4", "preview": "AI"}
-        ]
-        
-        logger.info("Found contextual B-Roll for keywords: %s", keywords)
-        return random.sample(mock_clips, min(len(mock_clips), count))
+        if not settings.enable_contextual_broll:
+            return []
+
+        if not settings.pexels_api_key:
+            logger.info("Contextual B-roll enabled but PEXELS_API_KEY is not configured; skipping.")
+            return []
+
+        # Provider integration intentionally returns no clips until the download
+        # path can enforce licensing, duration, and timeout constraints.
+        logger.info("Contextual B-roll provider configured but no provider adapter is active; skipping.")
+        return []

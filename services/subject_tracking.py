@@ -8,6 +8,7 @@ import logging
 import os
 from pathlib import Path
 import urllib.request
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import List, Tuple, Optional
 
@@ -92,29 +93,52 @@ def ensure_model_exists():
 class TrackingError(RuntimeError):
     """Raised when subject tracking fails due to file or detection issues."""
 
+
+@dataclass
+class TrackingAnalysis:
+    centers: List[float]
+    detected_face_count: int
+    primary_face_area_ratio: float | None
+    frame_width: int
+    frame_height: int
+
 class SubjectTracker:
     def __init__(self, sample_rate_fps: int = 2):
         self.sample_rate_fps = sample_rate_fps
+        self.enabled = callable(getattr(cv2, "VideoCapture", None))
+        self.detector = None
+        if not self.enabled:
+            logger.info("[tracking] OpenCV is not installed; subject tracking disabled.")
+            return
+
         ensure_model_exists()
-        
+
         # Initialize the Face Detector
         base_options = python.BaseOptions(model_asset_path=str(MODEL_PATH))
         options = vision.FaceDetectorOptions(base_options=base_options)
         self.detector = vision.FaceDetector.create_from_options(options)
 
-    def get_optimal_centers(self, video_path: Path, count: int = 1) -> List[float]:
-        """
-        Analyzes the video and returns the recommended center X coordinates for the 'count' top faces.
-        Returns exactly 'count' values, padded with frame_width/2 fallback if necessary.
-        """
+    def analyze_subjects(self, video_path: Path, count: int = 1) -> TrackingAnalysis:
+        """Analyze the clip and return center positions plus simple face-size heuristics."""
+        if not self.enabled or self.detector is None:
+            return TrackingAnalysis(
+                centers=[],
+                detected_face_count=0,
+                primary_face_area_ratio=None,
+                frame_width=0,
+                frame_height=0,
+            )
+
         if not video_path.exists():
             raise FileNotFoundError(f"Video file not found: {video_path}")
 
         cap = cv2.VideoCapture(str(video_path))
+        if cap is None:
+            raise TrackingError("OpenCV VideoCapture returned None.")
         if not cap.isOpened():
             raise TrackingError(f"Could not open video file for tracking: {video_path}")
 
-        fps = cap.get(cv2.CAP_PROP_FPS)
+        fps = cap.get(cv2.CAP_PROP_FPS) or float(self.sample_rate_fps)
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         
@@ -122,6 +146,7 @@ class SubjectTracker:
         
         # List of lists, one per detected face index
         face_x_histories: List[List[float]] = [[] for _ in range(count)]
+        primary_face_area_ratios: List[float] = []
         
         logger.info("[tracking] Analyzing up to %d subject positions in %s...", count, video_path.name)
         
@@ -150,15 +175,21 @@ class SubjectTracker:
                         bbox = sorted_detections[i].bounding_box
                         x_center = bbox.origin_x + (bbox.width / 2)
                         face_x_histories[i].append(x_center)
+                        if i == 0 and width > 0 and height > 0:
+                            primary_face_area_ratios.append(
+                                float((bbox.width * bbox.height) / float(width * height))
+                            )
             
             frame_idx += 1
             
         cap.release()
         
         results = []
+        detected_face_count = 0
         for i in range(count):
             history = face_x_histories[i]
             if history:
+                detected_face_count += 1
                 results.append(float(np.median(history)))
             else:
                 # Pad with frame center fallback if fewer than 'count' faces were detected
@@ -166,7 +197,24 @@ class SubjectTracker:
                     logger.warning("[tracking] No subjects detected in %s. Falling back to center.", video_path.name)
                 results.append(float(width / 2))
         
-        return results
+        primary_face_area_ratio = None
+        if primary_face_area_ratios:
+            primary_face_area_ratio = float(np.median(primary_face_area_ratios))
+
+        return TrackingAnalysis(
+            centers=results,
+            detected_face_count=detected_face_count,
+            primary_face_area_ratio=primary_face_area_ratio,
+            frame_width=width,
+            frame_height=height,
+        )
+
+    def get_optimal_centers(self, video_path: Path, count: int = 1) -> List[float]:
+        """
+        Analyzes the video and returns the recommended center X coordinates for the 'count' top faces.
+        Returns exactly 'count' values, padded with frame_width/2 fallback if necessary.
+        """
+        return self.analyze_subjects(video_path, count=count).centers
 
 def get_optimal_crop_x(video_path: Path) -> float:
     """Backward-compatible single-subject wrapper. Never raises IndexError."""

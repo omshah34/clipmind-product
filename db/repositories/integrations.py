@@ -11,6 +11,12 @@ from sqlalchemy import text
 from db.connection import engine
 
 
+def _serialize_trigger_events(trigger_events: list[str]) -> list[str] | str:
+    if engine.dialect.name == "sqlite":
+        return json.dumps(trigger_events)
+    return trigger_events
+
+
 def create_integration(
     user_id: UUID | str,
     integration_type: str,
@@ -34,7 +40,7 @@ def create_integration(
                 "integration_type": integration_type,
                 "name": name,
                 "config": json.dumps(config),
-                "trigger_events": trigger_events,
+                "trigger_events": _serialize_trigger_events(trigger_events),
             },
         ).one()
     return dict(row._mapping)
@@ -42,7 +48,7 @@ def create_integration(
 
 def get_integration(integration_id: UUID | str) -> dict[str, Any] | None:
     """Get a single integration by ID."""
-    query = text("SELECT * FROM integrations WHERE id = :id")
+    query = text("SELECT * FROM integrations WHERE id = :id AND deleted_at IS NULL")
     with engine.connect() as connection:
         row = connection.execute(query, {"id": str(integration_id)}).one_or_none()
     return dict(row._mapping) if row else None
@@ -59,13 +65,13 @@ def list_user_integrations(
         SELECT id, integration_type, name, trigger_events, is_active,
                last_triggered_at, created_at, updated_at
         FROM integrations
-        WHERE user_id = :user_id
+        WHERE user_id = :user_id AND deleted_at IS NULL
         ORDER BY created_at DESC
         LIMIT :limit OFFSET :offset
         """
     )
     
-    count_query = text("SELECT COUNT(*) FROM integrations WHERE user_id = :user_id")
+    count_query = text("SELECT COUNT(*) FROM integrations WHERE user_id = :user_id AND deleted_at IS NULL")
     
     with engine.connect() as connection:
         rows = connection.execute(
@@ -85,13 +91,27 @@ def list_active_integrations_for_event(event_type: str, user_id: str | None = No
     Optionally filter by user_id.
     """
     filter_user = " AND user_id = :user_id" if user_id else ""
-    query = text(
-        f"""
-        SELECT id, user_id, integration_type, name, trigger_events, config
-        FROM integrations
-        WHERE is_active = true AND :event_type = ANY(trigger_events) {filter_user}
-        """
-    )
+    if engine.dialect.name == "sqlite":
+        query = text(
+            f"""
+            SELECT id, user_id, integration_type, name, trigger_events, config
+            FROM integrations
+            WHERE is_active = 1 AND deleted_at IS NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM json_each(integrations.trigger_events)
+                  WHERE json_each.value = :event_type
+              ){filter_user}
+            """
+        )
+    else:
+        query = text(
+            f"""
+            SELECT id, user_id, integration_type, name, trigger_events, config
+            FROM integrations
+            WHERE is_active = true AND deleted_at IS NULL AND :event_type = ANY(trigger_events) {filter_user}
+            """
+        )
     
     params = {"event_type": event_type}
     if user_id:
@@ -118,6 +138,9 @@ def update_integration(integration_id: UUID | str, **fields: Any) -> dict[str, A
         if field == "config" and isinstance(value, dict):
             assignments.append(f"{field} = :{field}")
             params[field] = json.dumps(value)
+        elif field == "trigger_events":
+            assignments.append(f"{field} = :{field}")
+            params[field] = _serialize_trigger_events(value)
         else:
             assignments.append(f"{field} = :{field}")
             params[field] = value
@@ -127,7 +150,7 @@ def update_integration(integration_id: UUID | str, **fields: Any) -> dict[str, A
     query = text(
         f"""
         UPDATE integrations SET {", ".join(assignments)}
-        WHERE id = :id
+        WHERE id = :id AND deleted_at IS NULL
         RETURNING id, integration_type, name, trigger_events, config,
                   is_active, last_triggered_at, created_at, updated_at
         """
@@ -140,8 +163,10 @@ def update_integration(integration_id: UUID | str, **fields: Any) -> dict[str, A
 
 
 def delete_integration(integration_id: UUID | str) -> bool:
-    """Delete an integration."""
-    query = text("DELETE FROM integrations WHERE id = :id")
+    """Soft-delete an integration."""
+    query = text(
+        "UPDATE integrations SET deleted_at = CURRENT_TIMESTAMP, is_active = false, updated_at = CURRENT_TIMESTAMP WHERE id = :id AND deleted_at IS NULL"
+    )
     
     with engine.begin() as connection:
         result = connection.execute(query, {"id": str(integration_id)})
@@ -152,7 +177,7 @@ def delete_integration(integration_id: UUID | str) -> bool:
 def update_integration_last_triggered(integration_id: UUID | str) -> None:
     """Update the last_triggered_at timestamp for an integration."""
     query = text(
-        "UPDATE integrations SET last_triggered_at = CURRENT_TIMESTAMP WHERE id = :id"
+        "UPDATE integrations SET last_triggered_at = CURRENT_TIMESTAMP WHERE id = :id AND deleted_at IS NULL"
     )
     
     with engine.begin() as connection:

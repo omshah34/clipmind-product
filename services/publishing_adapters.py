@@ -29,6 +29,7 @@ class PublishAdapter:
         *,
         user_id: str,
         metadata: dict[str, Any],
+        idempotency_key: str | None = None,
     ) -> PublishResult:
         raise NotImplementedError
 
@@ -37,9 +38,9 @@ class YouTubePublishAdapter(PublishAdapter):
     platform = "youtube"
     supports_direct_publish = True
 
-    def publish(self, file_path: Path, *, user_id: str, metadata: dict[str, Any]) -> PublishResult:
+    def publish(self, file_path: Path, *, user_id: str, metadata: dict[str, Any], idempotency_key: str | None = None) -> PublishResult:
         access_token = TokenManager.get_valid_token(user_id, self.platform)
-        result = upload_to_youtube(file_path, metadata, access_token)  # type: ignore[arg-type]
+        result = upload_to_youtube(file_path, metadata, access_token, idempotency_key=idempotency_key)  # type: ignore[arg-type]
         return PublishResult(platform_clip_id=result.get("id"), platform_url=result.get("url", ""), status="published")
 
 
@@ -47,12 +48,12 @@ class TikTokPublishAdapter(PublishAdapter):
     platform = "tiktok"
     supports_direct_publish = True
 
-    def publish(self, file_path: Path, *, user_id: str, metadata: dict[str, Any]) -> PublishResult:
+    def publish(self, file_path: Path, *, user_id: str, metadata: dict[str, Any], idempotency_key: str | None = None) -> PublishResult:
         token_data = TokenManager.get_valid_token(user_id, self.platform)
         if not isinstance(token_data, tuple) or len(token_data) != 2:
             raise IntegrationExpiredError("TikTok integration is incomplete.")
         access_token, open_id = token_data
-        result = upload_to_tiktok(file_path, metadata, access_token, open_id)
+        result = upload_to_tiktok(file_path, metadata, access_token, open_id, idempotency_key=idempotency_key)
         return PublishResult(platform_clip_id=result.get("id"), platform_url=result.get("url", ""), status="published")
 
 
@@ -62,7 +63,7 @@ class QueueOnlyPublishAdapter(PublishAdapter):
     def __init__(self, platform: str) -> None:
         self.platform = platform
 
-    def publish(self, file_path: Path, *, user_id: str, metadata: dict[str, Any]) -> PublishResult:
+    def publish(self, file_path: Path, *, user_id: str, metadata: dict[str, Any], idempotency_key: str | None = None) -> PublishResult:
         return PublishResult(platform_clip_id=None, platform_url="", status="queued", error="Unsupported platform")
 
 

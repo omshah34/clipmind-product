@@ -33,9 +33,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -65,18 +67,139 @@ def ffmpeg_escape(text: str) -> str:
     return text.replace("\\", "\\\\").replace("'", "'\\''").replace(":", "\\:")
 
 
+@lru_cache(maxsize=1)
 def get_video_encoder() -> str:
-    """Determine the best available H.264 encoder."""
+    """Determine the best usable H.264 encoder for this machine."""
+    configured_encoder = os.getenv("CLIPMIND_VIDEO_ENCODER", "libx264").strip().lower()
+    if configured_encoder in {"libx264", "cpu"}:
+        return "libx264"
+    if configured_encoder not in {"auto", "h264_nvenc", "nvenc"}:
+        logger.warning("Unknown CLIPMIND_VIDEO_ENCODER=%r; falling back to libx264", configured_encoder)
+        return "libx264"
+
     try:
         result = subprocess.run(
             ["ffmpeg", "-hide_banner", "-encoders"],
-            capture_output=True, text=True, check=False
+            capture_output=True,
+            text=True,
+            check=False,
+            encoding="utf-8",
+            errors="replace",
         )
         if "h264_nvenc" in result.stdout:
-            return "h264_nvenc"
+            probe = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=c=black:s=16x16:d=0.04",
+                    "-frames:v",
+                    "1",
+                    "-c:v",
+                    "h264_nvenc",
+                    "-f",
+                    "null",
+                    "-",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if probe.returncode == 0:
+                return "h264_nvenc"
+            logger.warning(
+                "FFmpeg advertises h264_nvenc but it is not usable on this host; "
+                "falling back to libx264. Set CLIPMIND_VIDEO_ENCODER=libx264 to skip this probe. Details: %s",
+                _summarize_ffmpeg_stderr(probe.stderr, probe.returncode),
+            )
     except Exception:
-        pass
+        logger.debug("Falling back to libx264 because encoder detection failed", exc_info=True)
     return "libx264"
+
+
+def _summarize_ffmpeg_stderr(stderr: str, returncode: int) -> str:
+    for line in stderr.splitlines():
+        cleaned = line.strip()
+        if cleaned:
+            return cleaned
+    return f"exit code {returncode}"
+
+
+def _video_encoder_args(encoder: str, *, crf: int, preset: str) -> list[str]:
+    """Return encoder-specific FFmpeg arguments for H.264 output."""
+    if encoder == "h264_nvenc":
+        return [
+            "-c:v", "h264_nvenc",
+            "-rc", "vbr",
+            "-cq", "20",
+            "-preset", "p4",
+        ]
+    return [
+        "-c:v", "libx264",
+        "-crf", str(crf),
+        "-preset", preset,
+    ]
+
+
+def _is_nvenc_command(command: list[str]) -> bool:
+    try:
+        codec_index = command.index("-c:v")
+    except ValueError:
+        return False
+    return codec_index + 1 < len(command) and command[codec_index + 1] == "h264_nvenc"
+
+
+def _replace_video_encoder_args(
+    command: list[str],
+    *,
+    crf: int,
+    preset: str,
+    encoder: str,
+) -> list[str]:
+    """Return a copy of command with the video encoder option block replaced."""
+    try:
+        start = command.index("-c:v")
+    except ValueError:
+        return command.copy()
+
+    end = start + 2
+    while end < len(command) and command[end] in {"-crf", "-preset", "-rc", "-cq"}:
+        end += 2
+
+    return command[:start] + _video_encoder_args(encoder, crf=crf, preset=preset) + command[end:]
+
+
+def _run_command_with_encoder_fallback(
+    command: list[str],
+    *,
+    crf: int,
+    preset: str,
+) -> subprocess.CompletedProcess[str]:
+    """Run FFmpeg and retry with libx264 if NVENC fails on the real input."""
+    try:
+        return _run_command(command)
+    except FFmpegError as exc:
+        if not _is_nvenc_command(command):
+            raise
+
+        get_video_encoder.cache_clear()
+        fallback_command = _replace_video_encoder_args(
+            command,
+            crf=crf,
+            preset=preset,
+            encoder="libx264",
+        )
+        logger.warning(
+            "h264_nvenc failed for this render; retrying with libx264. Details: %s",
+            exc.stderr.strip() or f"exit code {exc.returncode}",
+        )
+        return _run_command(fallback_command)
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +295,12 @@ class FontRegistry:
         import os
         from pathlib import Path
         
+        # Gap 184: Check project-local fonts directory first
+        local_font_dir = Path(__file__).resolve().parent.parent / "assets" / "fonts"
+        local_font_path = local_font_dir / f"{font_name}.ttf"
+        if local_font_path.exists():
+            return _escape_subtitle_path(local_font_path)
+            
         system = platform.system()
 
         if system == "Linux":
@@ -385,6 +514,39 @@ def _assert_file_exists(path: Path, label: str = "file") -> None:
 # Public API
 # ---------------------------------------------------------------------------
 
+def ensure_faststart(video_path: Path) -> Path:
+    """Ensure the video has a moov atom at the start for streaming and processing.
+    
+    Gap 182: Uploaded MP4s with corrupted or missing moov atoms fail to process.
+    This runs a quick stream copy with -movflags faststart to relocate the atom.
+    """
+    _assert_file_exists(video_path, "video")
+    
+    if video_path.suffix.lower() not in (".mp4", ".mov", ".m4v"):
+        return video_path
+        
+    temp_path = video_path.with_suffix(f".faststart{video_path.suffix}")
+    command = [
+        "ffmpeg", "-y",
+        "-i", str(video_path),
+        "-c", "copy",
+        "-movflags", "faststart",
+        str(temp_path)
+    ]
+    
+    try:
+        _run_command(command)
+        import shutil
+        shutil.move(str(temp_path), str(video_path))
+        logger.info("Applied faststart to %s", video_path.name)
+    except Exception as e:
+        logger.warning("Failed to apply faststart to %s: %s", video_path.name, e)
+        if temp_path.exists():
+            temp_path.unlink()
+            
+    return video_path
+
+
 def get_video_duration_seconds(video_path: Path) -> float:
     """Return the duration of a video file in seconds using ffprobe.
 
@@ -404,6 +566,29 @@ def get_video_duration_seconds(video_path: Path) -> float:
         raise ProbeError(
             f"Could not extract duration from ffprobe output for {video_path.name}"
         ) from exc
+
+
+def detect_letterbox(video_path: Path) -> str:
+    """Detect actual crop parameters to remove letterboxing/black bars (Gap 186).
+    
+    Runs a fast ffmpeg pass with cropdetect filter on a few frames to find
+    the active video area. Returns the crop filter string, e.g., 'crop=1920:800:0:140'.
+    """
+    _assert_file_exists(video_path, "video")
+    # Seek to 5 seconds to avoid black intro frames, analyze 10 frames
+    command = [
+        "ffmpeg", "-hide_banner", "-ss", "00:00:05", "-i", str(video_path),
+        "-vframes", "10", "-vf", "cropdetect=24:16:0", "-f", "null", "-"
+    ]
+    # We don't use _run_command because it raises on some warnings, and we just want to parse stderr.
+    # Actually, ffmpeg -f null exits with 0 usually, but let's be safe.
+    result = subprocess.run(command, capture_output=True, encoding="utf-8", errors="replace")
+    match = re.search(r"crop=\d+:\d+:\d+:\d+", result.stderr)
+    if match:
+        crop_str = match.group(0)
+        logger.info("Detected letterbox crop for %s: %s", video_path.name, crop_str)
+        return crop_str
+    return ""
 
 
 def get_video_dimensions(video_path: Path) -> tuple[int, int]:
@@ -469,7 +654,9 @@ def extract_audio(video_path: Path, output_audio_path: Path, *, audio_track: int
             logger.warning("Could not detect audio tracks, defaulting to stream 0: %s", e)
             audio_track = 0
 
-    map_arg = f"0:a:{audio_track}" if audio_track is not None else "0:a:0"
+    # Use FFmpeg's built-in optional mapping syntax to avoid crashing
+    # if the stream index doesn't strictly match.
+    map_arg = f"0:a:{audio_track}?" if audio_track is not None else "0:a?"
 
     command = [
         "ffmpeg", "-y",
@@ -481,11 +668,56 @@ def extract_audio(video_path: Path, output_audio_path: Path, *, audio_track: int
         "-af", "loudnorm=I=-16:TP=-1.5:LRA=11,afftdn=nf=-25",
         "-acodec", "mp3",
         "-b:a", "192k", # Consistent bitrate for AI services
+        "-ar", "48000", # Gap 188: Resample to 48kHz to prevent pitch shift
         str(output_audio_path),
     ]
     _run_command(command)
     logger.info("Audio extracted: %s → %s (track=%s)", video_path.name, output_audio_path.name, audio_track)
     return output_audio_path
+
+
+def extract_audio_chunked(video_path: Path, output_dir: Path, segment_time: int = 600, *, audio_track: int | None = None) -> list[Path]:
+    """Extract audio from a video file into chunks (Gap 185).
+    
+    Prevents massive monolithic disk I/O on multi-hour 4K videos.
+    Outputs mp3 files in the format 'chunk_000.mp3', 'chunk_001.mp3', etc.
+    """
+    _assert_file_exists(video_path, "video")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if audio_track is None:
+        try:
+            probe = _probe_video(video_path)
+            audio_streams = [(i, s) for i, s in enumerate(probe.get("streams", [])) if s.get("codec_type") == "audio"]
+            if len(audio_streams) > 1:
+                audio_track, _ = max(audio_streams, key=lambda x: int(x[1].get("channels", 0)))
+            elif audio_streams:
+                audio_track = audio_streams[0][0]
+        except Exception as e:
+            logger.warning("Could not detect audio tracks for chunking, defaulting to stream 0: %s", e)
+            audio_track = 0
+
+    map_arg = f"0:a:{audio_track}?" if audio_track is not None else "0:a?"
+    output_pattern = str(output_dir / "chunk_%03d.mp3")
+
+    command = [
+        "ffmpeg", "-y",
+        "-i", str(video_path),
+        "-map", map_arg,
+        "-vn",
+        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11,afftdn=nf=-25",
+        "-acodec", "mp3",
+        "-b:a", "192k",
+        "-ar", "48000", # Gap 188
+        "-f", "segment",
+        "-segment_time", str(segment_time),
+        output_pattern,
+    ]
+    _run_command(command)
+    
+    chunks = sorted(output_dir.glob("chunk_*.mp3"))
+    logger.info("Extracted %d audio chunks from %s", len(chunks), video_path.name)
+    return chunks
 
 
 def hdr_to_sdr_filter(width: int, height: int) -> str:
@@ -639,6 +871,7 @@ def build_subtitle_filter(
     subject_centers: list[float] | None = None,
     is_ass: bool = False,
     layout_type: str = "vertical",
+    screen_focus: str = "center",
 ) -> str:
     """Build the FFmpeg -vf filter string for layout + vertical crop + subtitle burn-in.
 
@@ -665,7 +898,8 @@ def build_subtitle_filter(
         layout_type=layout_type,
         width=input_width or 1920, # Fallback to standard HD
         height=input_height or 1080,
-        subject_centers=subject_centers or []
+        subject_centers=subject_centers or [],
+        screen_focus=screen_focus,
     )
 
     escaped_path = _escape_subtitle_path(srt_path)
@@ -677,7 +911,10 @@ def build_subtitle_filter(
     # Gap 15: Fix Aspect Ratio Distortion with letterboxing
     filters.append(f"scale={output_width}:{output_height}:force_original_aspect_ratio=decrease")
     filters.append(f"pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2")
-    filters.append(f"{sub_filter}={escaped_path}:force_style='{style.to_force_style()}'")
+    if sub_filter == "ass":
+        filters.append(f"{sub_filter}={escaped_path}")
+    else:
+        filters.append(f"{sub_filter}={escaped_path}:force_style='{style.to_force_style()}'")
     
     return ",".join(filters)
 
@@ -688,6 +925,8 @@ def render_vertical_captioned_clip(
     output_path: Path,
     *,
     style: SubtitleStyle = DEFAULT_SUBTITLE_STYLE,
+    output_width: int = OUTPUT_WIDTH,
+    output_height: int = OUTPUT_HEIGHT,
     crf: int = 23,
     preset: str = "fast",
     audio_bitrate: str = "128k",
@@ -695,6 +934,9 @@ def render_vertical_captioned_clip(
     layout_type: str = "vertical",
     watermark_path: Path | None = None,
     headline: str | None = None,
+    screen_focus: str = "center",
+    audio_profile: str = "loudnorm_i_-14",
+    render_recipe: dict | None = None,
 ) -> Path:
     """Crop, scale, caption, and encode a vertical (9:16) clip with dynamic layout and watermark.
     
@@ -704,6 +946,13 @@ def render_vertical_captioned_clip(
     _assert_file_exists(srt_path, "SRT/ASS subtitle file")
     _validate_encoder_settings(crf, preset, audio_bitrate)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if render_recipe:
+        subject_centers = list(render_recipe.get("subject_centers") or subject_centers or [])
+        layout_type = str(render_recipe.get("layout_type") or layout_type)
+        headline = str(render_recipe.get("selected_hook") or headline or "").strip() or headline
+        screen_focus = str(render_recipe.get("screen_focus") or screen_focus)
+        audio_profile = str(render_recipe.get("audio_profile") or audio_profile)
 
     input_width, input_height = get_video_dimensions(raw_clip_path)
 
@@ -717,7 +966,8 @@ def render_vertical_captioned_clip(
         srt_path, style, output_width, output_height,
         input_width=input_width, input_height=input_height,
         subject_centers=subject_centers,
-        layout_type=layout_type
+        layout_type=layout_type,
+        screen_focus=screen_focus,
     )
     # Prepend HDR conversion to the filterchain
     vf = f"{hdr_filter}{vf}"
@@ -749,9 +999,10 @@ def render_vertical_captioned_clip(
         
         drawtext_vf = (
             f"drawtext=text='{safe_headline}':"
-            f"fontfile='{font_path}':"
+            f"fontfile={font_path}:"
             f"fontcolor=white:fontsize=64:x=(w-text_w)/2:y=h*0.15:"
-            f"box=1:boxcolor=black@0.6:boxborderw=20"
+            f"box=1:boxcolor=black@0.6:boxborderw=20:"
+            f"enable=between(t\\,0\\,1.5)"
         )
         # Update existing vf if simple, or complex if watermark active
         if "-vf" in command:
@@ -775,20 +1026,28 @@ def render_vertical_captioned_clip(
 
     encoder = get_video_encoder()
     command.extend([
-        "-map", "0:v:0",
-        "-map", f"0:a:{audio_track}?",
-        "-c:v", encoder,
-        "-crf", str(crf) if encoder == "libx264" else "20", # crf 20 for nvenc
-        "-preset", preset if encoder == "libx264" else "p4", # p4 for nvenc
+        "-map", "0:v:0?",
+        "-map", f"0:a:{audio_track}?" if audio_track is not None else "0:a?",
+        "-fps_mode", "cfr", # Gap 181: Fix VFR audio drift without deprecated -vsync
+        *_video_encoder_args(encoder, crf=crf, preset=preset),
+        "-pix_fmt", "yuv420p", # Gap 183: Explicit pixel format to prevent green artifacts
+        "-af", _audio_filter_for_profile(audio_profile),
         "-c:a", "aac",
         "-b:a", audio_bitrate,
+        "-ar", "48000", # Gap 188
         str(output_path),
     ])
     
-    _run_command(command)
+    _run_command_with_encoder_fallback(command, crf=crf, preset=preset)
     logger.info("Rendered captioned clip: %s (wm: %s) -> %s", 
                 layout_type, "yes" if watermark_path else "no", output_path.name)
     return output_path
+
+
+def _audio_filter_for_profile(audio_profile: str) -> str:
+    if audio_profile == "loudnorm_i_-14":
+        return "loudnorm=I=-14:TP=-1.5:LRA=11"
+    return "anull"
 
 
 def generate_proxy_video(
@@ -798,11 +1057,15 @@ def generate_proxy_video(
     height: int = 720,
     crf: int = 28,
     preset: str = "veryfast",
+    *,
+    max_retries: int = 3, # Gap 189: Retry on disk load failures
 ) -> Path:
     """Generate a low-bitrate proxy video for browser-side preview (Gap 63).
     
     4K source videos cause buffering in the browser. This generates a 720p proxy.
+    Gap 189: Retries with exponential backoff on transient disk I/O failures.
     """
+    import time
     _assert_file_exists(video_path, "source video")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
@@ -811,21 +1074,56 @@ def generate_proxy_video(
     if is_hdr(video_path):
         hdr_filter = f"{hdr_to_sdr_filter(width, height)},"
     
+    encoder = get_video_encoder()
     command = [
         "ffmpeg", "-y",
         "-i", str(video_path),
         "-vf", f"{hdr_filter}scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2",
-        "-c:v", get_video_encoder(),
-        "-crf", str(crf),
-        "-preset", preset,
+        "-fps_mode", "cfr", # Gap 181: Fix VFR audio drift without deprecated -vsync
+        *_video_encoder_args(encoder, crf=crf, preset=preset),
+        "-pix_fmt", "yuv420p", # Gap 183
+
         "-c:a", "aac",
         "-b:a", "128k",
+        "-ar", "48000", # Gap 188
         str(output_path),
     ]
     
+    last_exc: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            _run_command_with_encoder_fallback(command, crf=crf, preset=preset)
+            logger.info("Proxy generated: %s -> %s", video_path.name, output_path.name)
+            return output_path
+        except FFmpegError as exc:
+            last_exc = exc
+            wait = 2 ** attempt
+            logger.warning("Proxy generation failed (attempt %d/%d), retrying in %ds: %s", attempt + 1, max_retries, wait, exc)
+            time.sleep(wait)
+    raise last_exc  # type: ignore[misc]
+
+
+def extract_thumbnail(video_path: Path, output_path: Path, timestamp: float = 3.0) -> Path:
+    """Extract a single thumbnail frame from a video (Gap 190).
+    
+    Uses ffmpeg directly instead of cv2.VideoCapture to prevent memory leaks
+    from unclosed OpenCV video handles in long-running worker processes.
+    """
+    _assert_file_exists(video_path, "video")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    command = [
+        "ffmpeg", "-y",
+        "-ss", str(timestamp),
+        "-i", str(video_path),
+        "-vframes", "1",
+        "-q:v", "2",
+        str(output_path),
+    ]
     _run_command(command)
-    logger.info("Proxy generated: %s -> %s", video_path.name, output_path.name)
+    logger.info("Thumbnail extracted from %s at %.1fs -> %s", video_path.name, timestamp, output_path.name)
     return output_path
+
 
 
 def generate_waveform_video(
@@ -863,7 +1161,9 @@ def generate_waveform_video(
         "-map", f"0:a?", # map audio from input if it exists
         "-i", str(audio_path),
         "-c:v", "libx264",
+        "-pix_fmt", "yuv420p", # Gap 183
         "-c:a", "aac",
+        "-ar", "48000", # Gap 188
         "-t", str(duration),
         str(output_path),
     ]
@@ -950,10 +1250,13 @@ def apply_broll_cutaways(
         "-filter_complex", filter_complex,
         "-map", "[outv]",
         "-map", "0:a?", # Keep original audio
+        "-fps_mode", "cfr", # Gap 181: Fix VFR audio drift without deprecated -vsync
         "-c:v", "libx264",
         "-crf", "23",
         "-preset", "fast",
+        "-pix_fmt", "yuv420p", # Gap 183
         "-c:a", "aac",
+        "-ar", "48000", # Gap 188
         str(output_path)
     ])
     

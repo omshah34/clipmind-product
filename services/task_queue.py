@@ -31,6 +31,18 @@ def is_redis_available() -> bool:
         return False
 
 
+def _resolve_task(task: Any) -> Any:
+    """Return a Celery task object for a task instance or registered task name."""
+    if isinstance(task, str):
+        from workers.celery_app import celery_app
+
+        resolved = celery_app.tasks.get(task)
+        if resolved is None:
+            raise KeyError(f"Unknown Celery task: {task}")
+        return resolved
+    return task
+
+
 def dispatch_task(
     task: Any,
     *args: Any,
@@ -38,15 +50,16 @@ def dispatch_task(
     task_name: str | None = None,
     **kwargs: Any,
 ) -> Any:
-    """Send a task to Celery, or run the fallback when Redis is unavailable."""
+    """Send a task to Celery, or run the fallback when dispatch fails."""
     label = task_name or getattr(task, "name", "celery-task")
 
-    if is_redis_available():
-        return task.delay(*args, **kwargs)
+    try:
+        resolved_task = _resolve_task(task)
+        return resolved_task.delay(*args, **kwargs)
+    except Exception as exc:
+        if fallback is not None:
+            logger.warning("[%s] Task dispatch failed; running inline fallback.", label)
+            return fallback(*args, **kwargs)
 
-    if fallback is not None:
-        logger.warning("[%s] Redis unavailable; running inline fallback.", label)
-        return fallback(*args, **kwargs)
-
-    logger.warning("[%s] Redis unavailable; skipping async dispatch.", label)
-    return None
+        logger.exception("[%s] Task dispatch failed and no fallback was provided.", label)
+        raise RuntimeError(f"[{label}] Task dispatch failed") from exc

@@ -4,9 +4,13 @@
  * File: web/components/live-pipeline.tsx
  * Purpose: Real-time pipeline visualisation — connects via WebSocket and shows
  *          animated stage progress, live scores, and a completion celebration.
+ *          Gaps 213/217/220: React Query invalidation, optimized re-renders, and backoff.
+ *          Restored: Full UI richness (extraInfo, score colors, celebration stats).
  */
 
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { API_BASE_URL } from "@/lib/api";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -42,7 +46,84 @@ const STAGES = [
   { key: "completed",        label: "Complete",            icon: "🎉",  color: "#16a34a" },
 ];
 
-// ─── Component ───────────────────────────────────────────────────────────────
+const FALLBACK_STATUS_PROGRESS: Record<string, number> = {
+  uploading: 6,
+  uploaded: 10,
+  queued: 20,
+  downloading: 25,
+  generating_proxy: 30,
+  extracting_audio: 35,
+  transcribing: 50,
+  detecting_clips: 65,
+  cutting_video: 78,
+  reframing: 82,
+  rendering_captions: 88,
+  exporting: 95,
+  retrying: 55,
+  completed: 100,
+  failed: 100,
+  cancelled: 100,
+};
+
+// ─── Sub-components for Optimization (Gap 217) ──────────────────────────────
+
+const StageIndicator = React.memo(({ stage, isPast, isActive, isFuture, isComplete }: { 
+  stage: typeof STAGES[0], isPast: boolean, isActive: boolean, isFuture: boolean, isComplete: boolean 
+}) => {
+  return (
+    <div style={{
+      textAlign: "center", opacity: isFuture ? 0.3 : 1,
+      transition: "opacity 0.3s ease",
+    }}>
+      <div style={{
+        width: 36, height: 36, borderRadius: "50%",
+        margin: "0 auto 6px",
+        display: "flex", alignItems: "center", justifyContent: "center",
+        fontSize: 16,
+        background: isPast || isComplete
+          ? `${stage.color}18`
+          : isActive
+            ? `${stage.color}18`
+            : "rgba(255,255,255,0.95)",
+        border: isActive ? `2px solid ${stage.color}` : "1px solid rgba(16,32,51,0.08)",
+        animation: isActive ? "pulse 2s infinite" : "none",
+        transition: "all 0.3s ease",
+        boxShadow: isActive ? `0 10px 24px ${stage.color}18` : "0 8px 18px rgba(16,32,51,0.04)",
+      }}>
+        {isPast || isComplete ? "✓" : stage.icon}
+      </div>
+      <div style={{
+        fontSize: 10, color: isActive ? stage.color : "var(--muted)",
+        fontWeight: isActive ? 700 : 400,
+        lineHeight: 1.2,
+      }}>
+        {stage.label}
+      </div>
+    </div>
+  );
+});
+
+const ProgressBar = React.memo(({ progress, isComplete, hasError }: { progress: number, isComplete: boolean, hasError: boolean }) => {
+  return (
+    <div style={{
+      height: 8, backgroundColor: "rgba(16,32,51,0.08)",
+      borderRadius: 999, overflow: "hidden", marginBottom: 24,
+    }}>
+      <div style={{
+        height: "100%", width: `${progress}%`,
+        background: hasError
+          ? "linear-gradient(90deg, #ef4444, #f97316)"
+          : isComplete
+            ? "linear-gradient(90deg, #16a34a, #22c55e)"
+            : "linear-gradient(90deg, #4f46e5, #8b5cf6, #db2777)",
+        transition: "width 0.6s ease-out",
+        borderRadius: 999,
+      }} />
+    </div>
+  );
+});
+
+// ─── Main Component ──────────────────────────────────────────────────────────
 
 interface LivePipelineProps {
   jobId: string;
@@ -51,6 +132,7 @@ interface LivePipelineProps {
 }
 
 export default function LivePipeline({ jobId, initialData, onCompleted }: LivePipelineProps) {
+  const queryClient = useQueryClient();
   const [currentStage, setCurrentStage] = useState<string>("queued");
   const [progress, setProgress] = useState(0);
   const [clipScores, setClipScores] = useState<ClipScore[]>([]);
@@ -59,24 +141,82 @@ export default function LivePipeline({ jobId, initialData, onCompleted }: LivePi
   const [errorData, setErrorData] = useState<{ stage: string; message: string } | null>(null);
   const [extraInfo, setExtraInfo] = useState<Record<string, any>>({});
   const [connected, setConnected] = useState(false);
+  
   const lastMessageTime = useRef<number>(Date.now());
   const wsRef = useRef<WebSocket | null>(null);
-  const reconnectTimer = useRef<ReturnType<typeof setTimeout>>();
+  const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const retryCountRef = useRef(0);
+  const connectionStartTimeRef = useRef(0);
+  const shouldReconnectRef = useRef(true);
+  const currentStageRef = useRef(currentStage);
+  const onCompletedRef = useRef(onCompleted);
+
+  useEffect(() => {
+    currentStageRef.current = currentStage;
+  }, [currentStage]);
+
+  useEffect(() => {
+    onCompletedRef.current = onCompleted;
+  }, [onCompleted]);
+
+  const clearReconnectTimer = useCallback(() => {
+    if (reconnectTimer.current) {
+      clearTimeout(reconnectTimer.current);
+      reconnectTimer.current = null;
+    }
+  }, []);
+
+  const closeSocket = useCallback((socket: WebSocket | null) => {
+    if (!socket) return;
+
+    socket.onmessage = null;
+    socket.onerror = null;
+    socket.onclose = null;
+
+    if (socket.readyState === WebSocket.CONNECTING) {
+      socket.onopen = () => socket.close(1000, "superseded");
+      return;
+    }
+
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.close(1000, "superseded");
+    }
+  }, []);
 
   const connect = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return;
+    if (wsRef.current && (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
 
-    const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-    const wsUrl = `${protocol}://${window.location.hostname}:8000/api/v1/ws/jobs/${jobId}`;
+    clearReconnectTimer();
 
-    const ws = new WebSocket(wsUrl);
+    const wsUrl = new URL(API_BASE_URL.replace(/^http/, "ws"));
+    wsUrl.pathname = `${wsUrl.pathname.replace(/\/$/, "")}/ws/jobs/${jobId}`;
+
+    const ws = new WebSocket(wsUrl.toString());
     wsRef.current = ws;
 
     ws.onopen = () => {
+      if (wsRef.current !== ws) {
+        ws.close(1000, "stale connection");
+        return;
+      }
+
       setConnected(true);
+      lastMessageTime.current = Date.now();
+      connectionStartTimeRef.current = Date.now();
+      
+      setTimeout(() => {
+        if (wsRef.current?.readyState === WebSocket.OPEN && 
+            Date.now() - connectionStartTimeRef.current >= 10000) {
+          retryCountRef.current = 0;
+        }
+      }, 10000);
     };
 
     ws.onmessage = (evt) => {
+      if (wsRef.current !== ws) return;
+
       lastMessageTime.current = Date.now();
       try {
         const event: PipelineEvent = JSON.parse(evt.data);
@@ -111,74 +251,75 @@ export default function LivePipeline({ jobId, initialData, onCompleted }: LivePi
               if (exists) return prev;
               return [...prev, { clip_index: data.clip_index, duration: data.duration, final_score: data.final_score }];
             });
+            queryClient.invalidateQueries({ queryKey: ['clips', jobId] });
             break;
 
           case "completed":
             setCurrentStage("completed");
             setProgress(100);
             setCompletionData(data);
-            onCompleted?.();
+            shouldReconnectRef.current = false;
+            clearReconnectTimer();
+            queryClient.invalidateQueries({ queryKey: ['clips', jobId] });
+            onCompletedRef.current?.();
             break;
 
           case "error":
             setErrorData({ stage: data.stage, message: data.message });
+            shouldReconnectRef.current = false;
+            clearReconnectTimer();
             break;
         }
-      } catch {
-        // Ignore parse errors
-      }
+      } catch { /* ignore */ }
     };
 
     ws.onclose = () => {
+      if (wsRef.current !== ws) return;
+
       setConnected(false);
-      // Auto-reconnect after 3 seconds if not completed
-      if (currentStage !== "completed") {
-        reconnectTimer.current = setTimeout(connect, 3000);
+      if (shouldReconnectRef.current && currentStageRef.current !== "completed") {
+        clearReconnectTimer();
+        const jitter = Math.random() * 1000;
+        const delay = Math.min(30000, (Math.pow(2, retryCountRef.current) * 1000) + jitter);
+        retryCountRef.current++;
+        reconnectTimer.current = setTimeout(connect, delay);
       }
     };
 
     ws.onerror = () => {
-      ws.close();
+      if (wsRef.current === ws && ws.readyState === WebSocket.OPEN) {
+        ws.close();
+      }
     };
-  }, [jobId, currentStage, onCompleted]);
+  }, [clearReconnectTimer, jobId, queryClient]);
 
   useEffect(() => {
+    shouldReconnectRef.current = true;
     connect();
-    // Ping keepalive every 15 seconds
     const pingInterval = setInterval(() => {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
         wsRef.current.send(JSON.stringify({ type: "ping" }));
       }
-      
-      // Fallback logic: if no message for 15s and we have initialData, sync from it
-      const secondsSinceLastMessage = (Date.now() - lastMessageTime.current) / 1000;
-      if (secondsSinceLastMessage > 15 && initialData) {
-        if (initialData.status && initialData.status !== currentStage) {
-          setCurrentStage(initialData.status);
-          // Map status to progress if not provided
-          const statusProgress: Record<string, number> = {
-            uploading: 10, transcribing: 40, detecting_clips: 60, completed: 100
-          };
-          if (statusProgress[initialData.status]) setProgress(statusProgress[initialData.status]);
-        }
-      }
-    }, 15000);
+    }, 60000);
 
     return () => {
       clearInterval(pingInterval);
-      clearTimeout(reconnectTimer.current);
-      wsRef.current?.close();
+      shouldReconnectRef.current = false;
+      clearReconnectTimer();
+      const socket = wsRef.current;
+      wsRef.current = null;
+      closeSocket(socket);
     };
-  }, [connect, initialData, currentStage]);
+  }, [clearReconnectTimer, closeSocket, connect]);
 
-  // Sync with initialData on mount or if WebSocket is down
   useEffect(() => {
-    if (!connected && initialData?.status) {
-      setCurrentStage(initialData.status);
-    }
-  }, [initialData, connected]);
+    const status = initialData?.status;
+    if (!status || currentStageRef.current === "completed") return;
+    setCurrentStage(status);
+    setProgress((prev) => Math.max(prev, FALLBACK_STATUS_PROGRESS[status] ?? prev));
+  }, [initialData?.status]);
 
-  const activeStageIndex = STAGES.findIndex((s) => s.key === currentStage);
+  const activeStageIndex = useMemo(() => STAGES.findIndex((s) => s.key === currentStage), [currentStage]);
   const isComplete = currentStage === "completed";
   const hasError = !!errorData;
 
@@ -188,8 +329,7 @@ export default function LivePipeline({ jobId, initialData, onCompleted }: LivePi
       <div style={{
         display: "inline-flex", alignItems: "center", gap: 8,
         marginBottom: 18, fontSize: 12, color: "var(--muted)",
-        padding: "8px 12px",
-        borderRadius: 999,
+        padding: "8px 12px", borderRadius: 999,
         background: "rgba(255,255,255,0.82)",
         border: "1px solid rgba(16,32,51,0.08)",
       }}>
@@ -201,68 +341,26 @@ export default function LivePipeline({ jobId, initialData, onCompleted }: LivePi
         {connected ? "Live • Real-time updates" : "Reconnecting..."}
       </div>
 
-      {/* Progress bar */}
-      <div style={{
-        height: 8, backgroundColor: "rgba(16,32,51,0.08)",
-        borderRadius: 999, overflow: "hidden", marginBottom: 24,
-      }}>
-        <div style={{
-          height: "100%", width: `${progress}%`,
-          background: hasError
-            ? "linear-gradient(90deg, #ef4444, #f97316)"
-            : isComplete
-              ? "linear-gradient(90deg, #16a34a, #22c55e)"
-              : "linear-gradient(90deg, #4f46e5, #8b5cf6, #db2777)",
-          transition: "width 0.6s ease-out",
-          borderRadius: 999,
-        }} />
-      </div>
+      <ProgressBar progress={progress} isComplete={isComplete} hasError={hasError} />
 
-      {/* Stage indicators */}
+      {/* Stage indicators - Memoized (Gap 217) */}
       <div style={{
         display: "grid", gridTemplateColumns: `repeat(${STAGES.length}, 1fr)`,
         gap: 4, marginBottom: 24,
       }}>
-        {STAGES.map((stage, i) => {
-          const isPast = i < activeStageIndex;
-          const isActive = stage.key === currentStage;
-          const isFuture = i > activeStageIndex && !isComplete;
-
-          return (
-            <div key={stage.key} style={{
-              textAlign: "center", opacity: isFuture ? 0.3 : 1,
-              transition: "opacity 0.3s ease",
-            }}>
-              <div style={{
-                width: 36, height: 36, borderRadius: "50%",
-                margin: "0 auto 6px",
-                display: "flex", alignItems: "center", justifyContent: "center",
-                fontSize: 16,
-                background: isPast || isComplete
-                  ? `${stage.color}18`
-                  : isActive
-                    ? `${stage.color}18`
-                    : "rgba(255,255,255,0.95)",
-                border: isActive ? `2px solid ${stage.color}` : "1px solid rgba(16,32,51,0.08)",
-                animation: isActive ? "pulse 2s infinite" : "none",
-                transition: "all 0.3s ease",
-                boxShadow: isActive ? `0 10px 24px ${stage.color}18` : "0 8px 18px rgba(16,32,51,0.04)",
-              }}>
-                {isPast || isComplete ? "✓" : stage.icon}
-              </div>
-              <div style={{
-                fontSize: 10, color: isActive ? stage.color : "var(--muted)",
-                fontWeight: isActive ? 700 : 400,
-                lineHeight: 1.2,
-              }}>
-                {stage.label}
-              </div>
-            </div>
-          );
-        })}
+        {STAGES.map((stage, i) => (
+          <StageIndicator 
+            key={stage.key}
+            stage={stage}
+            isPast={i < activeStageIndex}
+            isActive={stage.key === currentStage}
+            isFuture={i > activeStageIndex && !isComplete}
+            isComplete={isComplete}
+          />
+        ))}
       </div>
 
-      {/* Current stage detail */}
+      {/* Current stage detail - RESTORED RICH INFO */}
       {!isComplete && !hasError && currentStage !== "queued" && (
         <div style={{
           padding: 16, borderRadius: 12,
@@ -271,12 +369,9 @@ export default function LivePipeline({ jobId, initialData, onCompleted }: LivePi
           marginBottom: 20,
         }}>
           <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 6 }}>
-            {STAGES.find((s) => s.key === currentStage)?.icon}{" "}
-            {STAGES.find((s) => s.key === currentStage)?.label || currentStage}
-            <span style={{
-              marginLeft: 8, fontSize: 12, color: "var(--muted)",
-              animation: "pulse 1.5s infinite",
-            }}>
+            {STAGES[activeStageIndex]?.icon}{" "}
+            {STAGES[activeStageIndex]?.label || currentStage}
+            <span style={{ marginLeft: 8, fontSize: 12, color: "var(--muted)", animation: "pulse 1.5s infinite" }}>
               Processing...
             </span>
           </div>
@@ -299,7 +394,7 @@ export default function LivePipeline({ jobId, initialData, onCompleted }: LivePi
         </div>
       )}
 
-      {/* Clip scores as they come in */}
+      {/* Clip scores - RESTORED RICH STYLING */}
       {clipScores.length > 0 && (
         <div style={{ marginBottom: 20 }}>
           <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 12, color: "#7c3aed" }}>
@@ -330,7 +425,6 @@ export default function LivePipeline({ jobId, initialData, onCompleted }: LivePi
                 <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                   {Object.entries(cs.scores).map(([key, val]) => {
                     const label = key.replace("_score", "");
-                    const numVal = Number(val) || 0;
                     const colors: Record<string, string> = {
                       hook: "#ef4444", emotion: "#14b8a6",
                       clarity: "#0ea5e9", story: "#f97316", virality: "#eab308",
@@ -343,7 +437,7 @@ export default function LivePipeline({ jobId, initialData, onCompleted }: LivePi
                         fontSize: 11, fontWeight: 600,
                         color: colors[label] || "#999",
                       }}>
-                        {label}: {numVal.toFixed(1)}
+                        {label}: {Number(val).toFixed(1)}
                       </div>
                     );
                   })}
@@ -375,7 +469,7 @@ export default function LivePipeline({ jobId, initialData, onCompleted }: LivePi
         </div>
       )}
 
-      {/* Completion celebration */}
+      {/* Completion celebration - RESTORED RICH STATS */}
       {isComplete && completionData && (
         <div style={{
           padding: 24, borderRadius: 16, textAlign: "center",
@@ -393,7 +487,7 @@ export default function LivePipeline({ jobId, initialData, onCompleted }: LivePi
           }}>
             <div>
               <div style={{ fontSize: 28, fontWeight: 800, color: "var(--text)" }}>
-                {completionData.total_clips}
+                {completionData.total_clips || 0}
               </div>
               <div style={{ fontSize: 11, color: "var(--muted)" }}>Clips Generated</div>
             </div>
@@ -429,16 +523,9 @@ export default function LivePipeline({ jobId, initialData, onCompleted }: LivePi
         </div>
       )}
 
-      {/* Animations */}
       <style>{`
-        @keyframes pulse {
-          0%, 100% { opacity: 1; }
-          50% { opacity: 0.5; }
-        }
-        @keyframes fadeSlideIn {
-          from { opacity: 0; transform: translateY(8px); }
-          to   { opacity: 1; transform: translateY(0); }
-        }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        @keyframes fadeSlideIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
       `}</style>
     </div>
   );

@@ -169,6 +169,7 @@ _SQLITE_SCHEMA = textwrap.dedent("""\
         retry_count      INTEGER    NOT NULL DEFAULT 0,
         retry_max        INTEGER    NOT NULL DEFAULT 5,
         timeout_seconds  INTEGER    NOT NULL DEFAULT 30,
+        deleted_at       TIMESTAMP,
         created_at       TIMESTAMP  NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at       TIMESTAMP  NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
@@ -200,6 +201,7 @@ _SQLITE_SCHEMA = textwrap.dedent("""\
         name               TEXT       NOT NULL,
         config             TEXT       NOT NULL,
         is_active          INTEGER    NOT NULL DEFAULT 1,
+        deleted_at         TIMESTAMP,
         last_triggered_at  TIMESTAMP,
         trigger_events     TEXT       NOT NULL,
         created_at         TIMESTAMP  NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -262,6 +264,18 @@ _SQLITE_SCHEMA = textwrap.dedent("""\
         last_alerted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (user_id, alert_type)
     );
+
+    CREATE TABLE IF NOT EXISTS performance_sync_jobs (
+        job_id         TEXT       PRIMARY KEY,
+        user_id        TEXT       NOT NULL,
+        status         TEXT       NOT NULL,
+        error_message  TEXT,
+        created_at     TIMESTAMP  DEFAULT CURRENT_TIMESTAMP,
+        updated_at     TIMESTAMP  DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_performance_sync_jobs_user_id ON performance_sync_jobs(user_id);
+    CREATE INDEX IF NOT EXISTS idx_performance_sync_jobs_status ON performance_sync_jobs(status);
 
     CREATE TABLE IF NOT EXISTS platform_credentials (
         id                       TEXT       PRIMARY KEY DEFAULT (lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-4' || substr(hex(randomblob(2)),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(hex(randomblob(2)),2) || '-' || hex(randomblob(6)))),
@@ -347,20 +361,51 @@ _SQLITE_SCHEMA = textwrap.dedent("""\
 
     CREATE INDEX IF NOT EXISTS idx_clip_sequences_user ON clip_sequences(user_id);
 
+    CREATE TABLE IF NOT EXISTS clips (
+        id               TEXT       PRIMARY KEY DEFAULT (lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-4' || substr(hex(randomblob(2)),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(hex(randomblob(2)),2) || '-' || hex(randomblob(6)))),
+        job_id           TEXT       NOT NULL,
+        clip_index       INTEGER    NOT NULL,
+        clip_url         TEXT       NOT NULL,
+        srt_url          TEXT,
+        start_time       REAL       NOT NULL,
+        end_time         REAL       NOT NULL,
+        hook_score       REAL       DEFAULT 0,
+        emotion_score    REAL       DEFAULT 0,
+        clarity_score    REAL       DEFAULT 0,
+        story_score      REAL       DEFAULT 0,
+        virality_score   REAL       DEFAULT 0,
+        final_score      REAL       DEFAULT 0,
+        reason           TEXT,
+        headlines        TEXT       DEFAULT '[]',
+        social_caption   TEXT,
+        social_hashtags  TEXT       DEFAULT '[]',
+        layout_type      TEXT,
+        visual_mode      TEXT,
+        selected_hook    TEXT,
+        render_recipe    TEXT       DEFAULT '{}',
+        created_at       TIMESTAMP  NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_clips_job_index ON clips (job_id, clip_index);
+    CREATE INDEX IF NOT EXISTS idx_clips_job_id ON clips(job_id);
+
     CREATE TABLE IF NOT EXISTS render_jobs (
         id              TEXT       PRIMARY KEY DEFAULT (lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-4' || substr(hex(randomblob(2)),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(hex(randomblob(2)),2) || '-' || hex(randomblob(6)))),
+        user_id         TEXT,
         job_id          TEXT       NOT NULL,
         clip_index      INTEGER    NOT NULL,
         edited_srt      TEXT,
         edited_style    TEXT,
+        render_recipe_json TEXT,
         status          TEXT       DEFAULT 'queued',
+        progress_percent INTEGER   DEFAULT 0,
         output_url      TEXT,
+        error_message   TEXT,
         created_at      TIMESTAMP  DEFAULT CURRENT_TIMESTAMP,
         completed_at    TIMESTAMP
     );
 
     CREATE INDEX IF NOT EXISTS idx_render_jobs_status ON render_jobs(status);
-
     CREATE TABLE IF NOT EXISTS social_accounts (
         id                       TEXT       PRIMARY KEY DEFAULT (lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-4' || substr(hex(randomblob(2)),2) || '-' || substr('89ab',abs(random()) % 4 + 1, 1) || substr(hex(randomblob(2)),2) || '-' || hex(randomblob(6)))),
         user_id                  TEXT       NOT NULL,
@@ -390,6 +435,7 @@ _SQLITE_SCHEMA = textwrap.dedent("""\
         platform_url      TEXT,
         caption           TEXT,
         hashtags          TEXT,
+        asset_path        TEXT,
         published_at      TIMESTAMP,
         scheduled_at      TIMESTAMP,
         status            TEXT       DEFAULT 'draft',
@@ -535,24 +581,227 @@ _SQLITE_SCHEMA = textwrap.dedent("""\
     );
 
     CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions(user_id);
+
+    -- ====================================================================
+    -- Gap 237  cas_assets (Content-Addressable Storage registry)
+    -- ====================================================================
+    CREATE TABLE IF NOT EXISTS cas_assets (
+        sha256        TEXT      PRIMARY KEY,
+        canonical_url TEXT      NOT NULL,
+        size_bytes    INTEGER   NOT NULL DEFAULT 0,
+        ref_count     INTEGER   NOT NULL DEFAULT 1,
+        last_seen_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
 """)
 # fmt: on
 
 
 def init_sqlite_tables(engine) -> None:
     """Execute all CREATE TABLE IF NOT EXISTS statements for SQLite.
-
-    Uses the raw DBAPI ``executescript()`` method so the entire batch
-    is processed in one call — no manual semicolon splitting needed.
-    Safe to call repeatedly because every statement uses IF NOT EXISTS.
+    Includes atomic migrations for existing databases and idempotent seeding.
     """
+    from core.config import settings
     logger.info("Initializing SQLite tables...")
+
     with engine.connect() as conn:
+        # 1. Main Schema Execution
         raw_conn = conn.connection.dbapi_connection
         raw_conn.executescript(_SQLITE_SCHEMA)
+        cursor = raw_conn.cursor()
+
+        def _table_columns(table_name: str) -> set[str]:
+            rows = cursor.execute(f"PRAGMA table_info({table_name})").fetchall()
+            return {row[1] for row in rows}
+
+        # 2. Atomic Migrations (Column Additions)
+        # Wrap in a try/except to ensure we don't crash if a column already exists (extra safety)
+        try:
+            # Users Table
+            user_cols = _table_columns("users")
+            if "mock_credit_balance" not in user_cols:
+                cursor.execute("ALTER TABLE users ADD COLUMN mock_credit_balance REAL DEFAULT 0")
+                logger.info("Added column 'mock_credit_balance' to 'users' table.")
+            if "stripe_customer_id" not in user_cols:
+                cursor.execute("ALTER TABLE users ADD COLUMN stripe_customer_id TEXT")
+                logger.info("Added column 'stripe_customer_id' to 'users' table.")
+
+            # Jobs Table
+            job_cols = _table_columns("jobs")
+            if "language" not in job_cols:
+                cursor.execute("ALTER TABLE jobs ADD COLUMN language TEXT DEFAULT 'en'")
+                logger.info("Added column 'language' to 'jobs' table.")
+            if "proxy_video_url" not in job_cols:
+                cursor.execute("ALTER TABLE jobs ADD COLUMN proxy_video_url TEXT")
+                logger.info("Added column 'proxy_video_url' to 'jobs' table.")
+            if "is_rejected" not in job_cols:
+                cursor.execute("ALTER TABLE jobs ADD COLUMN is_rejected INTEGER NOT NULL DEFAULT 0")
+                logger.info("Added column 'is_rejected' to 'jobs' table.")
+            if "rejected_at" not in job_cols:
+                cursor.execute("ALTER TABLE jobs ADD COLUMN rejected_at TIMESTAMP")
+                logger.info("Added column 'rejected_at' to 'jobs' table.")
+            if "completed_at" not in job_cols:
+                cursor.execute("ALTER TABLE jobs ADD COLUMN completed_at TIMESTAMP")
+                logger.info("Added column 'completed_at' to 'jobs' table.")
+
+            # Workspaces Table
+            ws_cols = _table_columns("workspaces")
+            if "is_active" not in ws_cols:
+                cursor.execute("ALTER TABLE workspaces ADD COLUMN is_active INTEGER DEFAULT 1")
+                logger.info("Added column 'is_active' to 'workspaces' table.")
+            if "logo_url" not in ws_cols:
+                cursor.execute("ALTER TABLE workspaces ADD COLUMN logo_url TEXT")
+                logger.info("Added column 'logo_url' to 'workspaces' table.")
+            if "brand_color" not in ws_cols:
+                cursor.execute("ALTER TABLE workspaces ADD COLUMN brand_color TEXT")
+                logger.info("Added column 'brand_color' to 'workspaces' table.")
+            if "plan" not in ws_cols:
+                cursor.execute("ALTER TABLE workspaces ADD COLUMN plan TEXT DEFAULT 'starter'")
+                logger.info("Added column 'plan' to 'workspaces' table.")
+
+            # Other Tables
+            if "user_id" not in _table_columns("render_jobs"):
+                cursor.execute("ALTER TABLE render_jobs ADD COLUMN user_id TEXT")
+                logger.info("Added column 'user_id' to 'render_jobs' table.")
+            render_job_cols = _table_columns("render_jobs")
+            if "render_recipe_json" not in render_job_cols:
+                cursor.execute("ALTER TABLE render_jobs ADD COLUMN render_recipe_json TEXT")
+                logger.info("Added column 'render_recipe_json' to 'render_jobs' table.")
+            if "progress_percent" not in render_job_cols:
+                cursor.execute("ALTER TABLE render_jobs ADD COLUMN progress_percent INTEGER DEFAULT 0")
+                logger.info("Added column 'progress_percent' to 'render_jobs' table.")
+            if "error_message" not in render_job_cols:
+                cursor.execute("ALTER TABLE render_jobs ADD COLUMN error_message TEXT")
+                logger.info("Added column 'error_message' to 'render_jobs' table.")
+            clip_cols = _table_columns("clips")
+            if "srt_url" not in clip_cols:
+                cursor.execute("ALTER TABLE clips ADD COLUMN srt_url TEXT")
+                logger.info("Added column 'srt_url' to 'clips' table.")
+            if "layout_type" not in clip_cols:
+                cursor.execute("ALTER TABLE clips ADD COLUMN layout_type TEXT")
+                logger.info("Added column 'layout_type' to 'clips' table.")
+            if "visual_mode" not in clip_cols:
+                cursor.execute("ALTER TABLE clips ADD COLUMN visual_mode TEXT")
+                logger.info("Added column 'visual_mode' to 'clips' table.")
+            if "selected_hook" not in clip_cols:
+                cursor.execute("ALTER TABLE clips ADD COLUMN selected_hook TEXT")
+                logger.info("Added column 'selected_hook' to 'clips' table.")
+            if "render_recipe" not in clip_cols:
+                cursor.execute("ALTER TABLE clips ADD COLUMN render_recipe TEXT DEFAULT '{}'")
+                logger.info("Added column 'render_recipe' to 'clips' table.")
+            if "asset_path" not in _table_columns("published_clips"):
+                cursor.execute("ALTER TABLE published_clips ADD COLUMN asset_path TEXT")
+                logger.info("Added column 'asset_path' to 'published_clips' table.")
+            if "deleted_at" not in _table_columns("webhooks"):
+                cursor.execute("ALTER TABLE webhooks ADD COLUMN deleted_at TIMESTAMP")
+                logger.info("Added column 'deleted_at' to 'webhooks' table.")
+            if "deleted_at" not in _table_columns("integrations"):
+                cursor.execute("ALTER TABLE integrations ADD COLUMN deleted_at TIMESTAMP")
+                logger.info("Added column 'deleted_at' to 'integrations' table.")
+
+            # Fix: jobs.id DEFAULT NULL — old schema had no UUID expression.
+            # SQLite cannot ALTER a PRIMARY KEY, so we detect the broken schema
+            # via PRAGMA and rebuild the table if needed.
+            jobs_info = cursor.execute("PRAGMA table_info(jobs)").fetchall()
+            id_col = next((r for r in jobs_info if r[1] == "id"), None)
+            if id_col is not None and (id_col[4] is None or str(id_col[4]).upper() in ("NULL", "")):
+                logger.warning("Detected jobs.id DEFAULT NULL — rebuilding table with correct UUID DEFAULT...")
+                _UUID_EXPR = (
+                    "lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-4' || "
+                    "substr(hex(randomblob(2)),2) || '-' || "
+                    "substr('89ab',abs(random()) % 4 + 1, 1) || "
+                    "substr(hex(randomblob(2)),2) || '-' || hex(randomblob(6)))"
+                )
+                cursor.executescript(f"""
+                    CREATE TABLE IF NOT EXISTS jobs_new (
+                        id                      TEXT        PRIMARY KEY DEFAULT ({_UUID_EXPR}),
+                        status                  TEXT        NOT NULL DEFAULT 'uploaded',
+                        source_video_url        TEXT        NOT NULL,
+                        audio_url               TEXT,
+                        transcript_json         TEXT,
+                        clips_json              TEXT,
+                        timeline_json           TEXT,
+                        failed_stage            TEXT,
+                        error_message           TEXT,
+                        retry_count             INTEGER     NOT NULL DEFAULT 0,
+                        prompt_version          TEXT        NOT NULL DEFAULT 'v4',
+                        estimated_cost_usd      REAL        NOT NULL DEFAULT 0,
+                        actual_cost_usd         REAL        NOT NULL DEFAULT 0,
+                        user_id                 TEXT,
+                        brand_kit_id            TEXT,
+                        campaign_id             TEXT,
+                        scheduled_publish_date  TIMESTAMP,
+                        language                TEXT        DEFAULT 'en',
+                        is_rejected             INTEGER     NOT NULL DEFAULT 0,
+                        rejected_at             TIMESTAMP,
+                        completed_at            TIMESTAMP,
+                        created_at              TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at              TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    INSERT INTO jobs_new SELECT
+                        CASE WHEN id IS NULL OR id = '' THEN lower(hex(randomblob(16))) ELSE id END,
+                        status, source_video_url, audio_url, transcript_json, clips_json,
+                        timeline_json, failed_stage, error_message, retry_count, prompt_version,
+                        estimated_cost_usd, actual_cost_usd, user_id, brand_kit_id, campaign_id,
+                        scheduled_publish_date, language, is_rejected, rejected_at, completed_at,
+                        created_at, updated_at
+                    FROM jobs;
+                    DROP TABLE jobs;
+                    ALTER TABLE jobs_new RENAME TO jobs;
+                """)
+                logger.info("Rebuilt jobs table with correct UUID DEFAULT.")
+
+            # Gap 237: CAS assets table migration (existing databases)
+            cas_tables = cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='cas_assets'"
+            ).fetchone()
+            if not cas_tables:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS cas_assets (
+                        sha256        TEXT      PRIMARY KEY,
+                        canonical_url TEXT      NOT NULL,
+                        size_bytes    INTEGER   NOT NULL DEFAULT 0,
+                        ref_count     INTEGER   NOT NULL DEFAULT 1,
+                        last_seen_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                logger.info("Created 'cas_assets' table.")
+
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_render_jobs_user ON render_jobs(user_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_webhooks_active_by_user ON webhooks(user_id, created_at DESC) WHERE deleted_at IS NULL")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_integrations_active_by_user ON integrations(user_id, created_at DESC) WHERE deleted_at IS NULL")
+
+            # 3. Idempotent Seeding (Local Dev Only)
+            env = (settings.environment or "production").lower()
+            if env in ["development", "local"]:
+                logger.info("ENVIRONMENT=%s detected — seeding mock user and workspace...", env)
+
+                # Seed User (Insert or Ignore)
+                cursor.execute("""
+                    INSERT OR IGNORE INTO users (id, email, full_name, mock_credit_balance, created_at, updated_at)
+                    VALUES (?, 'local@clipmind.com', 'Local Dev User', 100.0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """, (settings.dev_mock_user_id,))
+                
+                # Ensure credits are set (even if user already existed)
+                cursor.execute("UPDATE users SET mock_credit_balance = 100.0 WHERE id = ?", (settings.dev_mock_user_id,))
+
+                # Seed Workspace (Insert or Ignore)
+                cursor.execute("""
+                    INSERT OR IGNORE INTO workspaces (id, owner_id, name, slug, is_active, created_at, updated_at)
+                    VALUES (?, ?, 'Local Dev Workspace', 'local-dev', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """, (settings.dev_mock_user_id, settings.dev_mock_user_id))
+
+            raw_conn.commit()
+        except Exception as e:
+            raw_conn.rollback()
+            logger.exception("Error during SQLite migration/seeding: %s", str(e))
+            raise
+        finally:
+            cursor.close()
+
     try:
         from db.feature_flags import get_feature_flag
-
         get_feature_flag.cache_clear()
     except Exception:
         logger.debug("Feature flag cache clear skipped during SQLite init", exc_info=True)

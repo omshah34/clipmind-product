@@ -27,11 +27,24 @@ class DiarizationService:
         # In a real scenario, this would call the pyannote pipeline or a 3rd party API (Deepgram)
         
         # We'll return a simple alternation mock if no real engine is configured
-        return [
+        raw_segments = [
             {"start": 0.0, "end": 30.0, "speaker": "SPEAKER_00"},
             {"start": 30.0, "end": 60.0, "speaker": "SPEAKER_01"},
-            {"start": 60.0, "end": 90.0, "speaker": "SPEAKER_00"},
+            {"start": 60.0, "end": 60.2, "speaker": "SPEAKER_02"}, # Example noise hallucination
+            {"start": 61.0, "end": 90.0, "speaker": "SPEAKER_00"},
         ]
+        
+        # Gap 194: Filter out background noise/music hallucinations.
+        # Short segments (< 0.5s) are usually non-speech transients.
+        filtered_segments = []
+        for seg in raw_segments:
+            duration = seg.get("end", 0) - seg.get("start", 0)
+            if duration >= 0.5:
+                filtered_segments.append(seg)
+            else:
+                logger.debug("Filtered out likely hallucinated speaker segment: %.2fs", duration)
+                
+        return filtered_segments
 
 def get_diarization_service() -> DiarizationService:
     from core.config import settings

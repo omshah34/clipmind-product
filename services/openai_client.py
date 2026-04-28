@@ -33,7 +33,7 @@ def make_openai_client(for_whisper: bool = False) -> OpenAI:
         api_key = settings.openai_api_key
         base_url = settings.openai_base_url
 
-    kwargs: dict = {"api_key": api_key}
+    kwargs: dict = {"api_key": api_key, "timeout": settings.openai_timeout_seconds}
     if base_url:
         kwargs["base_url"] = base_url
     elif for_whisper:

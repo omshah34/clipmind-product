@@ -12,6 +12,12 @@ from sqlalchemy import text
 from db.connection import engine
 
 
+def _serialize_event_types(event_types: list[str]) -> list[str] | str:
+    if engine.dialect.name == "sqlite":
+        return json.dumps(event_types)
+    return event_types
+
+
 def create_webhook(
     user_id: UUID | str,
     url: str,
@@ -36,7 +42,7 @@ def create_webhook(
             {
                 "user_id": str(user_id),
                 "url": url,
-                "event_types": event_types,
+                "event_types": _serialize_event_types(event_types),
                 "secret": secret,
                 "timeout_seconds": timeout_seconds,
             },
@@ -51,7 +57,7 @@ def get_webhook(webhook_id: UUID | str) -> dict[str, Any] | None:
         """
         SELECT id, user_id, url, event_types, secret, is_active, 
                timeout_seconds, retry_count, retry_max, created_at, updated_at
-        FROM webhooks WHERE id = :id
+        FROM webhooks WHERE id = :id AND deleted_at IS NULL
         """
     )
     
@@ -68,13 +74,13 @@ def list_user_webhooks(user_id: UUID | str, limit: int = 50, offset: int = 0) ->
         SELECT id, url, event_types, is_active, timeout_seconds, 
                retry_count, retry_max, created_at, updated_at
         FROM webhooks
-        WHERE user_id = :user_id
+        WHERE user_id = :user_id AND deleted_at IS NULL
         ORDER BY created_at DESC
         LIMIT :limit OFFSET :offset
         """
     )
     
-    count_query = text("SELECT COUNT(*) FROM webhooks WHERE user_id = :user_id")
+    count_query = text("SELECT COUNT(*) FROM webhooks WHERE user_id = :user_id AND deleted_at IS NULL")
     
     with engine.begin() as connection:
         rows = connection.execute(
@@ -91,15 +97,27 @@ def list_user_webhooks(user_id: UUID | str, limit: int = 50, offset: int = 0) ->
 
 def list_active_webhooks_for_event(event_type: str) -> list[dict[str, Any]]:
     """Get all active webhooks subscribed to an event type."""
-    # SQLite compatibility: uses json_each for JSON array search or simple string match
-    # PostgreSQL uses = ANY(event_types)
-    query = text(
-        """
-        SELECT id, user_id, url, event_types, secret, timeout_seconds
-        FROM webhooks
-        WHERE is_active = true AND :event_type = ANY(event_types)
-        """
-    )
+    if engine.dialect.name == "sqlite":
+        query = text(
+            """
+            SELECT id, user_id, url, event_types, secret, timeout_seconds
+            FROM webhooks
+            WHERE is_active = 1 AND deleted_at IS NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM json_each(webhooks.event_types)
+                  WHERE json_each.value = :event_type
+              )
+            """
+        )
+    else:
+        query = text(
+            """
+            SELECT id, user_id, url, event_types, secret, timeout_seconds
+            FROM webhooks
+            WHERE is_active = true AND deleted_at IS NULL AND :event_type = ANY(event_types)
+            """
+        )
     
     with engine.begin() as connection:
         rows = connection.execute(query, {"event_type": event_type}).fetchall()
@@ -119,13 +137,16 @@ def update_webhook(webhook_id: UUID | str, **fields: Any) -> dict[str, Any] | No
     query = text(
         f"""
         UPDATE webhooks SET {set_clause}, updated_at = CURRENT_TIMESTAMP
-        WHERE id = :id
+        WHERE id = :id AND deleted_at IS NULL
         RETURNING id, url, event_types, is_active, timeout_seconds, 
                   retry_count, retry_max, created_at, updated_at
         """
     )
     
     params = {"id": str(webhook_id), **update_fields}
+
+    if "event_types" in params:
+        params["event_types"] = _serialize_event_types(params["event_types"])
     
     with engine.begin() as connection:
         row = connection.execute(query, params).fetchone()
@@ -134,8 +155,10 @@ def update_webhook(webhook_id: UUID | str, **fields: Any) -> dict[str, Any] | No
 
 
 def delete_webhook(webhook_id: UUID | str) -> bool:
-    """Delete a webhook."""
-    query_delete = text("DELETE FROM webhooks WHERE id = :id")
+    """Soft-delete a webhook."""
+    query_delete = text(
+        "UPDATE webhooks SET deleted_at = CURRENT_TIMESTAMP, is_active = false, updated_at = CURRENT_TIMESTAMP WHERE id = :id AND deleted_at IS NULL"
+    )
     
     with engine.begin() as connection:
         result = connection.execute(query_delete, {"id": str(webhook_id)})

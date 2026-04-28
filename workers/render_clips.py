@@ -11,15 +11,57 @@ import tempfile
 from pathlib import Path
 from uuid import UUID
 
+from db.repositories.brand_kits import get_brand_kit
+from db.repositories.jobs import get_job
 from workers.celery_app import celery_app
 from db.repositories.render_jobs import (
     get_render_job,
     update_render_job_status,
 )
+from services.brand_kit_renderer import brand_kit_to_subtitle_style
+from services.caption_renderer import write_ass_from_srt
+from services.render_recipe import merge_render_recipe
 from services.storage import storage_service
+from services.video_processor import (
+    DEFAULT_SUBTITLE_STYLE,
+    SubtitleStyle,
+    cut_clip,
+    render_vertical_captioned_clip,
+)
 
 
 logger = logging.getLogger(__name__)
+
+
+def _hex_to_ass_colour(value: str | None, fallback: str) -> str:
+    if not value:
+        return fallback
+    cleaned = str(value).strip().lstrip("#")
+    if len(cleaned) != 6:
+        return fallback
+    rr = cleaned[0:2]
+    gg = cleaned[2:4]
+    bb = cleaned[4:6]
+    return f"&H00{bb}{gg}{rr}"
+
+
+def _subtitle_style_from_inputs(job, caption_style: dict | None) -> SubtitleStyle:
+    base_style = DEFAULT_SUBTITLE_STYLE
+    if getattr(job, "brand_kit_id", None):
+        brand_kit = get_brand_kit(job.brand_kit_id)
+        if brand_kit:
+            base_style = brand_kit_to_subtitle_style(brand_kit)
+
+    style = caption_style or {}
+    return SubtitleStyle(
+        font_name=str(style.get("font") or base_style.font_name),
+        font_size=int(style.get("size") or base_style.font_size),
+        bold=base_style.bold,
+        alignment=base_style.alignment,
+        primary_colour=_hex_to_ass_colour(style.get("color"), base_style.primary_colour),
+        outline_colour=_hex_to_ass_colour(style.get("background"), base_style.outline_colour),
+        outline=base_style.outline,
+    )
 
 
 @celery_app.task(bind=True, max_retries=3)
@@ -67,77 +109,101 @@ def render_edited_clip(
             )
             return {"status": "failed", "error": "Render job not found"}
         
-        # Get original clip video (from job storage)
-        original_video_url = render_job.get("original_video_url")
-        if not original_video_url:
-            logger.error(f"No original video found for job {job_id}")
+        job = get_job(job_id)
+        if not job or not job.clips_json:
+            logger.error("Job %s or clips not found for rerender", job_id)
             update_render_job_status(
                 render_job_id,
                 status="failed",
-                error_message="Original video not found",
+                error_message="Job or clips not found",
             )
-            return {"status": "failed", "error": "Original video not found"}
-        
+            return {"status": "failed", "error": "Job or clips not found"}
+
+        if clip_index < 0 or clip_index >= len(job.clips_json):
+            logger.error("Clip %s out of range for job %s", clip_index, job_id)
+            update_render_job_status(
+                render_job_id,
+                status="failed",
+                error_message="Clip index out of range",
+            )
+            return {"status": "failed", "error": "Clip index out of range"}
+
+        clip = job.clips_json[clip_index]
+        if not getattr(job, "source_video_url", None):
+            logger.error("No source video found for job %s", job_id)
+            update_render_job_status(
+                render_job_id,
+                status="failed",
+                error_message="Source video not found",
+            )
+            return {"status": "failed", "error": "Source video not found"}
+
         # Create temporary files
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = Path(tmpdir)
-            
-            # Write edited SRT to temp file
-            srt_file = tmpdir / "edited_captions.srt"
-            srt_file.write_text(edited_srt, encoding="utf-8")
-            
-            # Get caption style with defaults
-            style = caption_style or {}
-            font_name = style.get("font", "Arial")
-            font_size = style.get("size", 24)
-            font_color = style.get("color", "white")
-            bg_color = style.get("background", "black")
-            
-            # Use existing caption renderer with edited SRT
+
+            source_video = tmpdir / "source_video.mp4"
+            raw_clip = tmpdir / f"clip_{clip_index}_raw.mp4"
+            ass_file = tmpdir / "edited_captions.ass"
             rendered_video = tmpdir / "rendered_video.mp4"
-            
+
             try:
-                # Render captions onto video
-                subtitle_file = tmpdir / "subtitle.srt"
-                subtitle_file.write_text(edited_srt, encoding="utf-8")
-                
-                # FFmpeg command to add captions
-                ffmpeg_cmd = [
-                    "ffmpeg",
-                    "-i", str(original_video_url),
-                    "-vf", f"subtitles={subtitle_file}:force_style='FontName={font_name},FontSize={font_size},PrimaryColour=&H{font_color}&,OutlineColour=&H{bg_color}&'",
-                    "-c:a", "aac",
-                    "-y",
-                    str(rendered_video),
-                ]
-                
-                result = subprocess.run(
-                    ffmpeg_cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=300,
+                storage_service.download_to_local(job.source_video_url, source_video)
+                cut_clip(
+                    source_video,
+                    start_time=float(getattr(clip, "start_time", 0)),
+                    end_time=float(getattr(clip, "end_time", 0)),
+                    output_path=raw_clip,
                 )
-                
-                if result.returncode != 0:
-                    logger.error(f"FFmpeg failed: {result.stderr}")
-                    update_render_job_status(
-                        render_job_id,
-                        status="failed",
-                        error_message=f"FFmpeg error: {result.stderr[:200]}",
-                    )
-                    return {"status": "failed", "error": "FFmpeg rendering failed"}
-                
+
+                recipe = merge_render_recipe(
+                    getattr(clip, "render_recipe", None),
+                    render_job.get("render_recipe_json") or {},
+                )
+                write_ass_from_srt(
+                    edited_srt,
+                    ass_file,
+                    preset_name=str(recipe.get("caption_preset") or "hormozi"),
+                    layout_type=str(recipe.get("layout_type") or "vertical"),
+                )
+
                 # Update progress
                 update_render_job_status(
                     render_job_id,
                     status="processing",
-                    progress_percent=70,
+                    progress_percent=55,
                 )
-                
+
+                subtitle_style = _subtitle_style_from_inputs(job, caption_style)
+                watermark_path = None
+                if getattr(job, "brand_kit_id", None):
+                    brand_kit = get_brand_kit(job.brand_kit_id)
+                    if brand_kit and getattr(brand_kit, "watermark_url", None):
+                        watermark_path = tmpdir / f"watermark_{job.brand_kit_id}.png"
+                        storage_service.download_to_local(brand_kit.watermark_url, watermark_path)
+
+                render_vertical_captioned_clip(
+                    raw_clip,
+                    ass_file,
+                    rendered_video,
+                    style=subtitle_style,
+                    subject_centers=list(recipe.get("subject_centers") or []),
+                    layout_type=str(recipe.get("layout_type") or "vertical"),
+                    watermark_path=watermark_path,
+                    headline=str(recipe.get("selected_hook") or "").strip() or None,
+                    screen_focus=str(recipe.get("screen_focus") or "center"),
+                    audio_profile=str(recipe.get("audio_profile") or "loudnorm_i_-14"),
+                    render_recipe=recipe,
+                )
+
+                update_render_job_status(
+                    render_job_id,
+                    status="processing",
+                    progress_percent=80,
+                )
+
                 # Upload rendered video to storage
                 user_id = render_job.get("user_id") or "anonymous"
-                # suffix removed as it was undefined in previous view, likely local var in original file
-                # fixing definedness
                 filename = f"clip_{clip_index}.mp4" 
                 output_url = storage_service.upload_file(
                     local_path=rendered_video,
@@ -160,7 +226,7 @@ def render_edited_clip(
                     "render_job_id": str(render_job_id),
                     "output_url": output_url,
                 }
-            
+
             except subprocess.TimeoutExpired:
                 logger.error(f"FFmpeg timeout for render {render_job_id}")
                 update_render_job_status(
@@ -169,6 +235,14 @@ def render_edited_clip(
                     error_message="Rendering timeout (>5 min)",
                 )
                 return {"status": "failed", "error": "FFmpeg timeout"}
+            except Exception as exc:
+                logger.exception("Rerender failed for job %s clip %s", job_id, clip_index)
+                update_render_job_status(
+                    render_job_id,
+                    status="failed",
+                    error_message=str(exc)[:400],
+                )
+                return {"status": "failed", "error": str(exc)}
     
     except Exception as exc:
         logger.exception(f"Render task failed: {exc}")

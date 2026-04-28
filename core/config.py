@@ -22,6 +22,25 @@ def _get_int(name: str, default: int) -> int:
     return int(value) if value is not None else default
 
 
+def _get_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    return float(value) if value is not None else default
+
+
+def _get_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _default_clip_detector_fallback_model() -> str:
+    base_url = os.getenv("OPENAI_BASE_URL", "").lower()
+    if "integrate.api.nvidia.com" in base_url:
+        return "openai/gpt-oss-20b"
+    return "gpt-4o-mini"
+
+
 @dataclass(frozen=True)
 class Settings:
     environment: str = os.getenv("ENVIRONMENT", "development")
@@ -34,6 +53,8 @@ class Settings:
     redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     redis_socket_timeout: int = _get_int("REDIS_SOCKET_TIMEOUT", 30)
     redis_socket_connect_timeout: int = _get_int("REDIS_SOCKET_CONNECT_TIMEOUT", 30)
+    storage_upload_timeout_seconds: int = _get_int("STORAGE_UPLOAD_TIMEOUT_SECONDS", 120)
+    storage_download_timeout_seconds: int = _get_int("STORAGE_DOWNLOAD_TIMEOUT_SECONDS", 60)
     database_url: str = os.getenv("DATABASE_URL", "")
     frontend_url: str = os.getenv("FRONTEND_URL", "http://localhost:3000")
     storage_bucket: str = os.getenv("STORAGE_BUCKET", "clipmind-videos")
@@ -45,6 +66,7 @@ class Settings:
         "TRANSCRIPT_CHUNK_OVERLAP_SECONDS", 60
     )
     polling_interval_seconds: int = _get_int("POLLING_INTERVAL_SECONDS", 4)
+    poller_max_workers: int = _get_int("POLLER_MAX_WORKERS", 5)
     dev_mock_user_id: str = "00000000-0000-0000-0000-000000000000"
 
     # Phase 7: Security & Platform Auth
@@ -62,12 +84,21 @@ class Settings:
     min_clip_length_seconds: int = _get_int("MIN_CLIP_LENGTH_SECONDS", 15)
     max_clip_length_seconds: int = _get_int("MAX_CLIP_LENGTH_SECONDS", 90)
     clip_detector_model: str = os.getenv("CLIP_DETECTOR_MODEL", "openai/gpt-oss-120b")
-    clip_detector_fallback_model: str = os.getenv("CLIP_DETECTOR_FALLBACK_MODEL", "openai/gpt-4o")
+    clip_detector_fallback_model: str = os.getenv("CLIP_DETECTOR_FALLBACK_MODEL", _default_clip_detector_fallback_model())
+    clip_detector_retry_attempts: int = _get_int("CLIP_DETECTOR_RETRY_ATTEMPTS", 1)
+    openai_timeout_seconds: float = _get_float("OPENAI_TIMEOUT_SECONDS", 90.0)
+    hf_token: str = os.getenv("HF_TOKEN", "")
+    enable_contextual_broll: bool = _get_bool("ENABLE_CONTEXTUAL_BROLL", False)
+    pexels_api_key: str = os.getenv("PEXELS_API_KEY", "")
+    brand_guide_ocr_model: str = os.getenv("BRAND_GUIDE_OCR_MODEL", "gpt-4o-mini")
     whisper_model: str = "whisper-1"
     job_retry_limit: int = 3
     chunk_upload_size_bytes: int = 1024 * 1024
     feature_flag_prefix: str = os.getenv("FEATURE_FLAG_PREFIX", "CLIPMIND_FLAG_")
     request_context_header: str = os.getenv("REQUEST_ID_HEADER", "X-Request-ID")
+    trace_context_header: str = os.getenv("TRACE_ID_HEADER", "X-Trace-ID")
+    cdn_purge_url: str = os.getenv("CDN_PURGE_URL", "")
+    cdn_purge_token: str = os.getenv("CDN_PURGE_TOKEN", "")
     local_storage_dir: Path = BASE_DIR / ".clipmind_runtime" / "storage"
     temp_dir: Path = BASE_DIR / ".clipmind_runtime" / "tmp"
 

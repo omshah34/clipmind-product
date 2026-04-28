@@ -43,6 +43,23 @@ def test_build_subtitle_filter_split_screen():
         assert "vstack=2" in vf
         assert "scale=1080:1920" in vf
 
+def test_build_subtitle_filter_speaker_screen():
+    srt_path = Path("C:/test/subs.srt")
+
+    with patch("services.layout_engine.LayoutEngine.get_filtergraph") as mock_geo:
+        mock_geo.return_value = "[0:v]split=2[speaker_raw][screen_raw];[speaker_raw]crop=A,scale=1080:672[speaker];[screen_raw]crop=B,scale=1080:1248[screen];[speaker][screen]vstack=inputs=2"
+
+        vf = build_subtitle_filter(
+            srt_path=srt_path,
+            layout_type="speaker_screen",
+            input_width=1920,
+            input_height=1080,
+            screen_focus="right",
+        )
+
+        assert "vstack=inputs=2" in vf
+        assert "scale=1080:1920" in vf
+
 @patch("services.video_processor._run_command")
 @patch("services.video_processor.get_video_dimensions")
 def test_render_command_generation(mock_dims, mock_run):
@@ -67,5 +84,7 @@ def test_render_command_generation(mock_dims, mock_run):
         assert isinstance(args, list)
         assert "ffmpeg" == args[0]
         assert "-filter_complex" in args
+        assert "-af" in args
+        assert "loudnorm=I=-14:TP=-1.5:LRA=11" in args
         # Ensure logo.png is a discrete element
         assert str(wm_path) in args

@@ -409,14 +409,15 @@ def review_portal_submission(
             
         approved_indices_json = json.dumps(payload.approved_clip_indices) if payload.approved_clip_indices else None
             
+        _ts = "NOW()" if engine.dialect.name == "postgresql" else "CURRENT_TIMESTAMP"
         connection.execute(
             text(
-                """
+                f"""
                 UPDATE portal_submissions
                 SET status = :status,
                     client_feedback = :feedback,
                     approved_clip_indices = :approved_indices,
-                    updated_at = NOW()
+                    updated_at = {_ts}
                 WHERE submission_token = :token
                 """
             ),

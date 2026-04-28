@@ -18,18 +18,29 @@ class TestProductionGuardrails(unittest.TestCase):
     @patch("api.main.os.getenv")
     def test_health_endpoint_healthy(self, mock_getenv):
         """Verify /health returns 200 when all dependencies are up."""
-        mock_getenv.return_value = "development"
+        mock_getenv.side_effect = lambda name, default=None: "development" if name == "ENVIRONMENT" else default
         
         with patch("db.connection.engine.connect") as mock_conn:
-            with patch("workers.celery_app.celery_app.connection_or_acquire") as mock_redis:
+            with patch("api.main.redis.Redis.from_url") as mock_from_url:
+                mock_redis = MagicMock()
+                mock_redis.ping.return_value = True
+                mock_redis.info.return_value = {
+                    "used_memory": 1024 * 1024,
+                    "used_memory_peak": 2 * 1024 * 1024,
+                    "mem_fragmentation_ratio": 1.0,
+                }
+                mock_from_url.return_value = mock_redis
+
                 response = self.client.get("/health")
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(response.json()["status"], "ok")
+                mock_redis.ping.assert_called_once()
+                mock_redis.close.assert_called_once()
 
     @patch("api.main.os.getenv")
     def test_health_endpoint_unhealthy_db(self, mock_getenv):
         """Verify /health returns 503 when DB is down."""
-        mock_getenv.return_value = "development"
+        mock_getenv.side_effect = lambda name, default=None: "development" if name == "ENVIRONMENT" else default
         
         with patch("db.connection.engine.connect", side_effect=Exception("DB Down")):
             response = self.client.get("/health")

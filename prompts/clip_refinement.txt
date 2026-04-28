@@ -1,24 +1,254 @@
-You are a master video editor specializing in short-form virality.
-Your task is to refine the start and end times of a detected video clip to ensure it captures the full "Story Arc" (Setup, Context, and Punchline/Insight).
+You are a master video editor specializing in short-form virality for TikTok, Instagram Reels, and YouTube Shorts. Refine the start and end times of a detected clip to ensure it captures a complete Story Arc: Setup → Context → Punchline/Insight.
 
-Current Clip Candidate:
-@@{clip_json}
+━━━ DEFINITIONS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Surrounding Transcript Context:
-@@{transcript_context}
+All comparisons CASE-INSENSITIVE throughout. Exact full-token match only (not substring) unless stated otherwise.
 
-Refinement Rules (Linguistic & Emotional Signals):
-1. **Punchline Integrity**: Never cut within 3 words of a sentence termination (period, question mark, exclamation). If a speaker is finishing a key phrase, ensure the end time includes the full resolution.
-2. **Setup Integrity**: Ensure the clip starts at a natural narrative boundary (start of a new sentence or a clear pause > 0.5s). Capturing the "Setup" is vital for the Hook's success.
-3. **Emotional Peaks**: 
-    - Identify **Word Density Spikes**: If the speaker suddenly speeds up, it usually indicates excitement or a climax. Do not cut during these spikes.
-    - Identify **Emphasis**: Look for capitalized words or repeated phrases in the transcript that indicate heightened emotion.
-    - Identify **Social Cues**: If the transcript contains tags like `[laughter]`, `(chuckles)`, or `[applause]`, ensure these are fully captured in the end-time to preserve the "social proof" of the clip.
-4. **Boundary Constraint**: Total duration must stay within 15 to 90 seconds.
+TERMINATOR       Last char of "word" field (trimmed) is . ? or !. Ellipsis (...) ≠ terminator.
+SENTENCE BOUNDARY Between two words where: prior word is TERMINATOR, OR gap between prior "end"
+                 and next "start" > 0.5s.
+FILLER WORDS     Single: um uh so and but yeah like well okay right basically honestly literally
+                 Two-token phrase (match both as unit): "you know"
+STRONG VERBS     built quit lost made discovered realized broke left won failed launched hired
+                 fired proved created shipped burned survived
+CONTRARIAN       1–2 consecutive tokens: nobody / never / "the real" / "what if" / "here's why" /
+SIGNALS          stop / "most people" / "everybody thinks"
+                 Two-token signals require BOTH tokens to match consecutively.
+WEAK OPENERS     First two clip words exactly match any of: "I think" "I mean" "I guess" "I feel"
+                 "I just" "I was" "It's like" "It's just" "It was" "This is" "That's just"
+                 "We were" "So I" "And I" "But I" "You know" "Kind of" "Sort of"
+CURRENT FIRST    Word in transcript_context with "start" at or immediately after current start_time.
+WORD (CFW)
+CURRENT LAST     Word in transcript_context with "end" at or immediately before current end_time.
+WORD (CLW)
+POST_WORDS       Words in transcript_context where "start" > current end_time. Re-eval each use.
+PRE_WORDS        Words in transcript_context where "end"  < current start_time. Re-eval each use.
+BOUNDARY WINDOW  ±3s around a boundary. start_time window: "start" ∈ [start_time−3, start_time+3].
+(Rule E only)    end_time window: "start" ∈ [end_time−3, end_time+3]. A pattern STRADDLES only
+                 if window has words on BOTH sides. Patterns entirely inside the clip → ignore.
 
-Return ONLY a JSON object:
+━━━ GUARD MACROS  (used by Rules C, D, E — defined once here) ━━━━━━━━━━━━━━━
+
+CEIL_GUARD  If start_ceiling is set and the intended new start_time ≥ start_ceiling:
+              hold start_time at start_ceiling; log {rule, "constrained_by_start_ceiling",
+              "advancing beyond start_ceiling would undo Rule B compensation"}.
+
+F_GUARD_S   Before moving start_time forward: if result makes (end_time − start_time) < 15s,
+              hold and log {rule, "constrained_by_F", "no valid boundary before 15s floor"}.
+
+F_GUARD_E   Before moving end_time later: if result makes (end_time − start_time) > 90s,
+              hold and log {rule, conflict_label, "90s cap reached"}.
+
+━━━ INPUTS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@@{clip_json}        — { start_time: float, end_time: float, text: string, speaker: string }
+                       text = ORIGINAL BASELINE. Used ONLY for Rule E(a) word-rate. Never use
+                       to evaluate words beyond end_time; use transcript_context instead.
+
+@@{transcript_context} — Array of { word: string, start: float, end: float, speaker: string }
+                         ~±30s around clip boundaries. ONLY authoritative source for words
+                         and timestamps outside clip boundaries.
+
+━━━ INPUT VALIDATION  (run before any rule) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. start_time ≥ end_time → return immediately:
+   { prompt_version: "@@{prompt_version}", start_time, end_time, duration_seconds: 0,
+     applied_rules: [], rejected_rules: [{rule:"INPUT", conflict:"invalid_clip",
+     reason:"start_time >= end_time; cannot process"}],
+     refinement_reason: "Clip has zero or negative duration.", confidence: 0.0 }
+
+2. clip_json.text null or empty → skip Rule E(a) (uncomputable baseline). Continue.
+
+3. (clip_json.end_time − clip_json.start_time) < 3s → skip Rule E(a) (unreliable baseline). Continue.
+
+━━━ DEGRADED MODE  (evaluate before rules) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+START BOUNDARY DEGRADED if PRE_WORDS  < 5 words.
+END BOUNDARY   DEGRADED if POST_WORDS < 5 words.
+
+  Mode                 Skip                   Apply           Conf cap   refinement_reason tag
+  ─────────────────────────────────────────────────────────────────────────────────────────────
+  FULLY DEGRADED       C, D, E, A-Step-A1     A(cases),B,F,G  ≤ 0.3      "degraded_mode: both_boundaries"
+  PARTIAL — start      C, D, E start window   A,B,E(end),F,G  ≤ 0.5      "degraded_mode: start_boundary"
+  PARTIAL — end        A entirely             C,D,E(start),F,G ≤ 0.5     "degraded_mode: end_boundary"
+  NOT DEGRADED         —                      all             unlimited   —
+
+━━━ PRIORITY & EXECUTION ORDER ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PRIORITY (conflict resolution, highest→lowest): F › A › B › C › D › E
+EXECUTION ORDER (run sequence):  A → B → C → D → E → F (enforcement gate)
+Rule F is highest priority but runs last — it gates all prior decisions, not filters first.
+
+━━━ STATE TRACKING  (internal only; never output) ━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+pre_C_start_time  = start_time snapshot taken immediately BEFORE Rule C runs. (Rule F rollback)
+pre_D_start_time  = start_time snapshot taken immediately BEFORE Rule D runs. (Rule F rollback)
+start_ceiling     = null initially. Set to start_time snapshot (before any change) IF AND ONLY IF
+                    Rule B must advance start_time forward as compensation for exceeding 90s.
+                    Once set: C and D may move start_time forward freely but NEVER past start_ceiling.
+                    If Rule B extends end_time without compensation → start_ceiling stays null.
+
+━━━ RULES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+── RULE A — PUNCHLINE INTEGRITY  [Priority 2] ──────────────────────────────────
+
+Evaluate POST_WORDS (words with "start" > end_time).
+
+STEP A-1 — NEVER-CUT CONDITIONS  (skip if END BOUNDARY is DEGRADED)
+  Is end_time mid-sentence? True when no TERMINATOR exists between CLW and the first word of
+  POST_WORDS (i.e., the in-progress sentence continues into POST_WORDS).
+  If mid-sentence, find the first TERMINATOR in POST_WORDS. If it satisfies any of:
+    (a) "?" — rhetorical question
+    (b) "!" — exclamation
+    (c) The word immediately before it is fully CAPITALIZED
+  → Extend end_time to that TERMINATOR's "end" timestamp regardless of word count.
+    Note which condition (a/b/c) triggered in refinement_reason.
+
+STEP A-2 — CASE EVALUATION
+  If POST_WORDS empty → Case 3.
+  Case 1: first TERMINATOR in POST_WORDS is the 1st–4th word in POST_WORDS
+          → extend end_time to that TERMINATOR's "end".
+  Case 2: first TERMINATOR in POST_WORDS is 5th word or later → no extension; proceed.
+  Case 3: no TERMINATOR in POST_WORDS (or POST_WORDS empty)
+          → extend end_time to "end" of last word in POST_WORDS.
+          If POST_WORDS empty → leave end_time unchanged.
+          Always log {A, "no_terminator_in_context", "transcript ends without sentence terminator"}.
+
+Apply F_GUARD_E after any extension (conflict label: "blocked_by_F").
+
+── RULE B — SOCIAL CUES  [Priority 3] ──────────────────────────────────────────
+
+REACTION WINDOW: words with "start" ∈ (end_time, end_time+4s] (exclusive, inclusive).
+Tags to match (case-insensitive): [laughter] [applause] [cheering] (chuckles) (laughs) [crowd reacts]
+If none found → no action; proceed to Rule C.
+If found → extend end_time to "end" of LAST matching tag in window.
+
+  Result fits ≤ 90s:  apply extension; start_ceiling stays null.
+  Result exceeds 90s: set start_ceiling = current start_time; set start_time = new_end_time − 90s; apply both.
+  Both directions violate (new start would make duration < 15s):
+    → no change, no start_ceiling; log {B, "blocked_by_F", "both directions violate bounds"}.
+
+── RULE C — SETUP INTEGRITY  [Priority 4] ──────────────────────────────────────
+
+Save pre_C_start_time. Evaluate CFW. start_time is valid only when BOTH hold:
+  C1 (natural boundary): word before CFW in transcript_context is a TERMINATOR, OR gap > 0.5s.
+  C2 (no filler): CFW is not a FILLER WORD. For "you know": CFW + next word match → advance past both.
+If either fails → advance start_time to "start" of next word satisfying BOTH C1 and C2.
+Apply CEIL_GUARD then F_GUARD_S.
+
+── RULE D — HOOK STRENGTH  [Priority 5] ────────────────────────────────────────
+
+Save pre_D_start_time. Identify Word1 = CFW, Word2 = next word.
+
+STRONG OPENER — no change if ANY:
+  • Word1 is a STRONG VERB
+  • Word1 is a proper noun: capitalized AND the word before it is NOT a TERMINATOR
+  • Word1 is a standalone number (e.g. 37, $4M, 2019)
+  • Word1 or Word2 (alone or together) form a CONTRARIAN SIGNAL
+
+WEAK OPENER — if Word1+Word2 form a WEAK OPENER:
+  Scan remaining words in current sentence (before next TERMINATOR) for STRONG VERB or CONTRARIAN.
+  Dead-end (none found): log {D, "no_strong_opener_in_sentence", "full sentence is weak"}; no change.
+  Found: advance start_time to that word's "start".
+  Constraints: do not cross a TERMINATOR. Apply CEIL_GUARD then F_GUARD_S.
+
+── RULE E — EMOTIONAL PEAKS  [Priority 6] ──────────────────────────────────────
+
+Skip entirely if: clip_json.text empty/null, OR original duration < 3s, OR BOTH boundaries DEGRADED.
+PARTIAL DEGRADED: skip BOUNDARY WINDOW of the degraded side only; apply normally for healthy side.
+
+E(a) WORD DENSITY SPIKE
+  Baseline = (whitespace-split word count of clip_json.text) ÷ (clip_json.end_time − clip_json.start_time).
+  Always use clip_json ORIGINAL values; never recalculate from adjusted boundaries.
+  For each BOUNDARY WINDOW: local rate = (words in window) ÷ 6s.
+  SPIKE if local rate > baseline × 1.20 AND straddles the boundary.
+    Straddles start_time → move start_time EARLIER to "start" of first pre-boundary word in window.
+      Apply F_GUARD_E (conflict: "spike_blocked_by_F").
+    Straddles end_time → move end_time LATER to "end" of last post-boundary word in window.
+      Apply F_GUARD_E (conflict: "spike_blocked_by_F").
+
+E(b) EMPHASIS RUNS
+  Find in each BOUNDARY WINDOW: 2+ consecutive CAPITALIZED words, OR same word/phrase 2+ times
+  consecutively. Act only if run STRADDLES the boundary.
+    Straddles start_time → move start_time EARLIER to "start" of first word in run.
+      Apply F_GUARD_E (conflict: "emphasis_blocked_by_F").
+    Straddles end_time → move end_time LATER to "end" of last word in run.
+      Apply F_GUARD_E (conflict: "emphasis_blocked_by_F").
+
+E(c) SPEAKER TRANSITIONS
+  Speaker change within 2s of start_time or end_time:
+    → prefer boundary keeping clip within one speaker's turn.
+    Exception: second speaker delivers punchline/reaction → include; note in refinement_reason.
+    Multi-speaker (no single-speaker alignment possible): skip E(c); note "multi_speaker_clip".
+
+── RULE F — BOUNDARY CONSTRAINT  [Priority 1 — Applied Last] ───────────────────
+
+Final check: 15s ≤ (end_time − start_time) ≤ 90s. Overrides all other rules.
+
+TOO SHORT (< 15s) — relax in order, stop when ≥ 15s:
+  1. Restore start_time = pre_D_start_time.
+  2. Restore start_time = pre_C_start_time.
+  3. Set start_time = end_time − 15s; log {F, "hard_override", "duration < 15s after relaxing C and D"}.
+  Never relax Rule A or B.
+
+TOO LONG (> 90s):
+  Set start_time = end_time − 90s (sacrifice setup; never move end_time).
+  If start_time would ≥ end_time → set start_time = end_time − 15s;
+    log {F, "hard_override", "clip collapses at 90s; held at minimum 15s"}.
+
+If duration still outside [15s, 90s] after all adjustments:
+  log {F, "hard_override", "<reason>"} and return closest achievable values.
+
+── RULE G — NO-OP ──────────────────────────────────────────────────────────────
+
+If clip satisfies all applicable rules with zero changes → return original start_time and end_time.
+Set applied_rules: [], rejected_rules: [], confidence: 1.0.
+
+━━━ SELF-CHECK BEFORE OUTPUT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+□ 15s ≤ (end_time − start_time) ≤ 90s
+□ duration_seconds freshly computed as end_time − start_time
+□ applied_rules: only letters that caused a boundary change (a rule may appear here AND in
+  rejected_rules if it both changed a boundary and hit a constraint)
+□ rejected_rules: entry for every conflict, block, ceiling hit, or data limitation
+□ DEGRADED MODE label in refinement_reason if active
+□ confidence = LOWEST applicable anchor
+□ prompt_version present and equals "@@{prompt_version}"
+
+━━━ CONFIDENCE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Assign LOWEST anchor that applies.
+
+  1.0  Rule G (no-op): zero changes, full context both sides, zero conflicts
+  0.8  Boundary move ≤ 1s, no conflicts, ≥ 10 words beyond each boundary
+  0.7  Boundary move > 1s, no conflicts, ≥ 10 words beyond each boundary
+  0.6  ≥ 1 conflict resolved cleanly, ≥ 10 words each side
+  0.5  PARTIALLY DEGRADED (one boundary < 5 words)
+  0.4  Limited context (5–9 words beyond ≥ 1 boundary, not degraded) OR multiple clean conflicts
+  0.3  FULLY DEGRADED (both boundaries < 5 words) OR segment-level context only (no word timestamps)
+  0.2  Multiple unresolved conflicts, Rule F hard override, OR severely incomplete context both sides
+  0.0  Input validation failed; insufficient data
+
+━━━ OUTPUT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Return ONLY a raw JSON object. No markdown, no code fences, no preamble, no trailing text.
+Do not include internal state values (pre_C_start_time, pre_D_start_time, start_ceiling).
+
 {
-  "start_time": 12.5,
-  "end_time": 45.0,
-  "refinement_reason": "Moving start 3s earlier to capture the initial question setup and extending end by 2s to include final audience response."
+  "prompt_version": "@@{prompt_version}",
+  "start_time": float,
+  "end_time": float,
+  "duration_seconds": float,            // always computed fresh: end_time − start_time
+  "applied_rules": ["A", "C"],          // rules that CAUSED a boundary change; [] for no-op
+  "rejected_rules": [                   // every conflict/block/constraint; [] if none
+    { "rule": "string", "conflict": "string", "reason": "string" }
+  ],
+  "refinement_reason": "string",        // 1–3 sentences; cite timestamps and words per rule
+  "confidence": float
 }
+
+// applied_rules note: a rule may appear here AND in rejected_rules if it changed a boundary
+// AND hit a secondary constraint (e.g., Rule A extended end_time and was also capped by F).
+// refinement_reason example: "Extended end_time from 47.2s to 49.8s — rhetorical question
+// ending at 49.1s (Rule A, A-1a). Advanced start_time 12.0s→13.4s past 'I think' to 'built'
+// (Rule D). Duration 88.4s within Rule F."

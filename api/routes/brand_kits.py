@@ -10,10 +10,13 @@ Purpose: Implements brand kit CRUD endpoints:
 
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Header, Query
+from fastapi import APIRouter, HTTPException, Header, Query, UploadFile, File
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from api.models.brand_kit import (
     BrandKitCreate,
@@ -30,8 +33,17 @@ from db.repositories.brand_kits import (
     update_brand_kit,
     delete_brand_kit,
 )
+from services.document_parser import DocumentParserError, parse_brand_guide
+from services.storage import storage_service
 
 router = APIRouter(prefix="/brand-kits", tags=["brand-kits"])
+
+
+class BrandGuideParseResponse(BaseModel):
+    text: str
+    parser: str
+    ocr_used: bool
+    page_count: int
 
 
 def _get_user_id_from_headers(authorization: str | None) -> UUID:
@@ -160,6 +172,14 @@ def update_brand_kit_endpoint(
         update_fields = {k: v for k, v in payload.model_dump().items() if v is not None}
         
         updated_kit = update_brand_kit(brand_kit_id, **update_fields)
+        for field_name in ("watermark_url", "intro_clip_url", "outro_clip_url"):
+            if field_name in update_fields and getattr(brand_kit, field_name) and getattr(brand_kit, field_name) != update_fields[field_name]:
+                try:
+                    storage_service.purge_cached_asset(str(getattr(brand_kit, field_name)))
+                except Exception:
+                    # DECISION: cache purge should not fail the asset update because the
+                    # new source of truth is already persisted and stale edges self-heal.
+                    pass
         return BrandKitResponse(brand_kit=updated_kit)
     except ValueError as e:
         return error_response("update_error", str(e), 400)
@@ -212,6 +232,40 @@ def get_brand_kit_presets():
             for preset_id, preset in BRAND_KIT_PRESETS.items()
         ]
     }
+
+
+@router.post("/parse-guide", response_model=BrandGuideParseResponse, status_code=200)
+async def parse_brand_guide_endpoint(
+    file: UploadFile = File(...),
+    authorization: str | None = Header(None),
+) -> BrandGuideParseResponse:
+    try:
+        _get_user_id_from_headers(authorization)
+    except HTTPException as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e.detail)) from e
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="A brand guide file is required.")
+
+    suffix = Path(file.filename).suffix.lower()
+    if suffix not in {".pdf", ".png", ".jpg", ".jpeg", ".webp"}:
+        raise HTTPException(status_code=400, detail="Supported file types: PDF, PNG, JPG, JPEG, WEBP.")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_path = Path(tmpdir) / f"brand_guide{suffix}"
+        temp_path.write_bytes(await file.read())
+        await file.close()
+        try:
+            result = parse_brand_guide(temp_path)
+        except DocumentParserError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return BrandGuideParseResponse(
+        text=result.text,
+        parser=result.parser,
+        ocr_used=result.ocr_used,
+        page_count=result.page_count,
+    )
 
 
 @router.post("/presets/{preset_id}/apply", response_model=BrandKitResponse, status_code=201)

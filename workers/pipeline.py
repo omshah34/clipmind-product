@@ -31,11 +31,12 @@ from openai import APIConnectionError, APITimeoutError, RateLimitError
 
 from core.config import settings
 from db.repositories.brand_kits import get_brand_kit
-from db.repositories.jobs import get_job, update_job
+from db.repositories.jobs import get_job, update_job, complete_job_atomic
 from services.brand_kit_renderer import brand_kit_to_subtitle_style
 from services.caption_renderer import write_clip_srt, write_clip_ass
 from services.clip_detector import get_clip_detector_service
 from services.event_emitter import emit_job_completed, emit_clips_generated
+from services.render_recipe import build_render_recipe
 from services.storage import storage_service
 from services.transcription import get_transcription_service
 from services.video_processor import (
@@ -101,6 +102,15 @@ def process_job(self, job_id: str) -> list[dict]:
     if job is None:
         logger.warning("Job %s not found in DB; ignoring task.", job_id)
         raise Ignore()
+        
+    # Gap 201: Prevent race condition if user cancels exactly as worker starts
+    if job.status == "completed":
+        logger.info("Job %s is already completed; ignoring duplicate task.", job_id)
+        raise Ignore()
+
+    if job.status in ["cancelled", "failed"]:
+        logger.warning("Job %s is already %s; ignoring task.", job_id, job.status)
+        raise Ignore()
 
     current_stage = "queued"
     actual_cost = float(job.actual_cost_usd)
@@ -110,6 +120,7 @@ def process_job(self, job_id: str) -> list[dict]:
     subject_tracker = get_subject_tracker()
     export_engine = get_export_engine()
     discovery_service = get_discovery_service()
+    subject_tracking_enabled = bool(getattr(subject_tracker, "enabled", True))
 
     # Temp dir created here so both success and failure paths can clean it up.
     temp_dir = Path(tempfile.mkdtemp(prefix=f"clipmind_{job.id}_"))
@@ -142,12 +153,23 @@ def process_job(self, job_id: str) -> list[dict]:
                 current_stage = "generating_proxy"
                 with _stage_timer(job_id, current_stage):
                     update_job(job.id, status=current_stage)
-                    proxy_path = temp_dir / f"{job.id}_proxy.mp4"
-                    from services.video_processor import generate_proxy_video
-                    generate_proxy_video(source_video_path, proxy_path)
-                    proxy_url = storage_service.upload_file(proxy_path, "proxies", f"{job.id}_proxy.mp4")
-                    update_job(job.id, proxy_video_url=proxy_url)
-                    logger.info("[job=%s] Preview proxy generated and uploaded", job_id)
+                    from services.video_processor import generate_proxy_video, get_video_dimensions
+
+                    source_width, source_height = get_video_dimensions(source_video_path)
+                    if source_width <= 1280 and source_height <= 720 and source_video_path.suffix.lower() in {".mp4", ".m4v", ".mov"}:
+                        update_job(job.id, proxy_video_url=job.source_video_url)
+                        logger.info(
+                            "[job=%s] Source is already proxy-friendly (%sx%s); reusing source video URL",
+                            job_id,
+                            source_width,
+                            source_height,
+                        )
+                    else:
+                        proxy_path = temp_dir / f"{job.id}_proxy.mp4"
+                        generate_proxy_video(source_video_path, proxy_path)
+                        proxy_url = storage_service.upload_file(proxy_path, "proxies", f"{job.id}_proxy.mp4")
+                        update_job(job.id, proxy_video_url=proxy_url)
+                        logger.info("[job=%s] Preview proxy generated and uploaded", job_id)
             except Exception as proxy_exc:
                 # Proxy is non-critical for pipeline success, just for UI smoothness
                 logger.warning("[job=%s] Proxy generation failed: %s", job_id, proxy_exc)
@@ -158,59 +180,81 @@ def process_job(self, job_id: str) -> list[dict]:
         is_audio_only = source_video_path.suffix.lower() in [".mp3", ".wav", ".m4a"]
         audio_path = temp_dir / f"{job.id}.mp3"
 
-        if is_audio_only:
-            logger.info("[job=%s] Source is audio-only. Skipping extraction.", job_id)
-            shutil.copy(source_video_path, audio_path)
-        else:
-            current_stage = "extracting_audio"
-            emit_stage(job_id, current_stage, progress=20)
-            with _stage_timer(job_id, current_stage):
-                update_job(job.id, status=current_stage)
+        if isinstance(job.transcript_json, dict) and job.transcript_json.get("segments"):
+            transcript_json = job.transcript_json
+            current_stage = "transcribing"
+            emit_stage(job_id, current_stage, progress=50, reused=True)
+            update_job(job.id, status=current_stage)
+            logger.info("[job=%s] Reusing existing transcript; skipping audio extraction/transcription", job_id)
+            if job.audio_url:
+                try:
+                    storage_service.download_to_local(job.audio_url, audio_path)
+                except Exception as audio_exc:
+                    logger.warning("[job=%s] Existing audio download failed: %s. Re-extracting audio.", job_id, audio_exc)
+                    if is_audio_only:
+                        shutil.copy(source_video_path, audio_path)
+                    else:
+                        extract_audio(source_video_path, audio_path)
+            elif is_audio_only:
+                shutil.copy(source_video_path, audio_path)
+            else:
                 extract_audio(source_video_path, audio_path)
                 audio_url = storage_service.upload_file(audio_path, "audio", f"{job.id}.mp3")
                 update_job(job.id, audio_url=audio_url)
-                emit_progress(job_id, current_stage, progress=30)
+        else:
+            if is_audio_only:
+                logger.info("[job=%s] Source is audio-only. Skipping extraction.", job_id)
+                shutil.copy(source_video_path, audio_path)
+            else:
+                current_stage = "extracting_audio"
+                emit_stage(job_id, current_stage, progress=20)
+                with _stage_timer(job_id, current_stage):
+                    update_job(job.id, status=current_stage)
+                    extract_audio(source_video_path, audio_path)
+                    audio_url = storage_service.upload_file(audio_path, "audio", f"{job.id}.mp3")
+                    update_job(job.id, audio_url=audio_url)
+                    emit_progress(job_id, current_stage, progress=30)
 
-        # ------------------------------------------------------------------ #
-        # 3. Transcribe
-        # ------------------------------------------------------------------ #
-        current_stage = "transcribing"
-        emit_stage(job_id, current_stage, progress=35)
-        with _stage_timer(job_id, current_stage):
-            update_job(job.id, status=current_stage)
-            
-            # Gap 72: Fetch vocabulary hints from brand kit if available
-            vocab_hints = None
-            if job.brand_kit_id:
-                brand_kit = get_brand_kit(job.brand_kit_id)
-                if brand_kit and brand_kit.vocabulary_hints:
-                    vocab_hints = brand_kit.vocabulary_hints
-                    logger.info("[job=%s] Using %d vocabulary hints for transcription", job_id, len(vocab_hints))
+            # ------------------------------------------------------------------ #
+            # 3. Transcribe
+            # ------------------------------------------------------------------ #
+            current_stage = "transcribing"
+            emit_stage(job_id, current_stage, progress=35)
+            with _stage_timer(job_id, current_stage):
+                update_job(job.id, status=current_stage)
+                
+                # Gap 72: Fetch vocabulary hints from brand kit if available
+                vocab_hints = None
+                if job.brand_kit_id:
+                    brand_kit = get_brand_kit(job.brand_kit_id)
+                    if brand_kit and brand_kit.vocabulary_hints:
+                        vocab_hints = brand_kit.vocabulary_hints
+                        logger.info("[job=%s] Using %d vocabulary hints for transcription", job_id, len(vocab_hints))
 
-            transcript_json, transcription_cost = transcription_service.transcribe_audio(
-                audio_path,
-                language=job.language,
-                vocabulary_hints=vocab_hints
-            )
-            actual_cost += transcription_cost
-            word_count = sum(len(s.get("words", [])) for s in transcript_json.get("segments", []))
-            update_job(
-                job.id,
-                transcript_json=transcript_json,
-                actual_cost_usd=round(actual_cost, 6),
-            )
-            emit_progress(job_id, current_stage, progress=50, words=word_count)
-            
-            # -- AI Semantic Discovery Indexing (Phase 3) --
-            try:
-                with _stage_timer(job_id, "indexing_semantics"):
-                    # This is non-blocking in Phase 3 for MVP
-                    # (In-memory/local-index is fast)
-                    import asyncio
-                    asyncio.run(discovery_service.add_job_to_index(job.id, transcript_json))
-                    logger.info("[job=%s] Job indexed for AI semantic discovery", job_id)
-            except Exception as idx_exc:
-                logger.warning("[job=%s] Semantic indexing failed: %s", job_id, idx_exc)
+                transcript_json, transcription_cost = transcription_service.transcribe_audio(
+                    audio_path,
+                    language=job.language,
+                    vocabulary_hints=vocab_hints
+                )
+                actual_cost += transcription_cost
+                word_count = sum(len(s.get("words", [])) for s in transcript_json.get("segments", []))
+                update_job(
+                    job.id,
+                    transcript_json=transcript_json,
+                    actual_cost_usd=round(actual_cost, 6),
+                )
+                emit_progress(job_id, current_stage, progress=50, words=word_count)
+                
+                # -- AI Semantic Discovery Indexing (Phase 3) --
+                try:
+                    with _stage_timer(job_id, "indexing_semantics"):
+                        # This is non-blocking in Phase 3 for MVP
+                        # (In-memory/local-index is fast)
+                        import asyncio
+                        asyncio.run(discovery_service.add_job_to_index(job.id, transcript_json))
+                        logger.info("[job=%s] Job indexed for AI semantic discovery", job_id)
+                except Exception as idx_exc:
+                    logger.warning("[job=%s] Semantic indexing failed: %s", job_id, idx_exc)
 
         # ------------------------------------------------------------------ #
         # 4. Detect clips
@@ -237,12 +281,10 @@ def process_job(self, job_id: str) -> list[dict]:
 
         if not detected_clips:
             logger.info("[job=%s] No clips detected; marking completed.", job_id)
-            update_job(
+            complete_job_atomic(
                 job.id,
-                status="completed",
-                clips_json=[],
-                actual_cost_usd=round(actual_cost, 6),
-                completed_at=datetime.now(timezone.utc),
+                clips=[],
+                actual_cost=actual_cost,
             )
             emit_completed(job_id, 0, 0.0, time.monotonic() - pipeline_start)
             return []
@@ -315,32 +357,26 @@ def process_job(self, job_id: str) -> list[dict]:
                                 job_id, brand_kit.name
                             )
                     
-                    subject_centers = [None]
-                    layout_type = clip.get("layout_suggestion", "vertical")
+                    subject_centers: list[float] = []
+                    detected_face_count = 0
+                    primary_face_area_ratio: float | None = None
                     
-                    try:
-                        with _stage_timer(job_id, current_stage):
-                            update_job(job.id, status="reframing")
-                            
-                            # If LLM suggested split_screen OR it's not specified, try to find 2 faces
-                            target_face_count = 2 if layout_type in ["split_screen", None] else 1
-                            
-                            subject_centers = subject_tracker.get_optimal_centers(
-                                raw_clip_path, 
-                                count=target_face_count
-                            )
-                            
-                            # Heuristic: If we found 2 distinct faces and LLM didn't explicitly say "vertical", use split_screen
-                            if len(subject_centers) >= 2 and layout_type != "vertical":
-                                layout_type = "split_screen"
-                                logger.info("[job=%s] Multiple subjects detected; using split_screen layout", job_id)
-                            elif layout_type == "split_screen" and len(subject_centers) < 2:
-                                logger.warning("[job=%s] Split-screen suggested but only 1 face detected. Falling back to vertical.", job_id)
-                                layout_type = "vertical"
-                                subject_centers = subject_centers[:1]
-                    except Exception as exc:
-                        logger.warning("[job=%s] Subject tracking failed for clip %d: %s. Falling back to center-crop.", job_id, clip_index, exc)
-                        subject_centers = [None]
+                    if subject_tracking_enabled:
+                        try:
+                            with _stage_timer(job_id, current_stage):
+                                update_job(job.id, status="reframing")
+
+                                tracking = subject_tracker.analyze_subjects(raw_clip_path, count=2)
+                                detected_face_count = tracking.detected_face_count
+                                primary_face_area_ratio = tracking.primary_face_area_ratio
+                                subject_centers = list(tracking.centers[:detected_face_count]) if detected_face_count > 0 else []
+                        except Exception as exc:
+                            logger.info("[job=%s] Subject tracking skipped for clip %d: %s. Using center-crop.", job_id, clip_index, exc)
+                            subject_centers = []
+                            detected_face_count = 0
+                            primary_face_area_ratio = None
+                    else:
+                        logger.debug("[job=%s] Subject tracking disabled for clip %d; using center-crop.", job_id, clip_index)
 
                     # -- Render Captions & Watermark ---------------------------
                     try:
@@ -357,18 +393,8 @@ def process_job(self, job_id: str) -> list[dict]:
                                 )
                                 logger.info("[job=%s] Detected %d transients for clip %d", job_id, len(transients), clip_index)
                         except Exception as sync_exc:
-                            logger.warning("[job=%s] Audio sync failed: %s. Using default timing.", job_id, sync_exc)
+                            logger.info("[job=%s] Audio sync unavailable for clip %d: %s. Using default timing.", job_id, clip_index, sync_exc)
 
-                        # Generate the ASS file before rendering
-                        write_clip_ass(
-                            job.transcript_json,
-                            clip_start_time=float(clip["start_time"]),
-                            clip_end_time=float(clip["end_time"]),
-                            output_path=ass_path,
-                            preset_name="hormozi",
-                            transients=transients
-                        )
-                        
                         # Gap 107: Also generate a sidecar SRT for the user
                         write_clip_srt(
                             job.transcript_json,
@@ -397,7 +423,8 @@ def process_job(self, job_id: str) -> list[dict]:
                             with _stage_timer(job_id, "generating_social_pulse"):
                                 update_job(job.id, status="generating_metadata")
                                 # Use engine to get viral headlines/caption
-                                pulse = yield from export_engine.generate_social_pulse(clip).__await__()
+                                import asyncio as _asyncio
+                                pulse = _asyncio.run(export_engine.generate_social_pulse(clip))
                                 headline = pulse.get("headlines", [None])[0]
                                 logger.info("[job=%s] Generated headline for clip %d: %s", job_id, clip_index, headline)
                                 # We can also enrich the clip object here
@@ -407,51 +434,73 @@ def process_job(self, job_id: str) -> list[dict]:
                         except Exception as pulse_exc:
                             logger.warning("[job=%s] Social pulse generation failed: %s", job_id, pulse_exc)
 
+                        render_recipe = build_render_recipe(
+                            clip,
+                            transcript_json=job.transcript_json,
+                            clip_start_time=float(clip["start_time"]),
+                            clip_end_time=float(clip["end_time"]),
+                            subject_centers=subject_centers,
+                            detected_face_count=detected_face_count,
+                            primary_face_area_ratio=primary_face_area_ratio,
+                            social_pulse_headline=headline,
+                            watermark_enabled=bool(watermark_path),
+                        )
+                        clip["layout_type"] = render_recipe["layout_type"]
+                        clip["visual_mode"] = render_recipe["visual_mode"]
+                        clip["selected_hook"] = render_recipe["selected_hook"]
+                        clip["render_recipe"] = render_recipe
+
+                        layout_type = render_recipe["layout_type"]
+                        write_clip_ass(
+                            job.transcript_json,
+                            clip_start_time=float(clip["start_time"]),
+                            clip_end_time=float(clip["end_time"]),
+                            output_path=ass_path,
+                            preset_name=str(render_recipe.get("caption_preset") or "hormozi"),
+                            transients=transients,
+                            layout_type=layout_type,
+                        )
                         render_vertical_captioned_clip(
                             raw_clip_path, ass_path, final_clip_path,
                             style=subtitle_style,
                             subject_centers=subject_centers,
                             layout_type=layout_type,
                             watermark_path=watermark_path,
-                            headline=headline
+                            headline=render_recipe["selected_hook"],
+                            screen_focus=render_recipe["screen_focus"],
+                            audio_profile=render_recipe["audio_profile"],
+                            render_recipe=render_recipe,
                         )
                         # -- B-Roll Pulse Cutaway Injection (Phase 3) --
-                        try:
-                            # 1. Identify visual keywords from the clip reason/headlines
-                            keywords = clip.get("hook_headlines", []) + [clip.get("reason", "")]
-                            # 2. Search for related B-roll
-                            broll_meta = yield from VisualEngine.find_contextual_broll(keywords).__await__()
-                            
-                            if broll_meta:
-                                with _stage_timer(job_id, "applying_broll"):
-                                    update_job(job.id, status="applying_broll")
-                                    # Download B-roll (using simple download for MVP)
-                                    broll_specs = []
-                                    for i, b in enumerate(broll_meta):
-                                        b_local = temp_dir / f"broll_{clip_index}_{i}.mp4"
-                                        storage_service.download_to_local(b["url"], b_local)
-                                        # Distribute B-roll across the clip duration
-                                        clip_duration = float(clip["end_time"]) - float(clip["start_time"])
-                                        target_start = (clip_duration / (len(broll_meta) + 1)) * (i + 1)
-                                        broll_specs.append({
-                                            "path": b_local,
-                                            "start": target_start,
-                                            "duration": min(3.0, clip_duration / 4) # Short punchy cutaways
-                                        })
+                        if settings.enable_contextual_broll:
+                            try:
+                                keywords = clip.get("hook_headlines", []) + [clip.get("reason", "")]
+                                import asyncio as _asyncio
+                                broll_meta = _asyncio.run(VisualEngine.find_contextual_broll(keywords))
+
+                                if broll_meta:
+                                    with _stage_timer(job_id, "applying_broll"):
+                                        update_job(job.id, status="applying_broll")
+                                        broll_specs = []
+                                        for i, b in enumerate(broll_meta):
+                                            b_local = temp_dir / f"broll_{clip_index}_{i}.mp4"
+                                            storage_service.download_to_local(b["url"], b_local)
+                                            clip_duration = float(clip["end_time"]) - float(clip["start_time"])
+                                            target_start = (clip_duration / (len(broll_meta) + 1)) * (i + 1)
+                                            broll_specs.append({
+                                                "path": b_local,
+                                                "start": target_start,
+                                                "duration": min(3.0, clip_duration / 4),
+                                            })
+
+                                        broll_output = temp_dir / f"clip_{clip_index}_brolled.mp4"
+                                        from services.video_processor import apply_broll_cutaways
+                                        apply_broll_cutaways(final_clip_path, broll_specs, broll_output)
+                                        shutil.copy2(broll_output, final_clip_path)
+                                        logger.info("[job=%s] Applied %d B-roll cutaways to clip %d", job_id, len(broll_specs), clip_index)
                                     
-                                    # Apply cutaways to the final rendered clip
-                                    broll_output = temp_dir / f"clip_{clip_index}_brolled.mp4"
-                                    # Note: We apply b-roll AFTER captioning to ensure captions stay visible 
-                                    # OR before to burn captions over b-roll. 
-                                    # Strategy: Full cutaway means we might want captions OVER b-roll.
-                                    # For Phase 3, we'll apply it to the captioned output.
-                                    from services.video_processor import apply_broll_cutaways
-                                    apply_broll_cutaways(final_clip_path, broll_specs, broll_output)
-                                    shutil.copy2(broll_output, final_clip_path)
-                                    logger.info("[job=%s] Applied %d B-roll cutaways to clip %d", job_id, len(broll_specs), clip_index)
-                                    
-                        except Exception as broll_exc:
-                            logger.warning("[job=%s] B-Roll injection failed for clip %d: %s", job_id, clip_index, broll_exc)
+                            except Exception as broll_exc:
+                                logger.info("[job=%s] B-Roll injection skipped for clip %d: %s", job_id, clip_index, broll_exc)
 
                     except Exception as render_exc:
                         logger.warning(
@@ -542,14 +591,10 @@ def process_job(self, job_id: str) -> list[dict]:
                 job_id, len(final_clips), len(detected_clips), skipped_clip_indices,
             )
 
-        update_job(
+        complete_job_atomic(
             job.id,
-            status="completed",
-            clips_json=final_clips,
-            actual_cost_usd=round(actual_cost, 6),
-            failed_stage=None,
-            error_message=None,
-            completed_at=datetime.now(timezone.utc),
+            clips=final_clips,
+            actual_cost=actual_cost,
         )
         processing_time = time.monotonic() - pipeline_start
         best_score = max((float(c.get("final_score", 0)) for c in final_clips), default=0.0)

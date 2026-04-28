@@ -9,7 +9,7 @@ from __future__ import annotations
 from uuid import UUID
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
@@ -17,14 +17,18 @@ from api.models.job import (
     ClipSummary,
     ErrorResponse,
     JobClipsResponse,
+    JobListItem,
+    JobListResponse,
     JobRecord,
     JobStatusResponse,
     JobRejectionResponse,
     ClipSearchResponse,
 )
-from db.repositories.jobs import get_job, update_job
+from db.repositories.jobs import get_job, list_jobs_for_user, update_job
 from db.connection import engine
 from services.discovery import get_discovery_service
+from api.dependencies import get_current_user, AuthenticatedUser
+from core.config import settings
 
 
 # Gap 71: Machine-readable error code registry
@@ -40,6 +44,21 @@ ERROR_CODES = {
 
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
+
+
+@router.get("", response_model=JobListResponse, status_code=200)
+def list_jobs(
+    user: AuthenticatedUser = Depends(get_current_user),
+    limit: int = 20,
+    offset: int = 0,
+) -> JobListResponse:
+    jobs, total = list_jobs_for_user(user.user_id, limit=limit, offset=offset)
+    return JobListResponse(
+        jobs=[JobListItem.model_validate(job) for job in jobs],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 def build_clip_summaries(job: JobRecord) -> list[ClipSummary] | None:
@@ -65,8 +84,11 @@ def error_response(error: str, message: str, status_code: int) -> JSONResponse:
 
 
 @router.get("/{job_id}/status", response_model=JobStatusResponse, status_code=200)
-def get_job_status(job_id: str) -> JobStatusResponse:
-    job = get_job(job_id)
+def get_job_status(
+    job_id: str,
+    user: AuthenticatedUser = Depends(get_current_user)
+) -> JobStatusResponse:
+    job = get_job(job_id, user_id=user.user_id)
     if job is None:
         return error_response("job_not_found", "No job found for the provided id.", 404)
 
@@ -80,8 +102,11 @@ def get_job_status(job_id: str) -> JobStatusResponse:
 
 
 @router.get("/{job_id}/clips", response_model=JobClipsResponse, status_code=200)
-def get_job_clips(job_id: str) -> JobClipsResponse:
-    job = get_job(job_id)
+def get_job_clips(
+    job_id: str,
+    user: AuthenticatedUser = Depends(get_current_user)
+) -> JobClipsResponse:
+    job = get_job(job_id, user_id=user.user_id)
     if job is None:
         return error_response("job_not_found", "No job found for the provided id.", 404)
     if job.status != "completed":
@@ -95,7 +120,10 @@ def get_job_clips(job_id: str) -> JobClipsResponse:
 
 
 @router.post("/{job_id}/reject", status_code=200)
-def reject_job(job_id: str) -> dict:
+def reject_job(
+    job_id: str,
+    user: AuthenticatedUser = Depends(get_current_user)
+) -> dict:
     """Mark a job as rejected if within the 5-minute window after completion.
     
     Gap 82: Entire operation (update + audit log) runs inside a single transaction.
@@ -103,7 +131,7 @@ def reject_job(job_id: str) -> dict:
     import logging
     _logger = logging.getLogger(__name__)
 
-    job = get_job(job_id)
+    job = get_job(job_id, user_id=user.user_id)
     if job is None:
         raise HTTPException(status_code=404, detail={"error": "job_not_found", "code": ERROR_CODES["job_not_found"]})
     
@@ -181,7 +209,10 @@ async def semantic_search_clips(q: str, limit: int = 5) -> dict:
 
 
 @router.delete("/{job_id}", status_code=200)
-async def delete_job_endpoint(job_id: str):
+async def delete_job_endpoint(
+    job_id: str,
+    user: AuthenticatedUser = Depends(get_current_user)
+):
     """Delete a job and its associated storage files (Gap 27).
     
     Order of operations:
@@ -193,7 +224,7 @@ async def delete_job_endpoint(job_id: str):
     logger = logging.getLogger(__name__)
     
     # 1. Fetch job to get file URLs before deletion
-    job = get_job(job_id)
+    job = get_job(job_id, user_id=user.user_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -218,6 +249,14 @@ async def delete_job_endpoint(job_id: str):
     
     if not success:
         raise HTTPException(status_code=500, detail="Failed to delete job record")
+        
+    # Gap 198: Clear stale vector indices to prevent ghost results
+    try:
+        from services.discovery import get_discovery_service
+        discovery = get_discovery_service()
+        await discovery.remove_job_from_index(job_id)
+    except Exception as exc:
+        logger.error(f"Failed to clear semantic vectors for deleted job {job_id}: {exc}")
 
     # 3. Clean up storage files (Best effort, individual try-except)
     from services.storage import storage_service
@@ -232,8 +271,31 @@ async def delete_job_endpoint(job_id: str):
             # but we log the orphan for manual cleanup if needed.
             logger.error(f"Orphaned file after job delete: {url} — {exc}")
 
+    # Best-effort sweep for derived artifacts that may not be referenced
+    # directly in the job row anymore.
+    cleanup_roots = [
+        settings.local_storage_dir / "clips",
+        settings.local_storage_dir / "exports",
+        settings.local_storage_dir / "audio",
+        settings.local_storage_dir / "sources",
+        settings.temp_dir,
+    ]
+    orphaned_count = 0
+    for root in cleanup_roots:
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            if job_id in path.name or job_id in path.as_posix():
+                try:
+                    path.unlink()
+                    orphaned_count += 1
+                except Exception as exc:
+                    logger.error(f"Failed to delete orphaned artifact {path}: {exc}")
+
     return {
         "status": "success",
-        "message": f"Job {job_id} and {deleted_count}/{len(files_to_delete)} associated files deleted.",
+        "message": f"Job {job_id} and {deleted_count}/{len(files_to_delete)} referenced files deleted; {orphaned_count} orphaned artifacts removed.",
         "job_id": job_id
     }

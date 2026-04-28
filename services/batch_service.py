@@ -51,22 +51,30 @@ class BatchService:
         zip_path = Path(settings.local_storage_dir) / "exports" / zip_name
         zip_path.parent.mkdir(parents=True, exist_ok=True)
 
+        import re
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             for job_id in job_ids:
+                # Security: Strict regex for job_id to prevent traversal
+                if not re.match(r"^[a-f0-9\-]{8,36}$", job_id):
+                    logger.warning("Skipping invalid job_id in batch zip: %s", job_id)
+                    continue
+
                 job = get_job(job_id)
                 if not job or not job.clips_json:
                     continue
                 
                 # Add clips
                 for clip in job.clips_json:
-                    # Resolve local path from URI (file://...)
                     clip_url = clip.get("clip_url")
                     if clip_url and clip_url.startswith("file://"):
                         from urllib.parse import urlparse, unquote
                         p = Path(unquote(urlparse(clip_url).path).lstrip("/"))
-                        if p.exists():
-                            # Path in ZIP: job_id/clip_index.mp4
-                            arc_name = f"{job_id[:8]}/clip_{clip.get('clip_index')}.mp4"
+                        if p.exists() and p.is_file():
+                            # Path in ZIP: {job_prefix}/clip_{index}.mp4
+                            # basename ensures no internal traversal from clip_index or filenames
+                            safe_job_prefix = re.sub(r'[^a-zA-Z0-9]', '', job_id[:8])
+                            clip_idx = str(clip.get('clip_index', '0'))
+                            arc_name = f"{safe_job_prefix}/clip_{clip_idx}.mp4"
                             zip_file.write(p, arc_name)
                 
                 # Add a README with captions/hashtags if available

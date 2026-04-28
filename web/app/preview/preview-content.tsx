@@ -10,6 +10,7 @@
 import { useState, useEffect, useRef } from "react";
 import { useSearchParams } from "next/navigation";
 import { useAuth } from "@/components/auth-provider";
+import { API_BASE_URL } from "@/lib/api";
 
 interface RenderJob {
   render_job_id: string;
@@ -81,6 +82,8 @@ export default function PreviewContent() {
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const shouldReconnectRef = useRef(true);
 
   // Fetch initial preview data
   useEffect(() => {
@@ -183,48 +186,65 @@ export default function PreviewContent() {
   // Fetch render job status and handle WebSocket streaming
   useEffect(() => {
     if (!renderJob?.render_job_id || !user) return;
-    
-    let ws: WebSocket;
-    
+    shouldReconnectRef.current = true;
+
+    let ws: WebSocket | null = null;
+
+    const clearReconnectTimer = () => {
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+    };
+
     const connectWebsocket = () => {
-        // Upgrade connection to WSS based on current origin
-        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const wsUrl = `${protocol}//${window.location.host}/ws/jobs/${user.id}`;
-        
-        ws = new WebSocket(wsUrl);
-        
-        ws.onmessage = (event) => {
-            try {
-                const data = JSON.parse(event.data);
-                // Listen for render_job events directed at this ID
-                if (data.render_job_id === renderJob.render_job_id) {
-                    setRenderJob(data);
-                    
-                    if (data.status === "completed" || data.status === "failed") {
-                        setIsRendering(false);
-                        if (data.status === "completed" && data.output_url) {
-                            setClipUrl(data.output_url);
-                        }
-                    }
-                }
-            } catch (err) {
-                console.error("Format error from WebSocket", err);
+      clearReconnectTimer();
+      const wsBase = API_BASE_URL.replace(/^http/, "ws");
+      const wsUrl = `${wsBase}/preview/render-jobs/${renderJob.render_job_id}/ws`;
+
+      ws = new WebSocket(wsUrl);
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.render_job_id === renderJob.render_job_id) {
+            setRenderJob(data);
+
+            if (data.status === "completed" || data.status === "failed") {
+              shouldReconnectRef.current = false;
+              clearReconnectTimer();
+              setIsRendering(false);
+              if (data.status === "completed" && data.output_url) {
+                setClipUrl(data.output_url);
+              }
             }
-        };
-        
-        ws.onclose = () => {
-            // Primitive Reconnect strategy if rendering isn't done
-            setTimeout(connectWebsocket, 3000);
-        };
+          }
+        } catch (err) {
+          console.error("Format error from WebSocket", err);
+        }
+      };
+
+      ws.onclose = () => {
+        if (!shouldReconnectRef.current) return;
+        if (renderJob.status === "completed" || renderJob.status === "failed") return;
+        clearReconnectTimer();
+        reconnectTimerRef.current = setTimeout(connectWebsocket, 3000);
+      };
+
+      ws.onerror = () => {
+        ws?.close();
+      };
     };
     
     connectWebsocket();
 
     return () => {
-        if (ws) {
-            ws.onclose = null; // Prevent reconnect Loop when unmounting
-            ws.close();
-        }
+      shouldReconnectRef.current = false;
+      clearReconnectTimer();
+      if (ws) {
+        ws.onclose = null; // Prevent reconnect loop when unmounting
+        ws.close();
+      }
     };
   }, [renderJob?.render_job_id, user]);
 

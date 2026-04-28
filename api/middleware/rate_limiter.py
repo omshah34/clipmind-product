@@ -9,10 +9,10 @@ import asyncio
 from typing import Callable, Awaitable
 from fastapi import Request, Response, status
 from fastapi.responses import JSONResponse
+from redis.exceptions import NoScriptError
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from core.config import settings
-from workers.celery_app import celery_app # Reusing redis connection from celery app if possible, or separate
 
 logger = logging.getLogger(__name__)
 
@@ -69,16 +69,31 @@ class SlidingWindowRateLimiter(BaseHTTPMiddleware):
         self._lock = asyncio.Lock()
 
     async def get_redis(self):
-        if not self.redis:
-            async with self._lock:
-                if not self.redis:
-                    import redis.asyncio as redis
-                    self.redis = redis.from_url(settings.redis_url)
-                    # Register LUA script
-                    sha = await self.redis.script_load(LUA_SLIDING_WINDOW)
-                    if not sha:
-                        raise ValueError("Failed to load rate limiter LUA script")
-                    self._lua_sha = sha
+        if self.redis and self._lua_sha:
+            return self.redis
+
+        async with self._lock:
+            if self.redis and self._lua_sha:
+                return self.redis
+
+            import redis.asyncio as redis
+
+            client = self.redis or redis.from_url(settings.redis_url)
+            try:
+                sha = await client.script_load(LUA_SLIDING_WINDOW)
+                if not sha:
+                    raise ValueError("Failed to load rate limiter LUA script")
+            except Exception:
+                try:
+                    await client.aclose()
+                except Exception:
+                    logger.debug("Failed to close rate limiter Redis client after script load error.", exc_info=True)
+                self.redis = None
+                self._lua_sha = None
+                raise
+
+            self.redis = client
+            self._lua_sha = sha
         return self.redis
 
     async def close(self):
@@ -91,6 +106,9 @@ class SlidingWindowRateLimiter(BaseHTTPMiddleware):
     async def dispatch(
         self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
+        if not hasattr(request.app.state, "rate_limiter"):
+            request.app.state.rate_limiter = self
+
         # 1. Skip excluded paths
         if any(request.url.path.startswith(path) for path in self.exclude_paths):
             return await call_next(request)
@@ -133,7 +151,15 @@ class SlidingWindowRateLimiter(BaseHTTPMiddleware):
                 raise ValueError("Rate limiter LUA script SHA is missing")
                 
             # Execute atomic LUA script
-            result = await r.evalsha(self._lua_sha, 1, key, now_ms, self.window_ms, current_limit, self.ttl)
+            try:
+                result = await r.evalsha(self._lua_sha, 1, key, now_ms, self.window_ms, current_limit, self.ttl)
+            except NoScriptError:
+                logger.warning("Rate limiter LUA script evicted from Redis, reloading.")
+                self._lua_sha = None
+                r = await self.get_redis()
+                if not self._lua_sha:
+                    raise ValueError("Rate limiter LUA script SHA is missing after reload")
+                result = await r.evalsha(self._lua_sha, 1, key, now_ms, self.window_ms, current_limit, self.ttl)
             if result is None:
                 raise ValueError("Rate limiter LUA script returned None")
             count, allowed = result

@@ -110,10 +110,14 @@ export default function PerformancePage() {
             setIsSyncing(false);
           }
         }, 2000);
+      } else {
+        setSyncStatus("Sync request failed.");
+        setIsSyncing(false);
       }
     } catch (error) {
       console.error("Sync failed:", error);
-      setIsGenerating(false);
+      setSyncStatus("Sync failed.");
+      setIsSyncing(false);
     }
   };
 
@@ -180,7 +184,13 @@ export default function PerformancePage() {
   }
 
   // Decision: Empty State Logic (n<5 clips)
-  const isDataSparse = !data || data.total_clips < 5;
+  const totalClips = data?.total_clips ?? 0;
+  const totalViews = data?.total_views ?? 0;
+  const totalLikes = data?.total_likes ?? 0;
+  const avgEngagement = data?.avg_engagement ?? 0;
+  const topClips = Array.isArray(data?.top_clips) ? data.top_clips : [];
+  const isDataSparse = !data || totalClips < 5;
+  const latestJobId = data?.latest_job_id ?? null;
 
   return (
     <div className="page">
@@ -284,8 +294,12 @@ export default function PerformancePage() {
                 </div>
                 <button 
                   className="button"
-                  onClick={() => handleGenerateNewsletter(data.latest_job_id || "demo-job")}
-                  disabled={isGenerating}
+                  onClick={() => {
+                    if (latestJobId) {
+                      void handleGenerateNewsletter(latestJobId);
+                    }
+                  }}
+                  disabled={isGenerating || !latestJobId}
                 >
                   {isGenerating ? "Generating..." : "Generate Newsletter Draft"}
                 </button>
@@ -293,7 +307,7 @@ export default function PerformancePage() {
            </div>
 
            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 24 }}>
-              {(data.top_clips || []).map((clip: any, idx: number) => (
+              {topClips.map((clip: any, idx: number) => (
                 <div key={idx} className="panel" style={{ display: "flex", flexDirection: "column", gap: 16 }}>
                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                       <div style={{ fontSize: 12, fontWeight: 700, color: "var(--accent)" }}>CLIP {idx + 1}</div>
@@ -303,8 +317,12 @@ export default function PerformancePage() {
                    <button 
                     className="button" 
                     style={{ background: "rgba(255,255,255,0.1)", color: "var(--fg)", fontSize: 13 }}
-                    onClick={() => handleGenerateLinkedIn(idx, data.latest_job_id || "demo-job")}
-                    disabled={isGenerating}
+                    onClick={() => {
+                      if (latestJobId) {
+                        void handleGenerateLinkedIn(idx, latestJobId);
+                      }
+                    }}
+                    disabled={isGenerating || !latestJobId}
                    >
                      Transform to LinkedIn Post
                    </button>
@@ -357,13 +375,13 @@ export default function PerformancePage() {
                     <div style={{ display: "grid", gap: 20 }}>
                       <AttributeItem 
                           label="Hook Efficiency" 
-                          value={data.total_views > 0 ? "+12.4%" : "Pending"} 
+                          value={totalViews > 0 ? "+12.4%" : "Pending"} 
                           status="rising" 
                           desc="High-energy openings are driving significantly higher retention than baseline."
                       />
                       <AttributeItem 
                           label="Emotional Volatility" 
-                          value={data.total_likes > 0 ? "+8.1%" : "Stable"} 
+                          value={totalLikes > 0 ? "+8.1%" : "Stable"} 
                           status="rising" 
                           desc="Content with 'Controversial' framing variants is seeing 2.5x more share depth."
                       />
@@ -371,7 +389,7 @@ export default function PerformancePage() {
                     <div style={{ display: "grid", gap: 20 }}>
                       <AttributeItem 
                           label="Conversion Clarity" 
-                          value={data.avg_engagement > 0 ? "-3.2%" : "Developing"} 
+                          value={avgEngagement > 0 ? "-3.2%" : "Developing"} 
                           status="falling" 
                           desc="Increasing complexity in recent segments correlates with a drop in save rate."
                       />

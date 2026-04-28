@@ -8,6 +8,7 @@ import type { ReactNode } from "react";
 import React from "react";
 import type { Metadata, Viewport } from "next";
 import { Providers } from "./providers";
+import BodyShell from "./BodyShell";
 
 export const metadata: Metadata = {
   title: "ClipMind — AI Video Studio",
@@ -566,8 +567,24 @@ const globalStyles = `
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="en">
-      <body>
+    <html lang="en" suppressHydrationWarning>
+      <head>
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `
+              (function() {
+                try {
+                  const saved = localStorage.getItem('theme');
+                  const pref = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                  const theme = saved || pref;
+                  if (theme === 'dark') document.documentElement.classList.add('dark');
+                } catch (e) {}
+              })();
+            `,
+          }}
+        />
+      </head>
+      <BodyShell>
         <React.StrictMode>
           <Providers>
             <div className="shell">
@@ -576,7 +593,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
             </div>
           </Providers>
         </React.StrictMode>
-      </body>
+      </BodyShell>
     </html>
   );
 }

@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from sqlalchemy import text
 
 from api.dependencies import AuthenticatedUser, get_current_user
+from api.response_utils import normalize_model
 from api.routes.upload import (
     UploadValidationError,
     estimate_job_cost,
@@ -44,6 +45,32 @@ class CampaignUpdatePayload(BaseModel):
     name: str | None = None
     description: str | None = None
     schedule_config: dict | None = None
+
+
+class CampaignResponseModel(BaseModel):
+    id: str
+    name: str
+    description: str | None = None
+    status: str
+    clip_count: int = 0
+    schedule_config: dict = {}
+    created_at: datetime
+    updated_at: datetime
+
+
+class CampaignDeleteResponse(BaseModel):
+    status: str
+    campaign_id: str
+
+
+class CampaignStatsResponseModel(BaseModel):
+    campaign_id: str
+    total_videos_uploaded: int
+    total_clips_detected: int
+    clips_scheduled: int
+    clips_published: int
+    next_publish_date: datetime | None = None
+    avg_clip_score: float
 
 
 def _normalize_campaign(record: dict) -> dict:
@@ -177,7 +204,7 @@ def create_new_campaign(
         schedule_config=payload.schedule_config,
     )
     campaign["clip_count"] = 0
-    return _normalize_campaign(campaign)
+    return normalize_model(CampaignResponseModel, _normalize_campaign(campaign))
 
 
 @router.get("/{campaign_id}")
@@ -190,7 +217,7 @@ def read_campaign(
         raise HTTPException(status_code=404, detail="Campaign not found")
 
     campaign["clip_count"] = sum(len(job.get("clips_json") or []) for job in _load_campaign_jobs(campaign_id))
-    return _normalize_campaign(campaign)
+    return normalize_model(CampaignResponseModel, _normalize_campaign(campaign))
 
 
 @router.patch("/{campaign_id}")
@@ -212,7 +239,7 @@ def edit_campaign(
     if not updated:
         raise HTTPException(status_code=404, detail="Campaign not found")
     updated["clip_count"] = sum(len(job.get("clips_json") or []) for job in _load_campaign_jobs(campaign_id))
-    return _normalize_campaign(updated)
+    return normalize_model(CampaignResponseModel, _normalize_campaign(updated))
 
 
 @router.delete("/{campaign_id}")
@@ -227,7 +254,7 @@ def remove_campaign(
     deleted = delete_campaign(campaign_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    return {"status": "deleted", "campaign_id": campaign_id}
+    return normalize_model(CampaignDeleteResponse, {"status": "deleted", "campaign_id": campaign_id})
 
 
 @router.post("/{campaign_id}/upload")
@@ -356,4 +383,4 @@ def campaign_stats(
     campaign = get_campaign(campaign_id)
     if not campaign or str(campaign.get("user_id")) != str(user.user_id):
         raise HTTPException(status_code=404, detail="Campaign not found")
-    return _campaign_stats(campaign_id)
+    return normalize_model(CampaignStatsResponseModel, _campaign_stats(campaign_id))

@@ -37,11 +37,13 @@ async def get_hook_variants(
         )
         
     hooks = generate_hook_variants(str(job_id), clip_index)
+    variants = hooks if isinstance(hooks, list) else []
     
     return {
         "job_id": job_id,
         "clip_index": clip_index,
-        "hooks": hooks
+        "hooks": variants,
+        "variants": variants,
     }
 
 

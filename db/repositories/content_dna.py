@@ -63,6 +63,24 @@ def get_user_signals(user_id: UUID | str, limit: int = 500) -> list[dict[str, An
     return results
 
 
+def get_user_signal_counts(user_id: UUID | str) -> dict[str, int]:
+    """Return per-signal counts for a user dashboard."""
+    query = text(
+        """
+        SELECT signal_type, COUNT(*) AS count
+        FROM content_signals
+        WHERE user_id = :user_id
+        GROUP BY signal_type
+        """
+    )
+    with engine.connect() as connection:
+        rows = connection.execute(query, {"user_id": str(user_id)}).all()
+
+    counts = {str(row._mapping["signal_type"]): int(row._mapping["count"]) for row in rows}
+    counts["total_signals"] = sum(counts.values())
+    return counts
+
+
 def get_user_score_weights(user_id: UUID | str) -> dict[str, Any] | None:
     """Retrieve score weights for a user."""
     query = text("SELECT * FROM user_score_weights WHERE user_id = :user_id")
