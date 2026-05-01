@@ -2,10 +2,6 @@
 Purpose: Shared OpenAI client factory.
          Uses the OpenAI SDK against Groq's OpenAI-compatible API and provides
          a shared multi-model failover path for chat-based tasks.
-
-Usage:
-    from services.openai_client import make_openai_client
-    client = make_openai_client()
 """
 
 from __future__ import annotations
@@ -18,6 +14,9 @@ from openai import OpenAI
 from openai import OpenAIError
 
 from core.config import settings
+from services.llm_config import get_llm_config, TaskType
+from services.token_tracker import extract_usage_from_response, update_job_usage
+from services.llm_cache import llm_cache
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +76,8 @@ def get_vision_model_chain(preferred_model: str | None = None) -> list[str]:
 def create_chat_completion(
     *,
     messages: list[dict[str, Any]],
+    task_type: TaskType = TaskType.ANALYTICAL, # Gap 251
+    job_id: str | None = None, # Gap 252
     preferred_model: str | None = None,
     vision: bool = False,
     client: OpenAI | None = None,
@@ -93,14 +94,42 @@ def create_chat_completion(
         else get_text_model_chain(preferred_model)
     )
 
+    # Gap 251: Task-specific configuration
+    llm_cfg = get_llm_config(task_type)
+    final_kwargs = {
+        "temperature": llm_cfg.temperature,
+        "max_tokens": llm_cfg.max_tokens,
+        "top_p": llm_cfg.top_p,
+        **kwargs
+    }
+
+    # Gap 253: Cache lookup
+    cached_response = llm_cache.get(str(messages), model_chain[0], **final_kwargs)
+    if cached_response:
+        return ChatCompletionResult(model=model_chain[0], response=cached_response)
+
     errors: list[str] = []
     for attempt, model in enumerate(model_chain, start=1):
         try:
             response = active_client.chat.completions.create(
                 model=model,
                 messages=messages,
-                **kwargs,
+                **final_kwargs,
             )
+            
+            # Gap 252: Usage tracking
+            if job_id:
+                usage = extract_usage_from_response(response)
+                update_job_usage(
+                    job_id, 
+                    usage["prompt_tokens"], 
+                    usage["completion_tokens"], 
+                    model
+                )
+
+            # Gap 253: Cache store
+            llm_cache.set(str(messages), model, response, **final_kwargs)
+
             if attempt > 1:
                 logger.info("Groq failover recovered with model '%s' on attempt %d.", model, attempt)
             return ChatCompletionResult(model=model, response=response)

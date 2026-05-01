@@ -63,6 +63,24 @@ def _get_audio_duration(audio_path: Path) -> float:
     return float(result.stdout.strip())
 
 
+def _detect_language(audio_path: Path, model: str = "whisper-large-v3-turbo") -> str:
+    """Detect language of a short audio snippet using Whisper."""
+    from services.openai_client import make_openai_client
+    client = make_openai_client(for_whisper=True)
+    
+    # We only need a tiny snippet for detection
+    with audio_path.open("rb") as audio_file:
+        response = client.audio.transcriptions.create(
+            model=model,
+            file=audio_file,
+            response_format="verbose_json",
+        )
+    
+    # model_dump() if using newer OpenAI SDK, otherwise dict()
+    data = response.model_dump() if hasattr(response, "model_dump") else dict(response)
+    return data.get("language", "en")
+
+
 def _split_audio(audio_path: Path, chunk_dir: Path) -> list[tuple[Path, float]]:
     """Split audio into chunks that fit under the Groq size limit.
     
@@ -356,8 +374,18 @@ class TranscriptionService:
             # Multi-chunk: transcribe each and merge
             chunk_results: list[tuple[dict, float]] = []
             
-            # Gap 199: Lock detected language to prevent switching in mixed-language videos
-            enforced_language = language if language and language.lower() != "auto" else None
+            # Gap 199/259: Lock detected language to prevent switching in mixed-language videos
+            if language and language.lower() != "auto":
+                enforced_language = language
+            else:
+                # Detect from the first chunk to lock it
+                try:
+                    logger.info("Detecting language from first chunk...")
+                    enforced_language = _detect_language(chunks[0][0])
+                    logger.info("Detected language: %s. Locking for all chunks.", enforced_language)
+                except Exception as e:
+                    logger.warning("Language detection failed: %s. Falling back to auto.", e)
+                    enforced_language = None
 
             for idx, (chunk_path, offset) in enumerate(chunks):
                 logger.info(

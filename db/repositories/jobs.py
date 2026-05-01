@@ -30,6 +30,8 @@ UPDATABLE_FIELDS = {
     "prompt_version",
     "estimated_cost_usd",
     "actual_cost_usd",
+    "token_prompt_total",
+    "token_completion_total",
     "language",
     "campaign_id",
     "scheduled_publish_date",

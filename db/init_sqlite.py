@@ -84,6 +84,8 @@ _SQLITE_SCHEMA = textwrap.dedent("""\
         scheduled_publish_date  TIMESTAMP,
         language                TEXT        DEFAULT 'en',
         is_rejected             INTEGER     NOT NULL DEFAULT 0,
+        token_prompt_total      INTEGER     DEFAULT 0,
+        token_completion_total  INTEGER     DEFAULT 0,
         rejected_at             TIMESTAMP,
         completed_at            TIMESTAMP,
         created_at              TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -643,6 +645,12 @@ def init_sqlite_tables(engine) -> None:
             if "completed_at" not in job_cols:
                 cursor.execute("ALTER TABLE jobs ADD COLUMN completed_at TIMESTAMP")
                 logger.info("Added column 'completed_at' to 'jobs' table.")
+            if "token_prompt_total" not in job_cols:
+                cursor.execute("ALTER TABLE jobs ADD COLUMN token_prompt_total INTEGER DEFAULT 0")
+                logger.info("Added column 'token_prompt_total' to 'jobs' table.")
+            if "token_completion_total" not in job_cols:
+                cursor.execute("ALTER TABLE jobs ADD COLUMN token_completion_total INTEGER DEFAULT 0")
+                logger.info("Added column 'token_completion_total' to 'jobs' table.")
 
             # Workspaces Table
             ws_cols = _table_columns("workspaces")

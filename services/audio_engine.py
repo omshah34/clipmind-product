@@ -141,3 +141,29 @@ def normalize_audio_file(input_path: Path, output_path: Path, target_lufs: float
         logger.error("Audio normalization failed: %s", result.stderr[-500:])
         raise subprocess.CalledProcessError(result.returncode, cmd, result.stderr)
     return output_path
+
+
+def time_stretch_audio(input_path: Path, output_path: Path, ratio: float) -> Path:
+    """
+    Time-stretch audio without changing pitch using FFmpeg's 'atempo' filter.
+    Gap 257 Fix: Synchronize TTS duration with visual clip duration.
+    
+    Args:
+        input_path: Source audio file.
+        output_path: Destination audio file.
+        ratio: Speed ratio. 0.5 to 2.0. (e.g., 1.1 = 10% faster).
+    """
+    if not (0.5 <= ratio <= 2.0):
+        # atempo filter limit is 0.5 to 2.0. For larger shifts, chain multiple filters.
+        logger.warning("Ratio %.2f outside standard atempo range; clamping.", ratio)
+        ratio = max(0.5, min(2.0, ratio))
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-af", f"atempo={ratio}",
+        str(output_path),
+    ]
+    logger.info("Time-stretching audio: %s (ratio=%.2f)", input_path.name, ratio)
+    subprocess.run(cmd, check=True, capture_output=True)
+    return output_path

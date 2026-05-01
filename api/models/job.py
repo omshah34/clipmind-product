@@ -89,6 +89,8 @@ class JobRecord(BaseModel):
     prompt_version: str = Field(default="v4", max_length=32)
     estimated_cost_usd: float = 0.0
     actual_cost_usd: float = 0.0
+    token_prompt_total: int = 0
+    token_completion_total: int = 0
     language: str = Field(default="en", max_length=32)
     is_rejected: bool = False
     rejected_at: Optional[datetime] = None

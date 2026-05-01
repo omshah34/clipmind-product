@@ -66,6 +66,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     scheduled_publish_date  TIMESTAMPTZ,
     language                TEXT        DEFAULT 'en',
     is_rejected             BOOLEAN     NOT NULL DEFAULT FALSE,
+    token_prompt_total      INTEGER     DEFAULT 0,
+    token_completion_total  INTEGER     DEFAULT 0,
     rejected_at             TIMESTAMPTZ,
     completed_at            TIMESTAMPTZ,
     created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
