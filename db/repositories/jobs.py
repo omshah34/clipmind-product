@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from uuid import UUID, uuid4
 
 from sqlalchemy import text
@@ -38,10 +39,19 @@ UPDATABLE_FIELDS = {
 }
 
 
+def _append_job_run_marker(url: str) -> str:
+    """Make a source URL unique per job without changing the underlying file."""
+    parsed = urlparse(url)
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    query = [(key, value) for key, value in query if key != "cm_job_run"]
+    query.append(("cm_job_run", uuid4().hex))
+    return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
+
+
 def _row_to_job_record(row: Any) -> JobRecord:
     data = dict(row._mapping)
     for field in JSON_FIELDS:
-        if isinstance(data.get(field), str):
+        if field in data and isinstance(data.get(field), str):
             try:
                 data[field] = json.loads(data[field])
             except json.JSONDecodeError:
@@ -157,9 +167,6 @@ def create_job(
         ":language",
     ]
 
-    # Gap 33: Use an UPSERT-like pattern to return existing job if it exists
-    # This prevents redundant processing of the same video/prompt version.
-    _ts = "NOW()" if engine.dialect.name == "postgresql" else "CURRENT_TIMESTAMP"
     query = text(
         f"""
         INSERT INTO jobs (
@@ -168,12 +175,6 @@ def create_job(
         VALUES (
             {", ".join(values)}
         )
-        ON CONFLICT (user_id, source_video_url, prompt_version) WHERE user_id IS NOT NULL
-        DO UPDATE SET 
-            status = CASE WHEN jobs.status IN ('failed', 'cancelled') THEN EXCLUDED.status ELSE jobs.status END,
-            error_message = CASE WHEN jobs.status IN ('failed', 'cancelled') THEN NULL ELSE jobs.error_message END,
-            failed_stage = CASE WHEN jobs.status IN ('failed', 'cancelled') THEN NULL ELSE jobs.failed_stage END,
-            updated_at = {_ts}
         RETURNING *
         """
     )
@@ -192,27 +193,14 @@ def create_job(
 
     try:
         with engine.begin() as connection:
-            row = connection.execute(query, params).one_or_none()
-
-            # If no-user (anonymous) conflict occurs, the above ON CONFLICT won't catch it
-            # since it's filtered. We handle anon conflict here.
-            if not row and not user_id:
-                query_anon = text(f"""
-                    INSERT INTO jobs (id, status, source_video_url, prompt_version, estimated_cost_usd, language)
-                    VALUES (:id, :status, :source_video_url, :prompt_version, :estimated_cost_usd, :language)
-                    ON CONFLICT (source_video_url, prompt_version) WHERE user_id IS NULL
-                    DO UPDATE SET 
-                        status = CASE WHEN jobs.status IN ('failed', 'cancelled') THEN EXCLUDED.status ELSE jobs.status END,
-                        error_message = CASE WHEN jobs.status IN ('failed', 'cancelled') THEN NULL ELSE jobs.error_message END,
-                        failed_stage = CASE WHEN jobs.status IN ('failed', 'cancelled') THEN NULL ELSE jobs.failed_stage END,
-                        updated_at = {_ts}
-                    RETURNING *
-                """)
-                row = connection.execute(query_anon, params).one()
-
-        if not row:
-            raise RuntimeError("Failed to create or retrieve job")
-
+            row = connection.execute(query, params).one()
+        return _row_to_job_record(row)
+    except IntegrityError as exc:
+        # Existing DBs may still enforce uniqueness on (user_id, source_video_url, prompt_version).
+        # Preserve storage deduplication but force a fresh job row by tagging the URL per run.
+        params["source_video_url"] = _append_job_run_marker(str(params["source_video_url"]))
+        with engine.begin() as connection:
+            row = connection.execute(query, params).one()
         return _row_to_job_record(row)
     except Exception as e:
         import logging
@@ -367,3 +355,53 @@ def complete_job_atomic(job_id: UUID | str, clips: list[dict], actual_cost: floa
         payload={"clips_count": len(clips)}
     )
     return updated
+
+def list_jobs_with_clips_for_campaigns(campaign_ids: list[UUID | str]) -> dict[str, list[dict]]:
+    """
+    Gap 242: N+1 Fix. Fetch all jobs and their clips for a list of campaigns in a single JOIN query.
+    Returns a mapping of campaign_id -> list of jobs (each job has a 'clips' list).
+    """
+    if not campaign_ids:
+        return {}
+
+    str_ids = [str(cid) for cid in campaign_ids]
+    
+    join_query = text("""
+        SELECT j.id as job_id, j.campaign_id, j.status, j.created_at, j.scheduled_publish_date,
+               c.clip_index, c.clip_url, c.final_score
+        FROM jobs j
+        LEFT JOIN clips c ON j.id = c.job_id
+        WHERE j.campaign_id IN (:campaign_ids)
+        ORDER BY j.created_at ASC, c.clip_index ASC
+    """)
+
+    with engine.connect() as connection:
+        rows = connection.execute(join_query, {"campaign_ids": tuple(str_ids)}).fetchall()
+    
+    # Map results
+    campaign_map: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        cid = str(row.campaign_id)
+        jid = str(row.job_id)
+        
+        if cid not in campaign_map:
+            campaign_map[cid] = {}
+        
+        if jid not in campaign_map[cid]:
+            campaign_map[cid][jid] = {
+                "id": jid,
+                "status": row.status,
+                "created_at": row.created_at,
+                "scheduled_publish_date": row.scheduled_publish_date,
+                "clips": []
+            }
+            
+        if row.clip_index is not None:
+            campaign_map[cid][jid]["clips"].append({
+                "clip_index": row.clip_index,
+                "clip_url": row.clip_url,
+                "final_score": row.final_score
+            })
+            
+    # Convert to the expected format: campaign_id -> list of jobs
+    return {cid: list(jobs.values()) for cid, jobs in campaign_map.items()}

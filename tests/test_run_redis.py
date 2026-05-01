@@ -1,5 +1,6 @@
 """Tests for Redis auto-start behavior in run.py."""
 
+import io
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -61,6 +62,34 @@ class RedisAutoStartTests(unittest.TestCase):
                 [r"C:\\Redis\\redis-server.exe"],
             )
             mock_sleep.assert_called_once()
+
+    def test_check_env_accepts_groq_key_without_openai_key(self) -> None:
+        with (
+            patch("run.Path.exists", return_value=True),
+            patch.dict(
+                "run.os.environ",
+                {"REDIS_URL": "redis://localhost:6379/0", "GROQ_API_KEY": "gsk-test"},
+                clear=True,
+            ),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            self.assertTrue(run.check_env())
+            self.assertNotIn("Missing env vars", stdout.getvalue())
+
+    def test_check_env_guides_legacy_openai_key_users(self) -> None:
+        with (
+            patch("run.Path.exists", return_value=True),
+            patch.dict(
+                "run.os.environ",
+                {"REDIS_URL": "redis://localhost:6379/0", "OPENAI_API_KEY": "sk-legacy"},
+                clear=True,
+            ),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            self.assertTrue(run.check_env())
+            output = stdout.getvalue()
+            self.assertIn("GROQ_API_KEY", output)
+            self.assertIn("OPENAI_API_KEY is a legacy variable", output)
 
 
 if __name__ == "__main__":

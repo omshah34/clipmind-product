@@ -5,10 +5,8 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
-from openai import OpenAIError
-
 from core.config import settings
-from services.openai_client import make_openai_client
+from services.openai_client import create_chat_completion
 
 logger = logging.getLogger(__name__)
 
@@ -59,15 +57,15 @@ def _render_pdf_pages(path: Path) -> list[str]:
 
 
 def _ocr_images(encoded_images: list[str]) -> str:
-    if not settings.openai_api_key:
-        raise DocumentParserError("OPENAI_API_KEY is required for OCR fallback.")
+    if not settings.groq_api_key:
+        raise DocumentParserError("GROQ_API_KEY is required for OCR fallback.")
 
-    client = make_openai_client()
     pages: list[str] = []
     for encoded_image in encoded_images:
         try:
-            response = client.chat.completions.create(
-                model=settings.brand_guide_ocr_model,
+            completion = create_chat_completion(
+                preferred_model=settings.brand_guide_ocr_model,
+                vision=True,
                 messages=[
                     {
                         "role": "system",
@@ -85,9 +83,10 @@ def _ocr_images(encoded_images: list[str]) -> str:
                     },
                 ],
             )
-        except OpenAIError as exc:
+        except Exception as exc:
             raise DocumentParserError(f"OCR fallback failed: {exc}") from exc
 
+        response = completion.response
         content = response.choices[0].message.content if response.choices else ""
         if content:
             pages.append(content.strip())
@@ -106,12 +105,12 @@ def parse_brand_guide(path: Path) -> DocumentParseResult:
         text = _ocr_images(encoded_pages)
         if not text:
             raise DocumentParserError("Unable to extract any text from the uploaded PDF.")
-        return DocumentParseResult(text=text, parser="openai_vision", ocr_used=True, page_count=len(encoded_pages))
+        return DocumentParseResult(text=text, parser="groq_vision", ocr_used=True, page_count=len(encoded_pages))
 
     if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
         text = _ocr_images([base64.b64encode(path.read_bytes()).decode("ascii")])
         if not text:
             raise DocumentParserError("Unable to extract any text from the uploaded image.")
-        return DocumentParseResult(text=text, parser="openai_vision", ocr_used=True, page_count=1)
+        return DocumentParseResult(text=text, parser="groq_vision", ocr_used=True, page_count=1)
 
     raise DocumentParserError("Only PDF and image brand guides are supported.")

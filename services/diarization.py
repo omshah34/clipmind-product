@@ -1,8 +1,7 @@
-/**
- * File: services/diarization.py
- * Purpose: Speaker diarization service (Gap 98).
- *          Identifies "Who spoke when" to enable automatic split-screen layouts.
- */
+"""File: services/diarization.py
+Purpose: Speaker diarization service (Gap 98).
+         Identifies "Who spoke when" to enable automatic split-screen layouts.
+"""
 
 import logging
 from pathlib import Path

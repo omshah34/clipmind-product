@@ -9,6 +9,7 @@ import logging
 import hashlib
 import json
 from uuid import UUID
+from datetime import datetime, timezone
 
 from services.task_queue import is_redis_available
 
@@ -26,13 +27,6 @@ def emit_event(event_type: str, event_data: dict, user_id: UUID | str) -> None:
         event_type: Event type (e.g., "job.completed", "clips.generated")
         event_data: Event payload data to send
         user_id: User ID that triggered the event
-    
-    Supported events:
-        - job.completed: Job processing completed (success or failure)
-        - clips.generated: Clips were generated from a job
-        - clip.regenerated: Clip was regenerated in Clip Studio
-        - campaign.created: Campaign was created
-        - campaign.updated: Campaign was updated
     """
     logger.debug(f"[emit] Event: {event_type} for user {user_id}")
 
@@ -43,12 +37,26 @@ def emit_event(event_type: str, event_data: dict, user_id: UUID | str) -> None:
     from workers.webhooks import deliver_webhook_event
     
     try:
+        # Gap 246: Pass a snapshot of critical data to prevent race conditions
+        # if the job is deleted before the worker fetches it.
+        snapshot = {
+            "job_id": None,
+            "event_type": event_type,
+            "status": "unknown",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        
+        if isinstance(event_data, dict):
+            snapshot["job_id"] = str(event_data.get("job_id", ""))
+            snapshot["status"] = event_data.get("status", "unknown")
+
         # Queue webhook delivery as a Celery task
         deliver_webhook_event.delay(
             event_type=event_type,
             event_data=event_data,
             user_id=str(user_id),
             idempotency_key=idempotency_key,
+            snapshot=snapshot,
         )
         
         # Also trigger integrations (Zapier, Make, etc)
@@ -66,15 +74,7 @@ def emit_job_completed(
     clips_count: int,
     cost_usd: float,
 ) -> None:
-    """Emit job.completed event.
-    
-    Args:
-        job_id: Job ID that completed
-        user_id: User ID
-        status: Final status ("completed" or "failed")
-        clips_count: Number of clips generated
-        cost_usd: Cost of processing
-    """
+    """Emit job.completed event."""
     emit_event(
         event_type="job.completed",
         event_data={
@@ -92,13 +92,7 @@ def emit_clips_generated(
     user_id: UUID | str,
     clips: list[dict],
 ) -> None:
-    """Emit clips.generated event.
-    
-    Args:
-        job_id: Job ID
-        user_id: User ID
-        clips: List of generated clips
-    """
+    """Emit clips.generated event."""
     emit_event(
         event_type="clips.generated",
         event_data={
@@ -116,14 +110,7 @@ def emit_clip_regenerated(
     clip_index: int,
     regen_id: UUID | str,
 ) -> None:
-    """Emit clip.regenerated event.
-    
-    Args:
-        job_id: Job ID
-        user_id: User ID
-        clip_index: Index of regenerated clip
-        regen_id: Regeneration request ID
-    """
+    """Emit clip.regenerated event."""
     emit_event(
         event_type="clip.regenerated",
         event_data={
@@ -140,13 +127,7 @@ def emit_campaign_created(
     user_id: UUID | str,
     campaign_name: str,
 ) -> None:
-    """Emit campaign.created event.
-    
-    Args:
-        campaign_id: Campaign ID
-        user_id: User ID
-        campaign_name: Campaign name
-    """
+    """Emit campaign.created event."""
     emit_event(
         event_type="campaign.created",
         event_data={
@@ -162,13 +143,7 @@ def emit_campaign_updated(
     user_id: UUID | str,
     changes: dict,
 ) -> None:
-    """Emit campaign.updated event.
-    
-    Args:
-        campaign_id: Campaign ID
-        user_id: User ID
-        changes: Dict of changed fields
-    """
+    """Emit campaign.updated event."""
     emit_event(
         event_type="campaign.updated",
         event_data={
@@ -180,16 +155,7 @@ def emit_campaign_updated(
 
 
 def emit_to_integrations(event_type: str, event_data: dict, user_id: UUID | str) -> None:
-    """Emit event to active integrations (Zapier, Make, etc).
-    
-    This triggers Celery tasks to send formatted event data to integration endpoints.
-    Integrations are triggered asynchronously and failures don't block the main flow.
-    
-    Args:
-        event_type: Event type (e.g., "job.completed")
-        event_data: Raw event data
-        user_id: User ID that triggered the event
-    """
+    """Emit event to active integrations (Zapier, Make, etc)."""
     logger.debug(f"[integrations] Triggering for event: {event_type} user: {user_id}")
 
     if not is_redis_available():
@@ -207,5 +173,4 @@ def emit_to_integrations(event_type: str, event_data: dict, user_id: UUID | str)
         )
     
     except Exception as e:
-        # Log but don't fail - integration triggers should not block main flow
         logger.warning(f"[integrations] Failed to queue trigger for {event_type}: {e}")

@@ -9,7 +9,7 @@ from __future__ import annotations
 from uuid import UUID
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
@@ -29,6 +29,7 @@ from db.connection import engine
 from services.discovery import get_discovery_service
 from api.dependencies import get_current_user, AuthenticatedUser
 from core.config import settings
+from core.sparse import apply_sparse_filter
 
 
 # Gap 71: Machine-readable error code registry
@@ -51,14 +52,21 @@ def list_jobs(
     user: AuthenticatedUser = Depends(get_current_user),
     limit: int = 20,
     offset: int = 0,
-) -> JobListResponse:
+    fields: Optional[str] = Query(None, description="Comma-separated list of fields to return from JobListItem"),
+) -> Any:
     jobs, total = list_jobs_for_user(user.user_id, limit=limit, offset=offset)
-    return JobListResponse(
-        jobs=[JobListItem.model_validate(job) for job in jobs],
-        total=total,
-        limit=limit,
-        offset=offset,
-    )
+    
+    # Gap 250: Apply sparse fieldsets
+    job_list = [JobListItem.model_validate(job) for job in jobs]
+    if fields:
+        job_list = apply_sparse_filter(job_list, fields, JobListItem)
+    
+    return {
+        "jobs": job_list,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 def build_clip_summaries(job: JobRecord) -> list[ClipSummary] | None:
@@ -86,13 +94,14 @@ def error_response(error: str, message: str, status_code: int) -> JSONResponse:
 @router.get("/{job_id}/status", response_model=JobStatusResponse, status_code=200)
 def get_job_status(
     job_id: str,
-    user: AuthenticatedUser = Depends(get_current_user)
-) -> JobStatusResponse:
+    user: AuthenticatedUser = Depends(get_current_user),
+    fields: Optional[str] = Query(None, description="Comma-separated list of fields to return from JobStatusResponse"),
+) -> Any:
     job = get_job(job_id, user_id=user.user_id)
     if job is None:
         return error_response("job_not_found", "No job found for the provided id.", 404)
 
-    return JobStatusResponse(
+    response_data = JobStatusResponse(
         job_id=job.id,
         status=job.status,
         failed_stage=job.failed_stage,
@@ -100,12 +109,18 @@ def get_job_status(
         clips=build_clip_summaries(job),
     )
 
+    if fields:
+        return apply_sparse_filter(response_data, fields, JobStatusResponse)
+
+    return response_data
+
 
 @router.get("/{job_id}/clips", response_model=JobClipsResponse, status_code=200)
 def get_job_clips(
     job_id: str,
-    user: AuthenticatedUser = Depends(get_current_user)
-) -> JobClipsResponse:
+    user: AuthenticatedUser = Depends(get_current_user),
+    fields: Optional[str] = Query(None, description="Comma-separated list of fields to return from ClipResult"),
+) -> Any:
     job = get_job(job_id, user_id=user.user_id)
     if job is None:
         return error_response("job_not_found", "No job found for the provided id.", 404)
@@ -116,7 +131,13 @@ def get_job_clips(
             409,
         )
 
-    return JobClipsResponse(job_id=job.id, clips=job.clips_json or [])
+    clips = job.clips_json or []
+    if fields:
+        # Wrap in Pydantic models first if they are dicts
+        clip_models = [ClipResult.model_validate(c) if isinstance(c, dict) else c for c in clips]
+        clips = apply_sparse_filter(clip_models, fields, ClipResult)
+
+    return {"job_id": job.id, "clips": clips}
 
 
 @router.post("/{job_id}/reject", status_code=200)

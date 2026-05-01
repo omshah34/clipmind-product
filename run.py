@@ -473,11 +473,20 @@ def check_env():
             print(f"       Run: {bold('cp .env.example .env')} and fill in values.\n")
         return False
 
-    required = ["REDIS_URL", "OPENAI_API_KEY"]
-    missing  = [k for k in required if not os.getenv(k)]
+    required = ["REDIS_URL"]
+    missing = [k for k in required if not os.getenv(k)]
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    legacy_openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+
+    if not groq_key:
+        missing.append("GROQ_API_KEY")
+
     if missing:
         print(f"\n{yellow('[WARN]')} Missing env vars: {', '.join(missing)}")
         print(f"       Some services may fail. Check your .env file.\n")
+        if legacy_openai_key and not groq_key:
+            print("       OPENAI_API_KEY is a legacy variable in this repo.")
+            print("       Copy that value to GROQ_API_KEY in .env.\n")
     return True
 
 

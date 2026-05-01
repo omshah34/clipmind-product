@@ -104,17 +104,19 @@ if settings.redis_url.startswith("rediss://"):
 
 # --- Periodic Task Schedule ---
 from celery.schedules import crontab
+
+# Gap 248: Explicitly stagger tasks to prevent midnight I/O spikes
 _conf["beat_schedule"] = {
     "sync_virality_performance": {
         "task": "workers.analytics.sync_all_active_performance",
-        "schedule": 21600.0, # Every 6 hours
+        "schedule": crontab(hour="1,7,13,19", minute=0), # Shifted away from midnight (1 AM, 7 AM, etc.)
     },
     "generate_weekly_strategy_summary": {
         "task": "workers.dna_tasks.generate_all_executive_summaries",
-        "schedule": crontab(hour=0, minute=0, day_of_week=0), # Sunday midnight
+        "schedule": crontab(day_of_week=0, hour=1, minute=30), # Sunday 1:30 AM
     },
     "poll_content_sources": {
-        "task": "workers.source_poller.poll_all_sources",  # Gap 70: Fixed name mismatch
+        "task": "workers.source_poller.poll_all_sources",
         "schedule": 3600.0, # Every hour
     },
     "reclaim_stale_jobs": {
@@ -127,7 +129,7 @@ _conf["beat_schedule"] = {
     },
     "cleanup_orphaned_files": {
         "task": "workers.maintenance_tasks.cleanup_local_storage",
-        "schedule": 86400.0, # Every 24 hours
+        "schedule": crontab(hour=3, minute=0), # Daily 3 AM
     },
 }
 
@@ -166,4 +168,3 @@ def _clear_trace_context(task_id=None, task=None, args=None, kwargs=None, retval
     tokens = getattr(request, "_clipmind_context_tokens", None)
     if tokens is not None:
         reset_request_context(tokens)
-

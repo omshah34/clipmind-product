@@ -2,22 +2,22 @@
 Purpose: Synthesize DNA learning logs into high-level strategic summaries using LLM.
 """
 import logging
-import inspect
 from typing import List, Optional
-import httpx
-import os
-from core.config import settings
 from db.repositories.content_dna import get_dna_logs_for_summary, save_executive_summary
+from services.openai_client import create_chat_completion, is_llm_available
 
 logger = logging.getLogger(__name__)
 
 class ExecutiveSummarizer:
     def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or os.getenv("NVIDIA_NIM_API_KEY")
-        self.api_url = "https://integrate.api.nvidia.com/v1/chat/completions"
+        self.api_key = api_key
 
     async def generate_summary(self, user_id: str) -> Optional[dict]:
         """Fetch logs from the last 30 days and generate a synthetic strategy summary."""
+        if not is_llm_available():
+            logger.info("Groq is not configured. Skipping executive summary generation.")
+            return None
+
         # 1. Fetch Windowed Logs
         logs = get_dna_logs_for_summary(user_id, days=30, limit=20)
         if not logs:
@@ -55,34 +55,15 @@ Start with "Strategic Analysis: "
 
         # 4. LLM Call
         try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    self.api_url,
-                    headers={
-                        "Authorization": f"Bearer {self.api_key}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": "meta/llama3-70b-instruct",
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.5,
-                        "max_tokens": 256
-                    },
-                    timeout=30.0
-                )
-                
-                if response.status_code != 200:
-                    logger.error(f"LLM Synthesis failed: {response.status_code} - {response.text}")
-                    return None
-                
-                payload = response.json()
-                if inspect.isawaitable(payload):
-                    payload = await payload
+            completion = create_chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.5,
+                max_tokens=256,
+            )
+            summary_text = completion.response.choices[0].message.content
 
-                summary_text = payload["choices"][0]["message"]["content"]
-
-                # 5. Persist Summary
-                return save_executive_summary(user_id, summary_text, log_ids)
+            # 5. Persist Summary
+            return save_executive_summary(user_id, summary_text, log_ids)
 
         except Exception as e:
             logger.exception(f"Error during Executive Summary generation: {e}")

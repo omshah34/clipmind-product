@@ -30,6 +30,8 @@ class ClipResult(BaseModel):
     story_score: float
     virality_score: float
     final_score: float
+    score_source: str = Field(default="llm", max_length=32)
+    score_confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     reason: str = Field(max_length=2000)
     hook_headlines: List[str] = Field(default_factory=list)
     layout_type: Optional[str] = Field(default=None, max_length=64)

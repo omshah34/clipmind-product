@@ -34,20 +34,39 @@ def _get_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _default_clip_detector_fallback_model() -> str:
-    base_url = os.getenv("OPENAI_BASE_URL", "").lower()
-    if "integrate.api.nvidia.com" in base_url:
-        return "openai/gpt-oss-20b"
-    return "gpt-4o-mini"
+def _get_csv(name: str, default: list[str]) -> tuple[str, ...]:
+    value = os.getenv(name)
+    if value is None:
+        return tuple(default)
+    models = [item.strip() for item in value.split(",") if item.strip()]
+    return tuple(models or default)
+
+
+DEFAULT_GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+DEFAULT_GROQ_TEXT_MODELS = [
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "qwen/qwen3-32b",
+    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-20b",
+    "llama-3.1-8b-instant",
+]
+DEFAULT_GROQ_VISION_MODELS = [
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+]
+DEFAULT_GROQ_WHISPER_MODELS = [
+    "whisper-large-v3",
+    "whisper-large-v3-turbo",
+]
 
 
 @dataclass(frozen=True)
 class Settings:
     environment: str = os.getenv("ENVIRONMENT", "development")
-    openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
-    openai_base_url: str = os.getenv("OPENAI_BASE_URL", "")  # Custom base URL (e.g. NVIDIA, OpenRouter)
-    whisper_api_key: str = os.getenv("WHISPER_API_KEY", "")
-    whisper_base_url: str = os.getenv("WHISPER_BASE_URL", "")
+    groq_api_key: str = os.getenv("GROQ_API_KEY", "")
+    groq_base_url: str = os.getenv("GROQ_BASE_URL", DEFAULT_GROQ_BASE_URL)
+    whisper_api_key: str = os.getenv("WHISPER_API_KEY", os.getenv("GROQ_API_KEY", ""))
+    whisper_base_url: str = os.getenv("WHISPER_BASE_URL", os.getenv("GROQ_BASE_URL", DEFAULT_GROQ_BASE_URL))
     supabase_url: str = os.getenv("SUPABASE_URL", "")
     supabase_key: str = os.getenv("SUPABASE_KEY", "")
     redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -83,15 +102,18 @@ class Settings:
     min_video_duration_minutes: int = 2
     min_clip_length_seconds: int = _get_int("MIN_CLIP_LENGTH_SECONDS", 15)
     max_clip_length_seconds: int = _get_int("MAX_CLIP_LENGTH_SECONDS", 90)
-    clip_detector_model: str = os.getenv("CLIP_DETECTOR_MODEL", "openai/gpt-oss-120b")
-    clip_detector_fallback_model: str = os.getenv("CLIP_DETECTOR_FALLBACK_MODEL", _default_clip_detector_fallback_model())
+    groq_text_models: tuple[str, ...] = _get_csv("GROQ_TEXT_MODELS", DEFAULT_GROQ_TEXT_MODELS)
+    groq_vision_models: tuple[str, ...] = _get_csv("GROQ_VISION_MODELS", DEFAULT_GROQ_VISION_MODELS)
+    groq_whisper_models: tuple[str, ...] = _get_csv("GROQ_WHISPER_MODELS", DEFAULT_GROQ_WHISPER_MODELS)
+    clip_detector_model: str = os.getenv("CLIP_DETECTOR_MODEL", DEFAULT_GROQ_TEXT_MODELS[0])
+    clip_detector_fallback_model: str = os.getenv("CLIP_DETECTOR_FALLBACK_MODEL", DEFAULT_GROQ_TEXT_MODELS[1])
     clip_detector_retry_attempts: int = _get_int("CLIP_DETECTOR_RETRY_ATTEMPTS", 1)
     openai_timeout_seconds: float = _get_float("OPENAI_TIMEOUT_SECONDS", 90.0)
     hf_token: str = os.getenv("HF_TOKEN", "")
     enable_contextual_broll: bool = _get_bool("ENABLE_CONTEXTUAL_BROLL", False)
     pexels_api_key: str = os.getenv("PEXELS_API_KEY", "")
-    brand_guide_ocr_model: str = os.getenv("BRAND_GUIDE_OCR_MODEL", "gpt-4o-mini")
-    whisper_model: str = "whisper-1"
+    brand_guide_ocr_model: str = os.getenv("BRAND_GUIDE_OCR_MODEL", DEFAULT_GROQ_VISION_MODELS[0])
+    whisper_model: str = os.getenv("WHISPER_MODEL", DEFAULT_GROQ_WHISPER_MODELS[0])
     job_retry_limit: int = 3
     chunk_upload_size_bytes: int = 1024 * 1024
     feature_flag_prefix: str = os.getenv("FEATURE_FLAG_PREFIX", "CLIPMIND_FLAG_")
@@ -114,8 +136,52 @@ class Settings:
     def min_video_duration_seconds(self) -> int:
         return self.min_video_duration_minutes * 60
 
+    @property
+    def openai_api_key(self) -> str:
+        return self.groq_api_key
+
+    @property
+    def openai_base_url(self) -> str:
+        return self.groq_base_url
+
 
 settings = Settings()
+
+
+def get_runtime_config_warnings() -> list[str]:
+    warnings: list[str] = []
+
+    raw_groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    raw_openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    raw_openai_base = os.getenv("OPENAI_BASE_URL", "").strip()
+    raw_groq_base = os.getenv("GROQ_BASE_URL", "").strip()
+
+    if not raw_groq_key:
+        warnings.append(
+            "GROQ_API_KEY is not set. Core AI tasks will not work."
+        )
+
+    if raw_openai_base:
+        warnings.append(
+            "OPENAI_BASE_URL is still set in the environment. This project is now Groq-only; remove legacy provider overrides."
+        )
+
+    if "integrate.api.nvidia.com" in raw_openai_base.lower():
+        warnings.append(
+            "Legacy NVIDIA endpoint detected in OPENAI_BASE_URL. Comment or remove it from .env to avoid operator confusion."
+        )
+
+    if raw_openai_key and raw_openai_key.startswith("nvapi-"):
+        warnings.append(
+            "Legacy NVIDIA-style OPENAI_API_KEY detected. Comment or remove it from .env now that Groq is the primary provider."
+        )
+
+    if raw_groq_base and "api.groq.com/openai/v1" not in raw_groq_base.lower():
+        warnings.append(
+            f"GROQ_BASE_URL is set to '{raw_groq_base}', which does not look like Groq's OpenAI-compatible endpoint."
+        )
+
+    return warnings
 
 for folder in (
     settings.local_storage_dir / "uploads",

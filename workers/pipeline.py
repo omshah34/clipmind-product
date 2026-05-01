@@ -29,6 +29,8 @@ import httpx
 from celery.exceptions import Ignore, SoftTimeLimitExceeded
 from openai import APIConnectionError, APITimeoutError, RateLimitError
 
+from core.redis_breaker import CircuitBreakerError
+
 from core.config import settings
 from db.repositories.brand_kits import get_brand_kit
 from db.repositories.jobs import get_job, update_job, complete_job_atomic
@@ -56,7 +58,7 @@ from workers.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
 
-TRANSIENT_ERRORS = (httpx.TimeoutException, APIConnectionError, APITimeoutError, RateLimitError)
+TRANSIENT_ERRORS = (httpx.TimeoutException, APIConnectionError, APITimeoutError, RateLimitError, CircuitBreakerError)
 
 _RETRY_BASE_SECONDS: int = 2   # countdown = _RETRY_BASE_SECONDS ** retry_number
 
@@ -633,6 +635,13 @@ def process_job(self, job_id: str) -> list[dict]:
             "[job=%s] Transient error at stage '%s' (attempt %d): %s",
             job_id, current_stage, retry_count, exc,
         )
+        # Gap 243: Handle CircuitBreaker specifically with a long cooldown
+        if isinstance(exc, CircuitBreakerError):
+            countdown = 600  # 10 minutes
+            logger.info("[job=%s] Circuit open. Scheduling retry in %ds.", job_id, countdown)
+            # We allow more retries for circuit breaker since it's a platform-wide cooldown
+            raise self.retry(exc=exc, countdown=countdown, max_retries=20)
+
         if retry_count <= settings.job_retry_limit:
             update_job(
                 job.id,

@@ -326,6 +326,8 @@ def get_job_preview(job_id: str) -> ClipPreviewData:
             "story_score": float(clip.story_score),
             "virality_score": float(clip.virality_score),
             "final_score": float(clip.final_score),
+            "score_source": getattr(clip, "score_source", "llm"),
+            "score_confidence": float(getattr(clip, "score_confidence", 1.0)),
             "reason": str(clip.reason),
             "clip_url": stream_url,          # ← always an HTTP URL now
             "download_url": f"/api/v1/jobs/{job_id}/clips/{i}/download" if has_clip else "",

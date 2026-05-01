@@ -61,6 +61,7 @@ function scoreColor(s: number) {
 }
 
 function fmt(n: number) { return n.toFixed(1); }
+function pct(n?: number) { return `${Math.round((n ?? 0) * 100)}%`; }
 
 const SCORE_DIMS = [
   { key: 'hook_score',     label: 'Hook'     },
@@ -206,6 +207,21 @@ function ClipCard({
           }}>
             {fmt(clip.duration)}s
           </span>
+          {clip.score_source === 'heuristic' && (
+            <span style={{
+              fontSize: 10,
+              fontWeight: 700,
+              letterSpacing: '0.08em',
+              color: T.amber,
+              background: 'rgba(245,158,11,0.12)',
+              border: '1px solid rgba(245,158,11,0.24)',
+              borderRadius: 5,
+              padding: '3px 8px',
+              fontFamily: 'monospace',
+            }}>
+              ESTIMATED {pct(clip.score_confidence)}
+            </span>
+          )}
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', flexShrink: 0 }}>
           <span style={{
@@ -252,6 +268,12 @@ function ClipCard({
       <p style={{ fontSize: 13, color: '#8b8fa8', lineHeight: 1.65, margin: '0 0 14px 0' }}>
         {clip.reason}
       </p>
+
+      {clip.score_source === 'heuristic' && (
+        <p style={{ fontSize: 11, color: T.amber, margin: '0 0 12px 0' }}>
+          AI scoring was unavailable for this clip. These scores were estimated from transcript signals and may be less reliable.
+        </p>
+      )}
 
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 16 }}>
         {SCORE_DIMS.map(({ key, label }) => (

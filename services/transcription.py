@@ -25,6 +25,7 @@ from openai import APIConnectionError, APITimeoutError, RateLimitError
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from core.config import settings
+from core.redis_breaker import whisper_breaker, CircuitBreakerError
 from services.caption_renderer import flatten_words
 from services.cost_tracker import estimate_whisper_cost
 from services.openai_client import make_openai_client
@@ -32,13 +33,7 @@ from services.openai_client import make_openai_client
 logger = logging.getLogger(__name__)
 
 # Ordered by quality — best first, fastest last
-WHISPER_MODELS = [
-    "whisper-large-v3",
-    "whisper-large-v3-turbo",
-]
-
-# Gap 42: OpenAI Whisper as final fallback when all Groq models are exhausted
-OPENAI_FALLBACK_MODEL = "whisper-1"
+WHISPER_MODELS = list(settings.groq_whisper_models)
 
 # Groq limit is 25MB; use 24MB as safe threshold
 _MAX_FILE_SIZE_BYTES = 24 * 1024 * 1024
@@ -240,8 +235,8 @@ def _deduplicate_words(words: list[dict]) -> list[dict]:
 
 class TranscriptionService:
     def __init__(self) -> None:
-        if not settings.whisper_api_key and not settings.openai_api_key:
-            raise RuntimeError("WHISPER_API_KEY or OPENAI_API_KEY is required for transcription")
+        if not settings.whisper_api_key and not settings.groq_api_key:
+            raise RuntimeError("WHISPER_API_KEY or GROQ_API_KEY is required for transcription")
         self.client = make_openai_client(for_whisper=True)
 
     @retry(
@@ -282,13 +277,14 @@ class TranscriptionService:
             response = c.audio.transcriptions.create(**params)
         return response.model_dump() if hasattr(response, "model_dump") else dict(response)
 
+    @whisper_breaker
     def _transcribe_single(
         self,
         audio_path: Path,
         language: str | None = None,
         vocabulary_hints: list[str] | None = None,
     ) -> dict:
-        """Try each Groq Whisper model in order; fall back to OpenAI if all fail (Gap 42)."""
+        """Try each Groq Whisper model in order until one succeeds."""
         last_error: Exception | None = None
 
         for i, model in enumerate(WHISPER_MODELS):
@@ -320,31 +316,12 @@ class TranscriptionService:
                         model, remaining,
                     )
                 else:
-                    logger.error("All %d Groq Whisper models rate-limited. Trying OpenAI fallback.", len(WHISPER_MODELS))
+                    logger.error("All %d Groq Whisper models rate-limited.", len(WHISPER_MODELS))
 
             except Exception as exc:
                 logger.error("Model '%s' failed: %s", model, exc)
                 last_error = exc
                 continue
-
-        # Gap 42: All Groq models exhausted — try OpenAI Whisper as a final fallback
-        openai_key = settings.openai_api_key
-        if openai_key:
-            try:
-                logger.warning("All Groq models failed. Falling back to OpenAI whisper-1.")
-                from services.openai_client import make_openai_client
-                openai_client = make_openai_client(for_whisper=False)  # OpenAI base client
-                transcript = self._call_whisper(
-                    audio_path, OPENAI_FALLBACK_MODEL, language, vocabulary_hints,
-                    client=openai_client
-                )
-                if transcript and "text" in transcript:
-                    transcript.setdefault("segments", [])
-                    logger.info("OpenAI fallback transcription succeeded.")
-                    return transcript
-            except Exception as fallback_exc:
-                logger.error("OpenAI fallback also failed: %s", fallback_exc)
-                last_error = fallback_exc
 
         raise last_error  # type: ignore[misc]
 

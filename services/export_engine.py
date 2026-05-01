@@ -15,7 +15,7 @@ from sqlalchemy import text
 
 from core.config import settings
 from db.repositories.jobs import get_job
-from services.llm_integration import llm_client, is_llm_available
+from services.openai_client import create_chat_completion, is_llm_available
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,6 @@ class ExportEngine:
 
     def __init__(self):
         self.model = settings.clip_detector_model
-        self.client = llm_client
 
     def generate_sync_bridge_xml(self, job_id: str, format: Literal["premiere", "davinci"] = "premiere") -> str:
         """
@@ -253,14 +252,14 @@ class ExportEngine:
         }}
         """
 
-        response = self.client.chat.completions.create(
-            model=self.model,
+        completion = create_chat_completion(
+            preferred_model=self.model,
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
             temperature=0.7
         )
         
-        result = json.loads(response.choices[0].message.content)
+        result = json.loads(completion.response.choices[0].message.content)
         return result
 
     def _get_clip_data(self, clip_id: str) -> dict:
@@ -331,13 +330,13 @@ class ExportEngine:
         Return ONLY the post content.
         """
 
-        response = self.client.chat.completions.create(
-            model=self.model,
+        completion = create_chat_completion(
+            preferred_model=self.model,
             messages=[{"role": "system", "content": "You are a LinkedIn Growth Expert."},
                       {"role": "user", "content": prompt}],
             temperature=0.7
         )
-        return response.choices[0].message.content.strip()
+        return completion.response.choices[0].message.content.strip()
 
     async def generate_newsletter_draft(self, job_id: str) -> str:
         """Aggregates all viral clips from a job into a Substack-ready newsletter blurb."""
@@ -373,13 +372,13 @@ class ExportEngine:
         Return ONLY the Markdown content.
         """
 
-        response = self.client.chat.completions.create(
-            model=self.model,
+        completion = create_chat_completion(
+            preferred_model=self.model,
             messages=[{"role": "system", "content": "You are a professional newsletter writer."},
                       {"role": "user", "content": prompt}],
             temperature=0.7
         )
-        return response.choices[0].message.content.strip()
+        return completion.response.choices[0].message.content.strip()
 
         # then merging into a PDF. For this MVP, we focus on text transformation.
         return {"status": "specced", "message": "PDF Carousel generation coming in Phase 4 - Enterprise."}

@@ -6,6 +6,7 @@ Purpose: Verify clip detection, LLM scoring, segment selection, and
 import unittest
 
 from services.clip_detector import (
+    build_heuristic_candidates,
     calculate_final_score,
     chunk_transcript,
     select_top_clips,
@@ -23,7 +24,7 @@ class ClipDetectorTests(unittest.TestCase):
                 "virality_score": 7,
             }
         )
-        self.assertAlmostEqual(score, 7.55, places=2)
+        self.assertAlmostEqual(score, 7.4, places=2)
 
     def test_select_top_clips_skips_overlap(self) -> None:
         selected = select_top_clips(
@@ -46,6 +47,40 @@ class ClipDetectorTests(unittest.TestCase):
         ]
         chunks = chunk_transcript(words)
         self.assertGreaterEqual(len(chunks), 2)
+
+    def test_heuristic_candidates_have_non_uniform_scores(self) -> None:
+        phrases = [
+            ["Why", "you", "should", "stop", "doing", "this?"],
+            ["This", "story", "gets", "wild!"],
+            ["First", "we", "thought", "it", "worked."],
+        ]
+        words = []
+        current_time = 0.0
+        for phrase in phrases:
+            for _ in range(18):
+                for token in phrase:
+                    words.append({"word": token, "start": current_time, "end": current_time + 0.45})
+                    current_time += 0.5
+            current_time += 6.0
+        candidates = build_heuristic_candidates(words, limit=3)
+
+        self.assertGreaterEqual(len(candidates), 2)
+        self.assertTrue(all(c["source"] == "heuristic" for c in candidates))
+        self.assertTrue(all("score_confidence" in c for c in candidates))
+
+        final_scores = {
+            calculate_final_score(
+                {
+                    "hook_score": c["hook_score"],
+                    "emotion_score": c["emotion_score"],
+                    "clarity_score": c["clarity_score"],
+                    "story_score": c["story_score"],
+                    "virality_score": c["virality_score"],
+                }
+            )
+            for c in candidates
+        }
+        self.assertGreater(len(final_scores), 1)
 
 
 if __name__ == "__main__":

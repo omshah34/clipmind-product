@@ -340,6 +340,8 @@ export type ClipPreviewData = {
     clarity_score: number;
     story_score: number;
     virality_score: number;
+    score_source?: string;
+    score_confidence?: number;
     reason: string;
     clip_url: string;       // /api/v1/jobs/{id}/clips/{i}/stream
     download_url: string;   // /api/v1/jobs/{id}/clips/{i}/download

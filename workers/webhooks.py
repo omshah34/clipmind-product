@@ -52,6 +52,7 @@ def deliver_webhook_event(
     event_data: dict,
     user_id: str,
     idempotency_key: str | None = None,
+    snapshot: dict | None = None,
 ) -> dict:
     """Queue webhook deliveries for an event."""
     logger.info(f"[webhook] Processing event: {event_type} for user {user_id}")
@@ -63,7 +64,40 @@ def deliver_webhook_event(
         logger.debug(f"[webhook] No active webhooks for event {event_type}")
         return {"queued": 0, "failed": 0}
     
-    # Gap 205: Use deterministic idempotency key if provided
+    # Gap 246: Fetch-on-delivery refactor to reduce Redis bloat.
+    # If we have a job_id, we fetch the full data here to construct the final payload.
+    final_data = event_data
+    job_id = snapshot.get("job_id") if snapshot else event_data.get("job_id")
+    
+    if job_id:
+        from db.repositories.jobs import get_job
+        job = get_job(job_id)
+        
+        if job:
+            # Construct rich payload from fresh DB record
+            final_data = {
+                "job_id": str(job.id),
+                "status": job.status,
+                "clips_count": len(job.clips_json) if job.clips_json else 0,
+                "source_video_url": job.source_video_url,
+                "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+                "estimated_cost_usd": job.estimated_cost_usd,
+            }
+        else:
+            # Gap 246: Race condition — job was deleted before delivery.
+            # Use snapshot as fallback but override event_type for explicit handling.
+            logger.warning(f"[webhook] Job {job_id} not found for event {event_type}. Using fallback payload.")
+            event_type = "job.unavailable"
+            # Schema Conformity: Missing fields default to null
+            final_data = {
+                "job_id": job_id,
+                "status": snapshot.get("status") if snapshot else "unavailable",
+                "clips_count": None,
+                "source_video_url": None,
+                "completed_at": snapshot.get("timestamp") if snapshot else None,
+                "estimated_cost_usd": None,
+            }
+
     event_id = idempotency_key or f"{event_type}_{int(time.time() * 1000)}"
     
     event_payload = {
@@ -72,7 +106,7 @@ def deliver_webhook_event(
         "schema_version": WEBHOOK_SCHEMA_VERSION,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "user_id": user_id,
-        "data": event_data,
+        "data": final_data,
     }
     
     queued = 0
@@ -89,11 +123,8 @@ def deliver_webhook_event(
             if delivery:
                 attempt_delivery_task.delay(str(delivery["id"]))
                 queued += 1
-                logger.debug(f"[webhook] Delivery queued: {delivery['id']}")
             else:
                 failed += 1
-                logger.error(f"[webhook] Failed to create delivery record for webhook {webhook['id']}")
-        
         except Exception as e:
             failed += 1
             logger.error(f"[webhook] Error queuing delivery for webhook {webhook['id']}: {e}")

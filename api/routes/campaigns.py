@@ -25,9 +25,8 @@ from api.routes.upload import (
 )
 from core.config import settings
 from db.repositories.campaigns import create_campaign, delete_campaign, get_campaign, list_campaigns, update_campaign
-from db.repositories.jobs import create_job
+from db.repositories.jobs import create_job, list_jobs_with_clips_for_campaigns, update_job
 from db.connection import engine
-from db.repositories.jobs import update_job
 from services.storage import storage_service
 from services.task_queue import dispatch_task
 from workers.pipeline import process_job
@@ -86,28 +85,9 @@ def _normalize_campaign(record: dict) -> dict:
 
 
 def _load_campaign_jobs(campaign_id: str) -> list[dict]:
-    query = text(
-        """
-        SELECT id, created_at, scheduled_publish_date, clips_json
-        FROM jobs
-        WHERE campaign_id = :campaign_id
-        ORDER BY created_at ASC
-        """
-    )
-    with engine.connect() as connection:
-        rows = connection.execute(query, {"campaign_id": campaign_id}).fetchall()
-
-    jobs: list[dict] = []
-    for row in rows:
-        job = dict(row._mapping)
-        clips_json = job.get("clips_json")
-        if isinstance(clips_json, str):
-            try:
-                job["clips_json"] = json.loads(clips_json)
-            except json.JSONDecodeError:
-                job["clips_json"] = []
-        jobs.append(job)
-    return jobs
+    """Gap 242: Load jobs and clips using optimized relational retrieval."""
+    results = list_jobs_with_clips_for_campaigns([campaign_id])
+    return results.get(str(campaign_id), [])
 
 
 def _campaign_stats(campaign_id: str) -> dict:
@@ -137,7 +117,7 @@ def _campaign_stats(campaign_id: str) -> dict:
         ).scalar() or 0
 
     for job in jobs:
-        clips = job.get("clips_json") or []
+        clips = job.get("clips") or []
         scheduled_at = job.get("scheduled_publish_date")
         if isinstance(scheduled_at, str):
             try:
@@ -182,11 +162,18 @@ def list_user_campaigns(
 ) -> dict:
     campaigns, total = list_campaigns(user.user_id, limit=limit, offset=offset, status=status)
 
+    if not campaigns:
+        return {"campaigns": [], "total": 0, "limit": limit, "offset": offset}
+
+    campaign_ids = [str(c["id"]) for c in campaigns]
+    # Gap 242: N+1 Fix. Batch load all jobs/clips for the campaigns on the current page.
+    campaign_jobs_map = list_jobs_with_clips_for_campaigns(campaign_ids)
+
     enriched = []
     for campaign in campaigns:
         campaign_id = str(campaign["id"])
-        jobs = _load_campaign_jobs(campaign_id)
-        campaign["clip_count"] = sum(len(job.get("clips_json") or []) for job in jobs)
+        jobs = campaign_jobs_map.get(campaign_id, [])
+        campaign["clip_count"] = sum(len(job.get("clips") or []) for job in jobs)
         enriched.append(_normalize_campaign(campaign))
 
     return {"campaigns": enriched, "total": int(total or 0), "limit": limit, "offset": offset}
@@ -216,7 +203,7 @@ def read_campaign(
     if not campaign or str(campaign.get("user_id")) != str(user.user_id):
         raise HTTPException(status_code=404, detail="Campaign not found")
 
-    campaign["clip_count"] = sum(len(job.get("clips_json") or []) for job in _load_campaign_jobs(campaign_id))
+    campaign["clip_count"] = sum(len(job.get("clips") or []) for job in _load_campaign_jobs(campaign_id))
     return normalize_model(CampaignResponseModel, _normalize_campaign(campaign))
 
 
@@ -238,7 +225,7 @@ def edit_campaign(
     )
     if not updated:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    updated["clip_count"] = sum(len(job.get("clips_json") or []) for job in _load_campaign_jobs(campaign_id))
+    updated["clip_count"] = sum(len(job.get("clips") or []) for job in _load_campaign_jobs(campaign_id))
     return normalize_model(CampaignResponseModel, _normalize_campaign(updated))
 
 
@@ -336,7 +323,7 @@ def campaign_calendar(
     range_end = now + timedelta(days=days_ahead)
 
     for job in jobs:
-        clips = job.get("clips_json") or []
+        clips = job.get("clips") or []
         scheduled_at = job.get("scheduled_publish_date")
         if isinstance(scheduled_at, str):
             try:

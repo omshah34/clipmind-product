@@ -47,7 +47,7 @@ CREATE INDEX IF NOT EXISTS idx_job_state_events_created_at ON job_state_events(c
 -- ====================================================================
 CREATE TABLE IF NOT EXISTS jobs (
     id                      UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    status                  TEXT        NOT NULL DEFAULT 'uploaded',
+    status                  TEXT        NOT NULL DEFAULT 'uploaded' CHECK (status IN ('uploaded', 'processing', 'completed', 'failed', 'rejected')),
     source_video_url        TEXT        NOT NULL,
     proxy_video_url         TEXT,
     audio_url               TEXT,
@@ -327,6 +327,7 @@ CREATE TABLE IF NOT EXISTS platform_credentials (
 -- ====================================================================
 -- 007  content_signals / user_score_weights / clip_sequences /
 --      render_jobs / social_accounts / published_clips
+-- ====================================================================
     -- Phase 7: platform_credentials health
     DO $$
     BEGIN
@@ -757,17 +758,6 @@ BEGIN
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_clip_sequences_job_id') THEN
         ALTER TABLE clip_sequences ADD CONSTRAINT fk_clip_sequences_job_id FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE;
-    END IF;
-
-    -- viral_predictions constraints
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_viral_pred_user_id') THEN
-        ALTER TABLE viral_predictions ADD CONSTRAINT fk_viral_pred_user_id FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_viral_pred_job_id') THEN
-        ALTER TABLE viral_predictions ADD CONSTRAINT fk_viral_pred_job_id FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_viral_pred_clip_perf_id') THEN
-        ALTER TABLE viral_predictions ADD CONSTRAINT fk_viral_pred_clip_perf_id FOREIGN KEY (clip_perf_id) REFERENCES clip_performance(id) ON DELETE CASCADE;
     END IF;
 
     -- job_state_events constraints

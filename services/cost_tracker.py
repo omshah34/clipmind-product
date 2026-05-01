@@ -10,16 +10,26 @@ import math
 from core.config import settings
 
 
-WHISPER_COST_PER_MINUTE = 0.006
 DEFAULT_LLM_COST_PER_CHUNK = 0.01
 MODEL_PRICING_PER_MILLION = {
     "gpt-4o": {"input": 5.0, "output": 15.0},
     "gpt-4o-mini": {"input": 0.15, "output": 0.6},
+    "meta-llama/llama-4-scout-17b-16e-instruct": {"input": 0.11, "output": 0.34},
+    "qwen/qwen3-32b": {"input": 0.29, "output": 0.59},
+    "llama-3.3-70b-versatile": {"input": 0.59, "output": 0.79},
+    "openai/gpt-oss-20b": {"input": 0.075, "output": 0.30},
+    "openai/gpt-oss-120b": {"input": 0.15, "output": 0.60},
+    "llama-3.1-8b-instant": {"input": 0.05, "output": 0.08},
+}
+WHISPER_COST_PER_HOUR = {
+    "whisper-large-v3": 0.111,
+    "whisper-large-v3-turbo": 0.04,
 }
 
 
 def estimate_whisper_cost(duration_seconds: float) -> float:
-    return round((duration_seconds / 60.0) * WHISPER_COST_PER_MINUTE, 6)
+    hourly_rate = WHISPER_COST_PER_HOUR.get(settings.whisper_model, WHISPER_COST_PER_HOUR["whisper-large-v3"])
+    return round((duration_seconds / 3600.0) * hourly_rate, 6)
 
 
 def estimate_chunk_count(duration_seconds: float) -> int:

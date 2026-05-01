@@ -1,18 +1,14 @@
 """
 File: services/llm_integration.py
 Purpose: LLM-powered sequence detection and caption optimization.
-         Uses OpenAI GPT-4 with fallback to heuristics on failure.
+         Uses Groq-hosted models with multi-model failover and heuristic backup.
 """
 
 import json
-import os
-from typing import Optional
-from tenacity import retry, stop_after_attempt, wait_exponential
-from openai import OpenAI, RateLimitError, APIError
 
 from core.config import settings
 from db.repositories.jobs import get_job
-from services.openai_client import make_openai_client
+from services.openai_client import create_chat_completion, is_llm_available
 import re
 import logging
 
@@ -68,15 +64,9 @@ def generate_platform_caption(original: str, platform: str) -> str:
     tags = {"tiktok": "#FYP #Viral", "instagram": "#Instagram #Creator", "youtube": "#Shorts #Video", "linkedin": "#Business"}
     return f"{original}\n\n{tags.get(platform, '#Content')}"
 
-
-# Initialize OpenAI client (respects OPENAI_BASE_URL if set)
-OPENAI_API_KEY = settings.openai_api_key
-llm_client = make_openai_client() if OPENAI_API_KEY else None
-
-
 def detect_sequences_with_llm(user_id: str, job_id: str) -> dict:
     """
-    Detect clip sequences using GPT-4 semantic understanding.
+    Detect clip sequences using Groq-hosted semantic analysis.
     Falls back to heuristic if LLM is unavailable or fails.
     
     Args:
@@ -95,7 +85,7 @@ def detect_sequences_with_llm(user_id: str, job_id: str) -> dict:
         clips = job["clips_json"]
         
         # If LLM not configured, use heuristic
-        if not llm_client:
+        if not is_llm_available():
             print(f"LLM not configured, falling back to heuristic for job {job_id}")
             return detect_sequences_heuristic(user_id, job_id)
         
@@ -140,29 +130,19 @@ Return ONLY valid JSON with this structure:
 """
         
         # Gap 193: Exponential backoff manual retry before fallback
-        import time
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                response = llm_client.chat.completions.create(
-                    model=settings.clip_detector_model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "You are an expert video editor analyzing clip sequences for narrative storytelling.",
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=0.7,
-                    max_tokens=1000,
-                )
-                break
-            except (RateLimitError, APIError) as e:
-                if attempt == max_retries - 1:
-                    raise e
-                wait = 2 ** attempt
-                logger.warning("LLM API error (attempt %d/%d), retrying in %ds: %s", attempt + 1, max_retries, wait, e)
-                time.sleep(wait)
+        completion = create_chat_completion(
+            preferred_model=settings.clip_detector_model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are an expert video editor analyzing clip sequences for narrative storytelling.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.7,
+            max_tokens=1000,
+        )
+        response = completion.response
         
         # Parse LLM response
         content = response.choices[0].message.content
@@ -173,12 +153,8 @@ Return ONLY valid JSON with this structure:
             "method": "llm",
             "sequences": result.get("sequences", []),
             "analysis": result.get("analysis", ""),
-            "model": settings.clip_detector_model,
+            "model": completion.model,
         }
-        
-    except (RateLimitError, APIError) as e:
-        print(f"LLM API error for job {job_id}: {e}. Using heuristic fallback.")
-        return detect_sequences_heuristic(user_id, job_id)
     except (json.JSONDecodeError, KeyError, ValueError) as e:
         print(f"LLM parsing error for job {job_id}: {e}. Using heuristic fallback.")
         return detect_sequences_heuristic(user_id, job_id)
@@ -195,7 +171,7 @@ def optimize_captions_with_llm(
     platforms: list,
 ) -> dict:
     """
-    Optimize captions for specific platforms using GPT-4.
+    Optimize captions for specific platforms using Groq-hosted models.
     Falls back to heuristic if LLM is unavailable or fails.
     
     Args:
@@ -215,7 +191,7 @@ def optimize_captions_with_llm(
             raise ValueError(f"Job {job_id} not found")
         
         # If LLM not configured, use heuristic
-        if not llm_client:
+        if not is_llm_available():
             print(f"LLM not configured, falling back to heuristic for captions")
             return {
                 platform: generate_platform_caption(original_caption, platform)
@@ -283,29 +259,19 @@ Only include keys for platforms in the target list above.
 """
         
         # Gap 193: Exponential backoff manual retry before fallback
-        import time
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                response = llm_client.chat.completions.create(
-                    model=settings.clip_detector_model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "You are an expert social media strategist optimizing content for maximum engagement.",
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=0.8,
-                    max_tokens=800,
-                )
-                break
-            except (RateLimitError, APIError) as e:
-                if attempt == max_retries - 1:
-                    raise e
-                wait = 2 ** attempt
-                logger.warning("LLM API error for captions (attempt %d/%d), retrying in %ds: %s", attempt + 1, max_retries, wait, e)
-                time.sleep(wait)
+        completion = create_chat_completion(
+            preferred_model=settings.clip_detector_model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are an expert social media strategist optimizing content for maximum engagement.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.8,
+            max_tokens=800,
+        )
+        response = completion.response
         
         # Parse LLM response
         content = response.choices[0].message.content
@@ -317,17 +283,7 @@ Only include keys for platforms in the target list above.
             "method": "llm",
             "captions": optimized,
             "strategy": result.get("strategy", ""),
-            "model": settings.clip_detector_model,
-        }
-        
-    except (RateLimitError, APIError) as e:
-        print(f"LLM API error for captions: {e}. Using heuristic fallback.")
-        return {
-            "method": "heuristic",
-            "captions": {
-                platform: generate_platform_caption(original_caption, platform)
-                for platform in platforms
-            },
+            "model": completion.model,
         }
     except (json.JSONDecodeError, KeyError, ValueError) as e:
         print(f"LLM parsing error for captions: {e}. Using heuristic fallback.")
@@ -351,7 +307,7 @@ Only include keys for platforms in the target list above.
 
 def is_llm_available() -> bool:
     """Check if LLM is configured and available."""
-    return llm_client is not None and OPENAI_API_KEY != ""
+    return bool(settings.groq_api_key)
 
 def generate_hook_variants(job_id: str, clip_index: int) -> list[dict]:
     """
@@ -373,7 +329,7 @@ def generate_hook_variants(job_id: str, clip_index: int) -> list[dict]:
             
         start_time = float(clip.get("start_time", 0))
         
-        if not llm_client or not getattr(job, "transcript_json", None):
+        if not is_llm_available() or not getattr(job, "transcript_json", None):
             return [
                 {"variant": "A", "start_time": start_time, "description": "Original start", "hook_text": "Original Hook"},
                 {"variant": "B", "start_time": start_time + 1.0, "description": "Delayed +1s", "hook_text": "Alternate Hook 1"},
@@ -415,29 +371,18 @@ Return ONLY valid JSON with this structure:
 }}
 """
         # Gap 193: Exponential backoff manual retry before fallback
-        import time
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                response = llm_client.chat.completions.create(
-                    model=settings.clip_detector_model,
-                    messages=[
-                        {"role": "system", "content": "You optimize short-form video hooks for retention."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=0.7,
-                    max_tokens=500,
-                    response_format={"type": "json_object"}
-                )
-                break
-            except (RateLimitError, APIError) as e:
-                if attempt == max_retries - 1:
-                    raise e
-                wait = 2 ** attempt
-                logger.warning("LLM API error for hooks (attempt %d/%d), retrying in %ds: %s", attempt + 1, max_retries, wait, e)
-                time.sleep(wait)
-        
-        result = json.loads(response.choices[0].message.content.strip())
+        completion = create_chat_completion(
+            preferred_model=settings.clip_detector_model,
+            messages=[
+                {"role": "system", "content": "You optimize short-form video hooks for retention."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.7,
+            max_tokens=500,
+            response_format={"type": "json_object"},
+        )
+
+        result = json.loads(completion.response.choices[0].message.content.strip())
         return result.get("hooks", [])
         
     except Exception as e:

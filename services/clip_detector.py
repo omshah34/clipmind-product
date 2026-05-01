@@ -17,6 +17,7 @@ Improvements over v4:
 from __future__ import annotations
 
 import bisect
+import hashlib
 import json
 import logging
 import re
@@ -133,6 +134,8 @@ class ScoredClip(TypedDict):
     hook_headlines: list[str]
     layout_suggestion: str
     refinement_reason: str | None
+    score_source: str
+    score_confidence: float
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +354,176 @@ def chunk_transcript(words: list[dict]) -> list[list[dict]]:
     return chunks
 
 
+_HOOK_WORDS = {
+    "how", "why", "what", "stop", "never", "always", "biggest", "secret",
+    "truth", "mistake", "wrong", "fast", "best", "worst", "wait", "listen",
+}
+_EMOTION_WORDS = {
+    "love", "hate", "afraid", "fear", "shocking", "crazy", "amazing", "incredible",
+    "angry", "excited", "embarrassing", "painful", "surprised", "beautiful",
+}
+_TRANSITION_WORDS = {
+    "then", "because", "finally", "suddenly", "after", "before", "but", "so",
+    "therefore", "instead", "meanwhile", "first", "second", "next", "when",
+}
+_FILLER_WORDS = {
+    "um", "uh", "like", "you know", "actually", "basically", "literally", "kind of",
+}
+_SECOND_PERSON_WORDS = {"you", "your", "you're", "youve", "you'll"}
+_FIRST_PERSON_WORDS = {"i", "im", "i'm", "ive", "i've", "my", "me", "we", "our", "us"}
+
+
+def _clamp_score(value: float, minimum: float = 4.8, maximum: float = 8.9) -> float:
+    return round(max(minimum, min(maximum, value)), 2)
+
+
+def _normalize_token(token: str) -> str:
+    return re.sub(r"[^a-z0-9']", "", token.lower())
+
+
+def _signal_ratio(tokens: list[str], lexicon: set[str]) -> float:
+    if not tokens:
+        return 0.0
+    return sum(1 for token in tokens if token in lexicon) / len(tokens)
+
+
+def _deterministic_jitter(seed: str, scale: float = 0.18) -> float:
+    digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()
+    unit = int(digest[:8], 16) / 0xFFFFFFFF
+    return (unit - 0.5) * scale
+
+
+def _generate_heuristic_headlines(words: list[dict], start_idx: int) -> list[str]:
+    opening = [str(w.get("word", "")).strip(" ,.!?") for w in words[start_idx : start_idx + 8] if str(w.get("word", "")).strip()]
+    snippet = " ".join(opening[:5]).strip()
+    if not snippet:
+        snippet = "Unexpected turning point"
+    snippet = snippet[:60]
+    return [
+        snippet,
+        f"Why {snippet[:40]}".strip(),
+        f"Watch what happens next",
+    ]
+
+
+def _score_heuristic_candidate(
+    segment_words: list[dict],
+    *,
+    start_time: float,
+    end_time: float,
+    total_end: float,
+) -> dict[str, float]:
+    tokens_raw = [str(word.get("word", "")).strip() for word in segment_words if str(word.get("word", "")).strip()]
+    tokens = [_normalize_token(token) for token in tokens_raw]
+    tokens = [token for token in tokens if token]
+    token_count = len(tokens) or 1
+    duration = max(end_time - start_time, 0.1)
+
+    opening_tokens = tokens[:8]
+    opening_raw = tokens_raw[:8]
+    hook_density = _signal_ratio(opening_tokens, _HOOK_WORDS)
+    emotion_density = _signal_ratio(tokens, _EMOTION_WORDS)
+    transition_density = _signal_ratio(tokens, _TRANSITION_WORDS)
+    second_person_density = _signal_ratio(tokens, _SECOND_PERSON_WORDS)
+    first_person_density = _signal_ratio(tokens, _FIRST_PERSON_WORDS)
+    filler_density = _signal_ratio(tokens, _FILLER_WORDS)
+    question_bonus = 1.0 if any(token.endswith("?") for token in opening_raw) else 0.0
+    exclaim_bonus = 1.0 if any(token.endswith("!") for token in tokens_raw) else 0.0
+    number_bonus = min(sum(any(ch.isdigit() for ch in token) for token in opening_raw) / 2.0, 1.0)
+    unique_ratio = len(set(tokens)) / token_count
+    avg_word_len = sum(len(token) for token in tokens) / token_count
+    long_word_ratio = min(avg_word_len / 7.0, 1.0)
+    sentence_boundary_bonus = 1.0 if str(segment_words[-1].get("word", "")).strip().endswith((".", "?", "!")) else 0.0
+    duration_signal = 1.0 - min(abs(duration - 45.0) / 35.0, 1.0)
+    position_signal = 1.0 - min(start_time / max(total_end, 1.0), 1.0)
+    mid_arc_signal = 1.0 - min(abs((start_time + end_time) / 2 - (total_end / 2)) / max(total_end / 2, 1.0), 1.0)
+    contrast_bonus = 1.0 if {"but", "however"} & set(tokens) else 0.0
+
+    seed = f"{round(start_time, 2)}:{round(end_time, 2)}:{' '.join(opening_tokens[:4])}"
+    hook_score = _clamp_score(
+        5.25
+        + 2.3 * hook_density
+        + 0.75 * question_bonus
+        + 0.55 * number_bonus
+        + 0.45 * second_person_density
+        + 0.35 * position_signal
+        + _deterministic_jitter(seed + ":hook")
+    )
+    emotion_score = _clamp_score(
+        5.1
+        + 2.1 * emotion_density
+        + 0.7 * exclaim_bonus
+        + 0.35 * first_person_density
+        + 0.4 * contrast_bonus
+        + _deterministic_jitter(seed + ":emotion")
+    )
+    clarity_score = _clamp_score(
+        5.45
+        + 1.35 * unique_ratio
+        + 0.55 * long_word_ratio
+        + 0.35 * sentence_boundary_bonus
+        - 1.65 * filler_density
+        + _deterministic_jitter(seed + ":clarity")
+    )
+    story_score = _clamp_score(
+        5.0
+        + 1.75 * transition_density
+        + 0.7 * duration_signal
+        + 0.55 * sentence_boundary_bonus
+        + 0.45 * mid_arc_signal
+        + _deterministic_jitter(seed + ":story")
+    )
+    virality_score = _clamp_score(
+        5.0
+        + 1.15 * hook_density
+        + 0.9 * emotion_density
+        + 0.65 * second_person_density
+        + 0.55 * number_bonus
+        + 0.35 * question_bonus
+        + _deterministic_jitter(seed + ":virality")
+    )
+
+    return {
+        "hook_score": hook_score,
+        "emotion_score": emotion_score,
+        "clarity_score": clarity_score,
+        "story_score": story_score,
+        "virality_score": virality_score,
+    }
+
+
+def estimate_heuristic_scores_for_range(
+    words: list[dict],
+    *,
+    start_time: float,
+    end_time: float,
+) -> dict[str, float]:
+    """Estimate fallback score dimensions for a specific clip span."""
+    if not words:
+        return {
+            "hook_score": 5.5,
+            "emotion_score": 5.2,
+            "clarity_score": 5.8,
+            "story_score": 5.1,
+            "virality_score": 5.4,
+        }
+
+    total_end = float(words[-1]["end"])
+    segment_words = [
+        word for word in words
+        if float(word.get("end", 0.0)) >= start_time and float(word.get("start", 0.0)) <= end_time
+    ]
+    if not segment_words:
+        segment_words = words[: min(len(words), 20)]
+
+    return _score_heuristic_candidate(
+        segment_words,
+        start_time=start_time,
+        end_time=end_time,
+        total_end=total_end,
+    )
+
+
 def build_heuristic_candidates(words: list[dict], limit: int = 5) -> list[dict]:
     """Generate usable fallback candidates when LLM scoring fails or times out."""
     if not words:
@@ -393,24 +566,24 @@ def build_heuristic_candidates(words: list[dict], limit: int = 5) -> list[dict]:
         if not (settings.min_clip_length_seconds <= duration <= settings.max_clip_length_seconds):
             continue
 
+        segment_words = words[start_idx : end_idx + 1]
+        scores = _score_heuristic_candidate(
+            segment_words,
+            start_time=start_time,
+            end_time=end_time,
+            total_end=total_end,
+        )
         opening_words = " ".join(str(w.get("word", "")).strip() for w in words[start_idx : start_idx + 10]).strip()
         candidates.append(
             {
                 "source": "heuristic",
                 "start_time": round(start_time, 2),
                 "end_time": round(end_time, 2),
-                "hook_score": 7.0,
-                "emotion_score": 6.5,
-                "clarity_score": 7.0,
-                "story_score": 6.5,
-                "virality_score": 7.0,
-                "reason": f"Fallback candidate beginning with '{opening_words}' selected after LLM clip detection did not return usable candidates.",
-                "hook_headlines": [
-                    "You can automate this now",
-                    "Stop doing this manually",
-                    "Your workflow can run itself",
-                ],
+                **scores,
+                "reason": f"Fallback candidate beginning with '{opening_words}' selected after LLM clip detection failed; scores were estimated from transcript structure and hook signals.",
+                "hook_headlines": _generate_heuristic_headlines(words, start_idx),
                 "layout_suggestion": "vertical",
+                "score_confidence": 0.38,
             }
         )
 
@@ -482,8 +655,8 @@ def _render_prompt(template: PromptTemplate, transcript_chunk: str, source_path:
 
 class ClipDetectorService:
     def __init__(self) -> None:
-        if not settings.openai_api_key:
-            raise RuntimeError("OPENAI_API_KEY is required for clip detection")
+        if not settings.groq_api_key:
+            raise RuntimeError("GROQ_API_KEY is required for clip detection")
         from services.openai_client import make_openai_client
         self.client = make_openai_client()
 
@@ -507,12 +680,16 @@ class ClipDetectorService:
 
     def _call_llm(self, prompt: str, model: str) -> tuple[str, Any]:
         """Low-level LLM call."""
-        response = self.client.chat.completions.create(
-            model=model,
+        from services.openai_client import create_chat_completion
+
+        result = create_chat_completion(
+            client=self.client,
+            preferred_model=model,
             temperature=0.4,
             messages=[{"role": "user", "content": prompt}],
         )
-        return response.choices[0].message.content or "[]", response
+        response = result.response
+        return response.choices[0].message.content or "[]", result
 
     @retry(
         reraise=True,
@@ -523,7 +700,8 @@ class ClipDetectorService:
     def score_chunk(self, rendered_prompt: str, model_override: str | None = None) -> tuple[list[dict], float]:
         """Call the LLM, parse candidates, and return (candidates, cost)."""
         model = model_override or settings.clip_detector_model
-        raw_content, response = self._call_llm(rendered_prompt, model)
+        raw_content, completion = self._call_llm(rendered_prompt, model)
+        response = completion.response
 
         # Parse — attempt repair on failure
         try:
@@ -558,12 +736,12 @@ class ClipDetectorService:
 
         usage = getattr(response, "usage", None)
         llm_cost = estimate_llm_cost_from_tokens(
-            model,
+            completion.model,
             getattr(usage, "prompt_tokens", None),
             getattr(usage, "completion_tokens", None),
         )
 
-        logger.debug("Chunk scored (%s): %d valid, cost=$%.6f", model, len(valid), llm_cost)
+        logger.debug("Chunk scored (%s): %d valid, cost=$%.6f", completion.model, len(valid), llm_cost)
         return valid, llm_cost
 
     def _score_chunk_safe(
@@ -571,37 +749,13 @@ class ClipDetectorService:
         chunk_index: int,
         rendered_prompt: str,
     ) -> tuple[int, list[dict], float, bool]:
-        """Wrapper for thread pool use: returns (chunk_index, candidates, cost, failed).
-        Gap 40: Fallback to secondary model on persistent failure.
-        """
+        """Wrapper for thread pool use: returns (chunk_index, candidates, cost, failed)."""
         try:
             candidates, cost = self.score_chunk(rendered_prompt)
             return chunk_index, candidates, cost, False
-        except Exception as primary_exc:
-            fallback_model = settings.clip_detector_fallback_model.strip()
-            if not fallback_model or fallback_model == settings.clip_detector_model:
-                logger.info(
-                    "Chunk %d primary model (%s) failed: %s. No fallback model configured.",
-                    chunk_index,
-                    settings.clip_detector_model,
-                    primary_exc,
-                )
-                return chunk_index, [], 0.0, True
-
-            logger.info(
-                "Chunk %d primary model (%s) failed: %s. Trying fallback (%s)...",
-                chunk_index, settings.clip_detector_model, primary_exc, 
-                fallback_model
-            )
-            try:
-                candidates, cost = self.score_chunk(
-                    rendered_prompt, 
-                    model_override=fallback_model
-                )
-                return chunk_index, candidates, cost, False
-            except Exception as fallback_exc:
-                logger.error("Chunk %d fallback model also failed: %s", chunk_index, fallback_exc)
-                return chunk_index, [], 0.0, True
+        except Exception as exc:
+            logger.error("Chunk %d failed after Groq failover chain: %s", chunk_index, exc)
+            return chunk_index, [], 0.0, True
 
     def refine_clip_boundaries(
         self,
@@ -637,11 +791,15 @@ class ClipDetectorService:
         )
         
         try:
-            response = self.client.chat.completions.create(
-                model=settings.clip_detector_model,
+            from services.openai_client import create_chat_completion
+
+            completion = create_chat_completion(
+                client=self.client,
+                preferred_model=settings.clip_detector_model,
                 temperature=0.2,
                 messages=[{"role": "user", "content": rendered}],
             )
+            response = completion.response
             raw_content = response.choices[0].message.content or "{}"
             json_match = re.search(r"\{.*\}", raw_content, re.DOTALL)
             refined_data = json.loads(json_match.group(0)) if json_match else json.loads(raw_content)
@@ -658,7 +816,7 @@ class ClipDetectorService:
 
             usage = getattr(response, "usage", None)
             llm_cost = estimate_llm_cost_from_tokens(
-                settings.clip_detector_model,
+                completion.model,
                 getattr(usage, "prompt_tokens", None),
                 getattr(usage, "completion_tokens", None),
             )
@@ -724,6 +882,8 @@ class ClipDetectorService:
                     **candidate,
                     "duration": round(duration, 2),
                     "final_score": calculate_final_score(coerced_scores, weights=effective_weights),
+                    "score_source": candidate.get("source", "llm"),
+                    "score_confidence": float(candidate.get("score_confidence", 1.0)),
                 }
                 if scored["final_score"] >= SCORE_THRESHOLD:
                     all_candidates.append(scored)
@@ -737,6 +897,8 @@ class ClipDetectorService:
                         **candidate,
                         "duration": round(float(candidate["end_time"]) - float(candidate["start_time"]), 2),
                         "final_score": calculate_final_score(coerced_scores, weights=effective_weights),
+                        "score_source": candidate.get("source", "heuristic"),
+                        "score_confidence": float(candidate.get("score_confidence", 0.38)),
                     }
                 )
 
@@ -769,7 +931,9 @@ class ClipDetectorService:
                     reason=str(candidate["reason"]),
                     hook_headlines=list(candidate.get("hook_headlines", [])),
                     layout_suggestion=candidate.get("layout_suggestion", "vertical"),
-                    refinement_reason=r_reason
+                    refinement_reason=r_reason,
+                    score_source=str(candidate.get("score_source", candidate.get("source", "llm"))),
+                    score_confidence=float(candidate.get("score_confidence", 1.0 if candidate.get("source") != "heuristic" else 0.38)),
                 )
             )
         return results, round(total_cost, 6)
