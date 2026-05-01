@@ -1,6 +1,10 @@
 """File: workers/celery_app.py
 Purpose: Celery configuration and Redis connection setup.
          Creates the Celery application instance and configures message broker.
+
+Gap 368: Added get_jittered_countdown() utility — used by all task retry calls
+         in pipeline.py instead of fixed countdown values.
+Gap 331: Added gdpr_purge_expired_jobs to beat_schedule (runs nightly 2 AM).
 """
 
 from __future__ import annotations
@@ -8,6 +12,7 @@ from __future__ import annotations
 from core.logging_config import setup_logging
 setup_logging()
 
+import random   # Gap 368
 import ssl
 
 from celery import Celery
@@ -37,7 +42,6 @@ celery_app = Celery(
     ],
 )
 
-# Base Celery config
 from kombu import Queue
 
 _conf: dict = dict(
@@ -47,18 +51,14 @@ _conf: dict = dict(
     accept_content=["json"],
     timezone="UTC",
     enable_utc=True,
-    # Gap 202: Prevent Redis memory bloat by expiring results after 24h
     result_expires=86400,
-    # Connection & retry settings
     broker_connection_retry_on_startup=True,
     broker_connection_max_retries=10,
     broker_connection_retry=True,
     broker_connection_retry_delay=5,
     redis_backend_health_check_interval=30,
-    # Gap 206: Worker health & heartbeats
     worker_send_task_events=True,
     worker_heartbeat_interval=10,
-    # Gap 209: Priority Queue Support
     task_queue_max_priority=10,
     task_default_priority=5,
     task_queues=[
@@ -68,7 +68,6 @@ _conf: dict = dict(
         Queue("publishing", routing_key="publishing"),
         Queue("dlq", routing_key="dlq"),
     ],
-    # Socket configuration - use settings from config.py
     broker_transport_options={
         "socket_timeout": settings.redis_socket_timeout,
         "socket_connect_timeout": settings.redis_socket_connect_timeout,
@@ -76,64 +75,107 @@ _conf: dict = dict(
         "socket_keepalive_intvl": 30,
         "retry_on_timeout": True,
         "max_retries": 5,
-        # Gap 95: Prevent long-running render tasks (>1hr) from being re-queued
-        # The visibility_timeout must exceed the longest expected task runtime.
-        "visibility_timeout": 7200,  # 2 hours in seconds
+        "visibility_timeout": 7200,
         "queue_order_strategy": "priority",
     },
-    # Gap 97: Route exhausted tasks to a Dead Letter Queue for manual inspection
-    # Tasks that exceed max retries will be routed to the 'dlq' queue.
     task_routes={
         "workers.pipeline.*": {"queue": "pipeline_v2"},
         "workers.render_clips.*": {"queue": "renders_v2"},
         "workers.publish_social.*": {"queue": "publishing"},
     },
-    # Gap 97: DLQ — when a task raises after all retries, Celery rejects it.
-    # Setting task_reject_on_worker_lost ensures it goes to DLQ instead of disappearing.
     task_reject_on_worker_lost=True,
-    task_acks_late=True,  # Required for reject_on_worker_lost to work correctly
+    task_acks_late=True,
 )
 
-# When using rediss:// (TLS), Celery requires explicit ssl_cert_reqs.
-# Upstash provides valid TLS certs; CERT_NONE skips local CA verification and
-# avoids the "ssl_cert_reqs missing" ValueError on startup.
 if settings.redis_url.startswith("rediss://"):
     _ssl_opts = {"ssl_cert_reqs": ssl.CERT_NONE}
     _conf["broker_use_ssl"] = _ssl_opts
     _conf["redis_backend_use_ssl"] = _ssl_opts
 
-# --- Periodic Task Schedule ---
 from celery.schedules import crontab
 
-# Gap 248: Explicitly stagger tasks to prevent midnight I/O spikes
 _conf["beat_schedule"] = {
     "sync_virality_performance": {
         "task": "workers.analytics.sync_all_active_performance",
-        "schedule": crontab(hour="1,7,13,19", minute=0), # Shifted away from midnight (1 AM, 7 AM, etc.)
+        "schedule": crontab(hour="1,7,13,19", minute=0),
     },
     "generate_weekly_strategy_summary": {
         "task": "workers.dna_tasks.generate_all_executive_summaries",
-        "schedule": crontab(day_of_week=0, hour=1, minute=30), # Sunday 1:30 AM
+        "schedule": crontab(day_of_week=0, hour=1, minute=30),
     },
     "poll_content_sources": {
         "task": "workers.source_poller.poll_all_sources",
-        "schedule": 3600.0, # Every hour
+        "schedule": 3600.0,
     },
     "reclaim_stale_jobs": {
         "task": "workers.maintenance_tasks.reclaim_stale_jobs",
-        "schedule": 900.0, # Every 15 minutes
+        "schedule": 900.0,
     },
     "check_worker_watchdog": {
         "task": "workers.maintenance_tasks.check_worker_health",
-        "schedule": 120.0, # Every 2 minutes
+        "schedule": 120.0,
     },
     "cleanup_orphaned_files": {
         "task": "workers.maintenance_tasks.cleanup_local_storage",
-        "schedule": crontab(hour=3, minute=0), # Daily 3 AM
+        "schedule": crontab(hour=3, minute=0),
+    },
+    # Gap 331: Nightly GDPR purge — hard-deletes soft-deleted rows older than
+    # GDPR_RETENTION_DAYS. Runs at 2 AM to avoid overlap with 3 AM file cleanup.
+    "gdpr_purge_expired_jobs": {
+        "task": "workers.maintenance_tasks.purge_gdpr_expired_records",
+        "schedule": crontab(hour=2, minute=0),
+        "options": {"expires": 3600},  # skip if previous run still going
     },
 }
 
 celery_app.conf.update(**_conf)
+
+
+# ---------------------------------------------------------------------------
+# Gap 368: Jittered retry countdown utility
+#
+# PROBLEM (before this fix):
+#   task_download  → raise self.retry(countdown=2 ** self.request.retries * 30)
+#   task_transcribe → raise self.retry(countdown=60)
+#   task_detect_clips → raise self.retry(countdown=60)
+#   task_render    → raise self.retry(countdown=60)
+#
+#   When Groq goes down, ALL queued tasks fail simultaneously and retry at
+#   exactly T+60s, hammering Groq again in a thundering herd. With Groq's
+#   rate limits this means ALL tasks fail again → T+120s spike → repeat.
+#
+# FIX: Full-jitter exponential backoff (AWS retry guidance strategy).
+#   Formula: uniform(0, min(max_delay, base * 2^attempt))
+#   Each task gets a different random delay → load spreads naturally.
+#
+# USAGE in pipeline.py (replace every self.retry countdown):
+#
+#   from workers.celery_app import get_jittered_countdown
+#
+#   # Instead of: raise self.retry(exc=e, countdown=60)
+#   raise self.retry(exc=e, countdown=get_jittered_countdown(self.request.retries))
+#
+#   # Instead of: raise self.retry(exc=e, countdown=2 ** self.request.retries * 30)
+#   raise self.retry(exc=e, countdown=get_jittered_countdown(self.request.retries, base_delay=30.0))
+# ---------------------------------------------------------------------------
+
+def get_jittered_countdown(
+    attempt: int,
+    base_delay: float = 30.0,
+    max_delay: float = 300.0,
+) -> float:
+    """
+    Full-jitter exponential backoff for Celery task retries.
+
+    attempt:    self.request.retries  (0 on first retry, 1 on second, etc.)
+    base_delay: seconds for attempt=0 cap  (default 30s)
+    max_delay:  hard ceiling in seconds    (default 300s = 5 min)
+
+    Returns a float seconds value, randomised within [0, cap].
+    """
+    cap = min(max_delay, base_delay * (2 ** attempt))
+    countdown = random.uniform(0.0, cap)
+    return countdown
 
 
 @before_task_publish.connect

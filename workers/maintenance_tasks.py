@@ -205,3 +205,42 @@ def check_worker_health() -> dict:
         "workers_online": len(pings),
         "revoked_zombies": revoked_count
     }
+
+
+GDPR_RETENTION_DAYS = int(os.getenv("GDPR_RETENTION_DAYS", "30"))
+
+
+@celery_app.task(name="workers.maintenance_tasks.purge_gdpr_expired_records")
+def purge_gdpr_expired_records() -> dict:
+    """
+    Gap 331: Hard-delete soft-deleted job records older than GDPR_RETENTION_DAYS.
+    Triggered nightly at 2 AM by Celery Beat (see celery_app.py beat_schedule).
+    """
+    from db.connection import engine
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=GDPR_RETENTION_DAYS)
+
+    try:
+        with engine.begin() as conn:
+            # Fetch IDs first so we can log them
+            rows = conn.execute(
+                text("SELECT id FROM jobs WHERE deleted_at IS NOT NULL AND deleted_at < :cutoff"),
+                {"cutoff": cutoff.isoformat() if engine.dialect.name == "sqlite" else cutoff}
+            ).fetchall()
+
+            if not rows:
+                logger.info("GDPR purge: no expired records to delete")
+                return {"purged": 0}
+
+            job_ids = [str(r[0]) for r in rows]
+            placeholders = ",".join(f":id{i}" for i in range(len(job_ids)))
+            params = {f"id{i}": job_ids[i] for i in range(len(job_ids))}
+
+            conn.execute(text(f"DELETE FROM jobs WHERE id IN ({placeholders})"), params)
+            
+            logger.info("GDPR purge: deleted %d expired job records (cutoff: %s)", len(job_ids), cutoff.date())
+            return {"purged": len(job_ids), "cutoff": cutoff.isoformat()}
+
+    except Exception as exc:
+        logger.error("GDPR purge task failed: %s", exc)
+        raise

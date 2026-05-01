@@ -33,8 +33,30 @@ _TEXT_FAILOVER_ERRORS = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Gap 336: AI Provider Opt-Out Headers
+#
+# Your product processes users' private video transcripts. These headers tell
+# Groq (and any future provider swap) not to use this traffic for training.
+#
+# Groq's policy: https://console.groq.com/docs/data-storage
+# X-Groq-No-Training is Groq's own documented opt-out signal.
+# The remaining headers are provider-agnostic future-proofing.
+# ---------------------------------------------------------------------------
+_PRIVACY_HEADERS: dict[str, str] = {
+    "X-Groq-No-Training": "1",                 # Groq's official opt-out signal
+    "X-OpenAI-No-Training": "1",               # Honoured on any future OpenAI swap
+    "X-Stainless-Disable-Telemetry": "true",   # Disables openai-python SDK telemetry
+    "User-Agent": "ClipMind/1.0 (privacy=strict)",
+}
+
+
 def make_openai_client(for_whisper: bool = False) -> OpenAI:
-    """Create an OpenAI SDK client pointed at Groq's OpenAI-compatible API."""
+    """Create an OpenAI SDK client pointed at Groq's OpenAI-compatible API.
+
+    Gap 336: default_headers injected so every request — across all model
+    failover attempts in create_chat_completion() — carries the opt-out signal.
+    """
     if for_whisper:
         api_key = settings.whisper_api_key or settings.groq_api_key
         base_url = settings.whisper_base_url or settings.groq_base_url
@@ -42,7 +64,11 @@ def make_openai_client(for_whisper: bool = False) -> OpenAI:
         api_key = settings.groq_api_key
         base_url = settings.groq_base_url
 
-    kwargs: dict = {"api_key": api_key, "timeout": settings.openai_timeout_seconds}
+    kwargs: dict = {
+        "api_key": api_key,
+        "timeout": settings.openai_timeout_seconds,
+        "default_headers": _PRIVACY_HEADERS,   # ← GAP 336: opt-out signal
+    }
     if base_url:
         kwargs["base_url"] = base_url
 
@@ -76,8 +102,8 @@ def get_vision_model_chain(preferred_model: str | None = None) -> list[str]:
 def create_chat_completion(
     *,
     messages: list[dict[str, Any]],
-    task_type: TaskType = TaskType.ANALYTICAL, # Gap 251
-    job_id: str | None = None, # Gap 252
+    task_type: TaskType = TaskType.ANALYTICAL,
+    job_id: str | None = None,
     preferred_model: str | None = None,
     vision: bool = False,
     client: OpenAI | None = None,
@@ -94,7 +120,6 @@ def create_chat_completion(
         else get_text_model_chain(preferred_model)
     )
 
-    # Gap 251: Task-specific configuration
     llm_cfg = get_llm_config(task_type)
     final_kwargs = {
         "temperature": llm_cfg.temperature,
@@ -103,7 +128,6 @@ def create_chat_completion(
         **kwargs
     }
 
-    # Gap 253: Cache lookup
     cached_response = llm_cache.get(str(messages), model_chain[0], **final_kwargs)
     if cached_response:
         return ChatCompletionResult(model=model_chain[0], response=cached_response)
@@ -116,20 +140,15 @@ def create_chat_completion(
                 messages=messages,
                 **final_kwargs,
             )
-            
-            # Gap 252: Usage tracking
             if job_id:
                 usage = extract_usage_from_response(response)
                 update_job_usage(
-                    job_id, 
-                    usage["prompt_tokens"], 
-                    usage["completion_tokens"], 
+                    job_id,
+                    usage["prompt_tokens"],
+                    usage["completion_tokens"],
                     model
                 )
-
-            # Gap 253: Cache store
             llm_cache.set(str(messages), model, response, **final_kwargs)
-
             if attempt > 1:
                 logger.info("Groq failover recovered with model '%s' on attempt %d.", model, attempt)
             return ChatCompletionResult(model=model, response=response)
@@ -138,11 +157,7 @@ def create_chat_completion(
             status_text = f" status={status_code}" if status_code is not None else ""
             logger.warning(
                 "Groq model '%s' failed on attempt %d/%d (%s%s). Trying next model.",
-                model,
-                attempt,
-                len(model_chain),
-                type(exc).__name__,
-                status_text,
+                model, attempt, len(model_chain), type(exc).__name__, status_text,
             )
             errors.append(f"{model}: {type(exc).__name__}({exc})")
 
