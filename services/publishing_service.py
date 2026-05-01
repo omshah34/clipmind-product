@@ -4,10 +4,12 @@ from __future__ import annotations
 import hashlib
 
 from datetime import datetime, timezone
+import time
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import httpx
 from fastapi import HTTPException
 from sqlalchemy import text
 
@@ -26,6 +28,105 @@ from db.repositories.publish import (
 from services.llm_integration import optimize_captions_with_llm
 from services.publishing_adapters import get_publish_adapter
 from services.storage import storage_service
+from core.redis import get_redis_client
+
+
+class TokenRefreshError(Exception):
+    pass
+
+
+async def get_valid_token(platform: str, user_id: str) -> str:
+    """
+    Gap 281: Always returns a valid access token, refreshing if needed.
+    """
+    # Fetch integration from DB
+    query = text(
+        """
+        SELECT id, platform, access_token_encrypted as access_token, 
+               refresh_token_encrypted as refresh_token, expires_at
+        FROM platform_credentials
+        WHERE user_id = :user_id AND platform = :platform
+        """
+    )
+    with engine.connect() as connection:
+        row = connection.execute(query, {"user_id": str(user_id), "platform": platform}).fetchone()
+
+    if not row:
+        raise TokenRefreshError(f"No integration found for {platform}")
+
+    integration = dict(row._mapping)
+    
+    # In a real system, we'd decrypt access_token/refresh_token here using SecretManager
+    # For this gap, we assume they are accessible or decrypted elsewhere
+    
+    # Check if token expires within next 5 minutes
+    buffer_secs = 300
+    expires_at = integration.get("expires_at")
+    
+    # Convert expires_at to timestamp if it's a datetime
+    expires_ts = 0
+    if isinstance(expires_at, datetime):
+        expires_ts = expires_at.timestamp()
+    elif isinstance(expires_at, (int, float)):
+        expires_ts = expires_at
+
+    if expires_ts and expires_ts - time.time() < buffer_secs:
+        return await _refresh_token(integration, user_id)
+
+    return integration["access_token"]
+
+
+async def _refresh_token(integration: dict, user_id: str) -> str:
+    REFRESH_URLS = {
+        "youtube": "https://oauth2.googleapis.com/token",
+        "tiktok": "https://open-api.tiktok.com/oauth/refresh_token/",
+        "linkedin": "https://www.linkedin.com/oauth/v2/accessToken",
+    }
+    platform = integration["platform"]
+    url = REFRESH_URLS.get(platform)
+    if not url:
+        raise TokenRefreshError(f"No refresh URL for platform: {platform}")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(url, data={
+            "grant_type": "refresh_token",
+            "refresh_token": integration["refresh_token"],
+            "client_id": settings.get_platform_client_id(platform),
+            "client_secret": settings.get_platform_client_secret(platform),
+        })
+
+    if resp.status_code != 200:
+        raise TokenRefreshError(
+            f"Token refresh failed for {platform}: {resp.status_code} {resp.text}"
+        )
+
+    data = resp.json()
+    new_token = data["access_token"]
+    expires_in = data.get("expires_in", 3600)
+    new_expiry_dt = datetime.fromtimestamp(time.time() + expires_in, tz=timezone.utc)
+
+    # Persist refreshed token
+    query = text(
+        """
+        UPDATE platform_credentials
+        SET access_token_encrypted = :access_token,
+            expires_at = :expires_at,
+            refresh_token_encrypted = :refresh_token,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = :id
+        """
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            query,
+            {
+                "id": integration["id"],
+                "access_token": new_token,
+                "expires_at": new_expiry_dt,
+                "refresh_token": data.get("refresh_token", integration["refresh_token"]),
+            }
+        )
+    return new_token
 
 
 def _parse_hashtags(value: Any) -> list[str]:
@@ -75,6 +176,17 @@ def _normalize_scheduled_for(
     if len(valid_candidates) == 2 and valid_candidates[0].utcoffset() != valid_candidates[1].utcoffset():
         chosen = fold_one
     return chosen.astimezone(timezone.utc)
+
+
+def generate_publish_idempotency_key(
+    job_id: str,
+    clip_index: int,
+    platform: str,
+    scheduled_at: datetime | None = None,
+) -> str:
+    """Gap 376: Deterministic key — same inputs always produce same key."""
+    raw = f"{job_id}:{clip_index}:{platform}:{scheduled_at.isoformat() if scheduled_at else 'immediate'}"
+    return "pub:" + hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 
 def _connected_accounts(user_id: str) -> list[dict]:
@@ -282,9 +394,24 @@ class PublishingService:
 
         clip_path = self._clip_asset_path(job_id, clip_index, clip)
         
-        # Gap 205: Generate deterministic idempotency key
-        # SHA256(job_id + clip_index + platform)
-        idempotency_key = hashlib.sha256(f"{job_id}:{clip_index}:{platform_name}".encode()).hexdigest()
+        # Gap 376: Workflow Idempotency (Double-Publish)
+        idempotency_key = generate_publish_idempotency_key(job_id, clip_index, platform_name, normalized_scheduled_for)
+        redis_client = get_redis_client()
+        
+        lock_key = f"publish_lock:{idempotency_key}"
+        # Atomic check-and-set — prevents concurrent double-publish
+        lock_acquired = redis_client.set(
+            lock_key,
+            "1",
+            nx=True,     # Only set if not exists
+            ex=3600,     # Lock expires in 1 hour
+        )
+        if not lock_acquired:
+            logger.warning(f"Publishing attempt blocked by idempotency lock: {lock_key}")
+            return {
+                "status": "already_publishing",
+                "message": "This clip is already being published to this platform."
+            }
         
         try:
             result = adapter.publish(
@@ -355,6 +482,10 @@ class PublishingService:
                 "status": "queued",
                 "engagement_metrics": {"views": 0, "likes": 0, "shares": 0},
             }
+        except Exception as e:
+            # Release lock on failure so it can be retried
+            redis_client.delete(lock_key)
+            raise
         finally:
             try:
                 if clip_path.exists():

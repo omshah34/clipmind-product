@@ -7,16 +7,17 @@
 
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { downloadClip } from '@/lib/api';
 
 type ClipPlayerProps = {
   clipUrl: string;
   jobId: string;
   clipIndex: number;   // 0-based clip index used by the API
+  onTimeUpdate?: (time: number) => void;
 };
 
-export default function ClipPlayer({ clipUrl, jobId, clipIndex }: ClipPlayerProps) {
+export default function ClipPlayer({ clipUrl, jobId, clipIndex, onTimeUpdate }: ClipPlayerProps) {
   const [copying, setCopying]     = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [dlError, setDlError]     = useState<string | null>(null);
@@ -56,6 +57,53 @@ export default function ClipPlayer({ clipUrl, jobId, clipIndex }: ClipPlayerProp
     setVideoError({ code: error.code, message });
   };
 
+  // Gap 354: Precision Scrubbing & rAF Playhead
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const isSeeking = useRef(false);
+  const pendingSeek = useRef<number | null>(null);
+  const rafId = useRef<number>();
+
+  const seekTo = useCallback((time: number) => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    if (isSeeking.current) {
+      pendingSeek.current = time;
+      return;
+    }
+
+    isSeeking.current = true;
+    video.currentTime = time;
+  }, []);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    const onSeeked = () => {
+      isSeeking.current = false;
+      if (pendingSeek.current !== null) {
+        const next = pendingSeek.current;
+        pendingSeek.current = null;
+        seekTo(next);
+      }
+    };
+
+    const tick = () => {
+      if (!video.paused && onTimeUpdate) {
+        onTimeUpdate(video.currentTime);
+      }
+      rafId.current = requestAnimationFrame(tick);
+    };
+    rafId.current = requestAnimationFrame(tick);
+
+    video.addEventListener("seeked", onSeeked);
+    return () => {
+      video.removeEventListener("seeked", onSeeked);
+      if (rafId.current) cancelAnimationFrame(rafId.current);
+    };
+  }, [seekTo, onTimeUpdate]);
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
       <div style={{
@@ -63,14 +111,17 @@ export default function ClipPlayer({ clipUrl, jobId, clipIndex }: ClipPlayerProp
         aspectRatio: '9/16', maxHeight: 260, display: 'flex', alignItems: 'center', justifyContent: 'center',
       }}>
         {isValid ? (
-          <video
-            controls
-            playsInline
-            preload="metadata"
-            src={clipUrl}
-            style={{ width: '100%', height: '100%', objectFit: 'contain', background: '#07080d' }}
-            onError={handleVideoError}
-          />
+          <div style={{ width: "100%", height: "100%", isolation: "isolate", position: "relative" }}>
+            <video
+              ref={videoRef}
+              controls
+              playsInline
+              preload="metadata"
+              src={clipUrl}
+              style={{ width: '100%', height: '100%', objectFit: 'contain', background: '#07080d', display: "block" }}
+              onError={handleVideoError}
+            />
+          </div>
         ) : (
           <div style={{ color: '#555870', fontSize: 12, textAlign: 'center', padding: 20 }}>
             {videoError ? (

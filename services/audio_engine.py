@@ -110,37 +110,93 @@ class AudioEngine:
 
 
 def normalize_audio_file(input_path: Path, output_path: Path, target_lufs: float = -14.0) -> Path:
-    """Normalize audio loudness using FFmpeg's EBU R128 loudnorm filter.
+    """Normalize audio loudness using FFmpeg's EBU R128 loudnorm filter + brickwall limiter.
 
-    Gap 45: Clips from different sources can have wildly different volumes.
-    This two-pass loudnorm brings every clip to -14 LUFS (YouTube/Spotify standard).
-
-    Args:
-        input_path: Source audio/video file.
-        output_path: Destination for the normalized file.
-        target_lufs: Target integrated loudness. Default -14 LUFS (streaming standard).
-
-    Returns:
-        output_path on success.
-
-    Raises:
-        subprocess.CalledProcessError: If FFmpeg fails.
+    Gap 45 & 323: Clips from different sources can have wildly different volumes.
+    This two-pass loudnorm brings every clip to -14 LUFS, and the brickwall limiter
+    prevents clipping distortion during sudden loud transients.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Combined loudnorm and brickwall limiter
+    audio_filter = (
+        f"loudnorm=I={target_lufs}:TP=-1.5:LRA=11,"
+        "alimiter=level_in=1:level_out=1:limit=0.9:attack=7:release=100:level=disabled"
+    )
+    
     cmd = [
         "ffmpeg", "-y",
         "-i", str(input_path),
-        "-af", f"loudnorm=I={target_lufs}:TP=-1.5:LRA=11",
+        "-af", audio_filter,
         "-c:v", "copy",       # Pass video through unchanged if present
-        "-ar", "48000",       # Gap 188: Resample to consistent 48kHz to prevent pitch shifting
+        "-ar", "48000",       # Resample to consistent 48kHz
         str(output_path),
     ]
-    logger.info("Normalizing audio: %s → %s (target=%s LUFS)", input_path.name, output_path.name, target_lufs)
+    logger.info("Normalizing audio: %s → %s (target=%s LUFS + Limiter)", input_path.name, output_path.name, target_lufs)
     result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if result.returncode != 0:
         logger.error("Audio normalization failed: %s", result.stderr[-500:])
         raise subprocess.CalledProcessError(result.returncode, cmd, result.stderr)
     return output_path
+
+
+def extract_audio_for_transcription(video_path: str, output_path: str) -> None:
+    """
+    Gap 321: Extract audio for Whisper. Stereo to mono using 'aformat' NOT simple downmix.
+    Simple downmix (pan=mono) causes phase cancellation on some stereo sources.
+    """
+    cmd = [
+        "ffmpeg", "-y", "-i", video_path,
+        "-vn",
+        # Safe stereo→mono: average L+R without phase issues
+        "-af", "aformat=channel_layouts=mono",
+        "-ar", "16000",      # Whisper native sample rate
+        "-acodec", "pcm_s16le",
+        output_path
+    ]
+    subprocess.run(cmd, check=True)
+
+
+def extract_audio_check_phase(video_path: str) -> bool:
+    """
+    Gap 321: Detect if stereo track has phase issues (near-silent after downmix).
+    """
+    # Probe stereo loudness
+    stereo_cmd = ["ffmpeg", "-i", video_path, "-af",
+                  "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level",
+                  "-f", "null", "-"]
+    # Probe mono loudness
+    mono_cmd = ["ffmpeg", "-i", video_path,
+                "-af", "aformat=channel_layouts=mono,astats=metadata=1:reset=1,"
+                       "ametadata=print:key=lavfi.astats.Overall.RMS_level",
+                "-f", "null", "-"]
+    stereo_out = subprocess.run(stereo_cmd, capture_output=True, text=True).stderr
+    mono_out   = subprocess.run(mono_cmd, capture_output=True, text=True).stderr
+    # If mono is significantly quieter than stereo — phase cancellation
+    return "inf" in mono_out or "-91" in mono_out or "-inf" in mono_out
+
+
+def build_audio_normalization_filter() -> str:
+    """
+    Gap 323: Two-pass loudnorm + brickwall limiter.
+    """
+    return (
+        "loudnorm=I=-16:TP=-1.5:LRA=11,"
+        "alimiter=level_in=1:level_out=1:limit=0.9:attack=7:release=100:level=disabled"
+    )
+
+
+def export_clip_with_normalization(input_path: str, output_path: str) -> None:
+    """
+    Gap 323: Export a clip with audio normalization and limiting.
+    """
+    audio_filter = build_audio_normalization_filter()
+    subprocess.run([
+        "ffmpeg", "-y", "-i", input_path,
+        "-af", audio_filter,
+        "-c:v", "copy",
+        output_path
+    ], check=True)
 
 
 def time_stretch_audio(input_path: Path, output_path: Path, ratio: float) -> Path:

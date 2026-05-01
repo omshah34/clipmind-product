@@ -11,6 +11,44 @@ interface Clip {
   selected: boolean;
 }
 
+const isTouchDevice =
+  typeof window !== "undefined" &&
+  ("ontouchstart" in window || navigator.maxTouchPoints > 0);
+
+interface TrimHandleProps {
+  side: 'start' | 'end';
+  onDrag: (e: React.PointerEvent) => void;
+}
+
+function ClipTrimHandle({ side, onDrag }: TrimHandleProps) {
+  return (
+    <div
+      className={`trim-handle trim-handle--${side}`}
+      style={{
+        position: 'absolute',
+        top: 0,
+        bottom: 0,
+        [side === 'start' ? 'left' : 'right']: 0,
+        width: isTouchDevice ? 16 : 8,
+        minWidth: isTouchDevice ? '44px' : 'auto', // Apple HIG target
+        cursor: 'col-resize',
+        background: 'rgba(255,255,255,0.1)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        zIndex: 20,
+        touchAction: 'none',
+      }}
+      onPointerDown={(e) => {
+        e.currentTarget.setPointerCapture(e.pointerId);
+        onDrag(e);
+      }}
+    >
+      <div style={{ width: 2, height: 12, background: 'rgba(255,255,255,0.3)', borderRadius: 1 }} />
+    </div>
+  );
+}
+
 interface Props {
   duration?: number;   // total video seconds
   clips?: Clip[];

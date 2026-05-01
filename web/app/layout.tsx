@@ -7,10 +7,20 @@
 import type { ReactNode } from "react";
 import React from "react";
 import type { Metadata, Viewport } from "next";
+import { Inter } from "next/font/google";
 import { Providers } from "./providers";
 import BodyShell from "./BodyShell";
 import AppShell from "../components/AppShell";
 import "./globals.css";
+
+// Gap 275: next/font handles preloading + font-display automatically
+const inter = Inter({
+  subsets: ["latin"],
+  display: "swap",           // Prevent invisible text flash
+  preload: true,
+  fallback: ["system-ui", "arial"], // Reserve identical layout space
+  adjustFontFallback: true,  // ← Key: adjusts fallback metrics to match Inter
+});
 
 export const metadata: Metadata = {
   title: "ClipMind — AI Video Studio",
@@ -24,7 +34,7 @@ export const viewport: Viewport = {
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html lang="en" className={inter.className} suppressHydrationWarning>
       <head>
         <script
           dangerouslySetInnerHTML={{

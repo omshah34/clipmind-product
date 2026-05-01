@@ -6,6 +6,7 @@
  */
 
 import React, { useState, useEffect, useRef } from "react";
+import { createPortal } from "react-dom";
 
 interface ExportPreviewModalProps {
   isOpen: boolean;
@@ -76,7 +77,7 @@ export default function ExportPreviewModal({
     setTimeout(() => setCopied(false), 2000);
   };
 
-  return (
+  return createPortal(
     <div className="modal-overlay" style={{
       position: "fixed", top: 0, left: 0, right: 0, bottom: 0,
       background: "rgba(0, 0, 0, 0.8)", backdropFilter: "blur(8px)",
@@ -142,6 +143,7 @@ export default function ExportPreviewModal({
       <style jsx>{`
         @keyframes slideUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
       `}</style>
-    </div>
+    </div>,
+    document.body
   );
 }

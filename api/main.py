@@ -4,6 +4,7 @@ Purpose: FastAPI application entry point. Registers all routes and middleware,
 """
 
 from __future__ import annotations
+import asyncio
 
 from core.logging_config import setup_logging
 setup_logging()
@@ -31,6 +32,9 @@ async def lifespan(app: FastAPI):
     logger.info("ClipMind API starting up...")
     for warning in get_runtime_config_warnings():
         logger.warning("Config warning: %s", warning)
+    
+    # Gap 370: Set global exception handler for truly unhandled cases
+    asyncio.get_event_loop().set_exception_handler(_handle_task_exception)
     
     # Gap 208: Initialize shared Redis clients
     await ws_manager.init_redis(app)
@@ -66,6 +70,38 @@ from db.feature_flags import feature_flag_enabled
 from api.v1.router import v1_router
 
 logger = logging.getLogger(__name__)
+
+# Gap 370: Global registry for background tasks to prevent GC
+_background_tasks: set[asyncio.Task] = set()
+
+def safe_background_task(coro):
+    """
+    Wrap a coroutine so exceptions are always logged/reported.
+    Never swallow silently.
+    """
+    async def _wrapped():
+        try:
+            await coro
+        except asyncio.CancelledError:
+            raise  # Normal — don't log
+        except Exception as e:
+            logger.error(f"Background task failed: {e}", exc_info=True)
+            if sentry_sdk:
+                sentry_sdk.capture_exception(e)
+
+    task = asyncio.create_task(_wrapped())
+    # Keep strong reference — prevents GC from killing the task
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+def _handle_task_exception(loop, context):
+    """Gap 370: Global asyncio exception handler."""
+    exc = context.get("exception")
+    msg = context.get("message")
+    logger.error(f"Unhandled asyncio exception: {msg}", exc_info=exc)
+    if exc and sentry_sdk:
+        sentry_sdk.capture_exception(exc)
 
 # Sentry Initialization
 if os.getenv("SENTRY_DSN"):
@@ -186,9 +222,9 @@ async def healthcheck() -> dict:
     }
     status_code = 200
     try:
-        from db.connection import engine
+        from db.connection import fast_engine
         from sqlalchemy import text
-        with engine.connect() as conn:
+        with fast_engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         health["dependencies"]["postgres"] = "healthy"
     except Exception:

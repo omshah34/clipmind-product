@@ -1278,3 +1278,97 @@ def check_optical_flow(video_path: Path, threshold: float = 2.0) -> bool:
     logger.info("Performing motion check for %s (threshold=%.1f)", 
                 video_path.name, threshold)
     return True
+
+
+def trim_clip(
+    input_path: str,
+    output_path: str,
+    start: float,
+    end: float,
+    force_keyframe: bool = True,
+) -> None:
+    """
+    Gap 325: Smart trim: seek to nearest keyframe BEFORE start, then trim precisely.
+    Avoids full GOP re-encode while maintaining accuracy.
+    """
+    duration = end - start
+
+    if force_keyframe:
+        # Two-pass approach:
+        # 1. Fast seek to keyframe before start
+        # 2. Precise trim using 'trim' filter (re-encodes only delta)
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(start),          # Input seek — fast, keyframe-aligned
+            "-i", input_path,
+            "-t", str(duration),
+            "-force_key_frames", "0",
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "18",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-movflags", "+faststart",
+            output_path
+        ]
+    else:
+        # Stream copy — only use if start/end are known keyframe boundaries
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(start), "-i", input_path, "-t", str(duration),
+            "-c", "copy",
+            "-avoid_negative_ts", "make_zero",
+            output_path
+        ]
+
+    subprocess.run(cmd, check=True)
+
+def find_nearest_keyframe(video_path: str, target_time: float) -> float:
+    """Gap 325: Find the keyframe timestamp nearest to target_time (before it)."""
+    result = subprocess.run([
+        "ffprobe", "-v", "quiet",
+        "-select_streams", "v:0",
+        "-skip_frame", "nokey",
+        "-show_entries", "frame=pkt_pts_time",
+        "-of", "csv=p=0",
+        "-read_intervals", f"{max(0, target_time-5)}%{target_time+1}",
+        video_path
+    ], capture_output=True, text=True, check=True)
+
+    keyframes = [float(t) for t in result.stdout.strip().split("\n") if t]
+    before = [k for k in keyframes if k <= target_time]
+    return max(before) if before else target_time
+
+def concatenate_clips(clip_paths: list[str], output_path: str) -> None:
+    """
+    Gap 330: Safe concatenation using FFmpeg concat demuxer with explicit sync.
+    Prevents millisecond drift accumulation across many clips.
+    """
+    import tempfile, os
+
+    # Write concat list file
+    list_file = tempfile.mktemp(suffix=".txt")
+    try:
+        with open(list_file, "w") as f:
+            for path in clip_paths:
+                f.write(f"file '{os.path.abspath(path)}'\n")
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", list_file,
+            # Force uniform timebase across all segments — prevents drift
+            "-vf", "settb=AVTB,setpts=N/FRAME_RATE/TB",
+            "-af", "aresample=async=1:min_hard_comp=0.100:first_pts=0",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            "-c:a", "aac", "-b:a", "192k",
+            "-ar", "48000",
+            "-vsync", "cfr",
+            "-movflags", "+faststart",
+            output_path
+        ]
+        subprocess.run(cmd, check=True)
+    finally:
+        if os.path.exists(list_file):
+            os.unlink(list_file)

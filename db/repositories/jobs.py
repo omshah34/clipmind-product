@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from enum import Enum
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from uuid import UUID, uuid4
@@ -14,6 +15,34 @@ from api.models.job import JobRecord
 from db.connection import engine
 from db.job_state import record_job_transition
 from db.repositories.clips import insert_clip_rows
+
+class JobStatus(str, Enum):
+    PENDING    = "pending"
+    UPLOADED   = "uploaded"
+    QUEUED     = "queued"
+    PROCESSING = "processing"
+    COMPLETED  = "completed"
+    FAILED     = "failed"
+    CANCELLED  = "cancelled"
+    REJECTED   = "rejected"
+    PARTIAL    = "partial"
+
+# Gap 373: Valid transitions graph
+VALID_TRANSITIONS: dict[JobStatus, set[JobStatus]] = {
+    JobStatus.UPLOADED:   {JobStatus.QUEUED, JobStatus.FAILED},
+    JobStatus.QUEUED:     {JobStatus.PROCESSING, JobStatus.FAILED, JobStatus.CANCELLED},
+    JobStatus.PROCESSING: {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.PARTIAL, JobStatus.CANCELLED},
+    JobStatus.FAILED:     {JobStatus.QUEUED, JobStatus.PENDING}, # Re-queue only
+    JobStatus.PARTIAL:    {JobStatus.PROCESSING, JobStatus.COMPLETED, JobStatus.CANCELLED},
+    JobStatus.COMPLETED:  {JobStatus.REJECTED},
+    JobStatus.CANCELLED:  {JobStatus.QUEUED},
+    JobStatus.REJECTED:   set(), # Terminal
+    JobStatus.PENDING:    {JobStatus.QUEUED, JobStatus.PROCESSING},
+}
+
+class InvalidTransitionError(Exception):
+    """Gap 373: Raised when a job status transition is not allowed."""
+    pass
 
 JSON_FIELDS = {"transcript_json", "clips_json", "timeline_json"}
 UPDATABLE_FIELDS = {
@@ -233,6 +262,21 @@ def update_job(job_id: UUID | str, **fields: Any) -> JobRecord:
         for field in ["source_video_url", "proxy_video_url", "audio_url"]:
             if field in fields and getattr(current, field) and fields[field] != getattr(current, field):
                 old_urls.append(getattr(current, field))
+
+    # Gap 373: Validate status transitions if status is being updated
+    if "status" in fields and previous_status and fields["status"] != previous_status:
+        current_status_enum = JobStatus(previous_status)
+        new_status_enum = JobStatus(fields["status"])
+        
+        allowed = VALID_TRANSITIONS.get(current_status_enum, set())
+        if new_status_enum not in allowed:
+            # For resilience, we log warning in dev/test but could raise in production
+            # For now, let's just log and block the update if strictly necessary
+            # Actually, the user requested InvalidTransitionError
+            raise InvalidTransitionError(
+                f"Job {job_id}: cannot transition {previous_status!r} → {fields['status']!r}. "
+                f"Allowed: {[s.value for s in allowed]}"
+            )
 
     query = text(
         f"""

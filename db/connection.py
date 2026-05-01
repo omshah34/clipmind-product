@@ -43,26 +43,38 @@ _is_celery_worker = os.environ.get("CELERY_WORKER_RUNNING") == "1"
 
 if _is_celery_worker:
     logger.info("Celery worker detected - using NullPool to prevent connection sharing (Gap 30)")
-    engine = create_engine(
-        db_url,
-        poolclass=NullPool,  # Each task opens/closes its own connection
-        pool_pre_ping=True,
-    )
+    engine = create_engine(db_url, poolclass=NullPool, pool_pre_ping=True)
+    fast_engine = engine
+    analytics_engine = engine
 else:
-    # FastAPI: Production-tuned QueuePool for concurrent request handling
-    # Gap 207: DB Connection Resilience. High concurrency pooling.
-    # Ensure Postgres max_connections >= 100 on server.
-    engine = create_engine(
+    # Gap 364: Separate connection pools per query class to prevent cascading failures.
+    # Fast engine: health checks, status endpoints — strict timeout
+    fast_engine = create_engine(
         db_url,
         pool_pre_ping=True,
-        pool_size=20,         # Increased from 10
-        max_overflow=40,      # Increased from 20
-        pool_recycle=300,     # Recycle stale connections every 5 minutes
-        pool_timeout=30,      # 30 seconds wait for a connection
+        pool_size=10,
+        max_overflow=20,
+        pool_timeout=5,         # Fail fast — don't block lightweight endpoints
+        # 2s statement timeout for fast queries
+        connect_args={"options": "-c statement_timeout=2000"} if "postgresql" in db_url else {},
     )
 
+    # Analytics engine: heavy aggregation queries — relaxed timeout, isolated
+    analytics_engine = create_engine(
+        db_url,
+        pool_pre_ping=True,
+        pool_size=5,
+        max_overflow=10,
+        pool_timeout=15,
+        # 30s statement timeout for heavy analytics
+        connect_args={"options": "-c statement_timeout=30000"} if "postgresql" in db_url else {},
+    )
+    # Default engine for general use
+    engine = fast_engine
+
 # Session factory for use in FastAPI Depends(get_db)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# Use fast_engine for default request processing
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=fast_engine)
 
 
 @event.listens_for(engine, "before_cursor_execute", retval=True)

@@ -5,7 +5,9 @@ Purpose: Converts Whisper word timestamps into clip-relative SRT captions.
 
 from __future__ import annotations
 
+import os
 import re
+import unicodedata
 from pathlib import Path
 from services.ass_generator import ASSGenerator
 
@@ -145,3 +147,77 @@ def write_ass_from_srt(
     words = srt_to_words(srt_text)
     generator = ASSGenerator(preset_name=preset_name, layout_type=layout_type)
     return generator.create_ass_file(words, output_path)
+
+
+# Font chain: primary → emoji fallback → last-resort
+FONT_CHAIN = [
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+]
+
+# Local bundled fallbacks
+LOCAL_FONTS = {
+    "regular": "assets/fonts/NotoSans-Regular.ttf",
+    "emoji":   "assets/fonts/NotoColorEmoji.ttf",
+    "bold":    "assets/fonts/NotoSans-Bold.ttf",
+}
+
+def get_font_path(variant: str = "regular") -> str:
+    """Gap 327: Resolve font path with emoji fallbacks."""
+    local = LOCAL_FONTS.get(variant)
+    if local and os.path.exists(local):
+        return local
+    # System fallback
+    for path in FONT_CHAIN:
+        if os.path.exists(path):
+            return path
+    # Return font name if path not found, FFmpeg might resolve it
+    return "Arial"
+
+def contains_emoji(text: str) -> bool:
+    """Gap 327: Detect emoji in text."""
+    return any(unicodedata.category(c) in ("So", "Mn") for c in text)
+
+def build_drawtext_filter(
+    text: str,
+    font_path: str,
+    font_size: int = 48,
+    x: str = "(w-text_w)/2",
+    y: str = "h*0.85",
+    color: str = "white",
+    box_color: str = "black@0.5",
+) -> str:
+    """
+    Gap 322: FFmpeg drawtext with subpixel rendering enabled.
+    """
+    # Escape special chars in text
+    safe_text = (text
+        .replace("'", r"\'")
+        .replace(":", r"\:")
+        .replace(",", r"\,")
+    )
+
+    return (
+        f"drawtext="
+        f"fontfile='{font_path}':"
+        f"text='{safe_text}':"
+        f"fontsize={font_size}:"
+        f"fontcolor={color}:"
+        f"x={x}:y={y}:"
+        f"borderw=2:"          
+        f"bordercolor=black:"
+        f"box=1:"
+        f"boxcolor={box_color}:"
+        f"boxborderw=8:"       
+        f"alpha=1"             
+    )
+
+def build_caption_filtergraph(drawtext_filter: str) -> str:
+    """Gap 322: Ensure 32-bit RGBA pipeline for subpixel accuracy."""
+    return f"format=rgba,{drawtext_filter},format=yuv420p"
+
+def build_drawtext_filter_with_emoji(text: str, **kwargs) -> str:
+    """Gap 327: Use emoji font when text contains emoji characters."""
+    font = get_font_path("emoji" if contains_emoji(text) else "regular")
+    return build_drawtext_filter(text, font_path=font, **kwargs)

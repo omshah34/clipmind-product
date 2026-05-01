@@ -24,7 +24,7 @@ from api.models.job import (
     JobRejectionResponse,
     ClipSearchResponse,
 )
-from db.repositories.jobs import get_job, list_jobs_for_user, update_job
+from db.repositories.jobs import get_job, list_jobs_for_user, update_job, JobStatus, InvalidTransitionError
 from db.connection import engine
 from services.discovery import get_discovery_service
 from api.dependencies import get_current_user, AuthenticatedUser
@@ -319,4 +319,36 @@ async def delete_job_endpoint(
         "status": "success",
         "message": f"Job {job_id} and {deleted_count}/{len(files_to_delete)} referenced files deleted; {orphaned_count} orphaned artifacts removed.",
         "job_id": job_id
+    }
+
+
+@router.post("/{job_id}/cancel", status_code=200)
+async def cancel_job(
+    job_id: str,
+    user: AuthenticatedUser = Depends(get_current_user)
+):
+    """
+    Gap 375: Cancel a job and its associated storage files.
+    """
+    from workers.pipeline import revoke_job_recursively
+    from db.repositories.jobs import get_job
+    
+    job = get_job(job_id, user_id=user.user_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    # 1. Revoke all Celery tasks (parent + children)
+    revoked_count = revoke_job_recursively(job_id)
+    
+    # 2. Transition state machine
+    try:
+        update_job(job_id, status=JobStatus.CANCELLED.value)
+    except InvalidTransitionError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    
+    return {
+        "status": "success",
+        "message": f"Job {job_id} cancelled. {revoked_count} tasks terminated.",
+        "job_id": job_id,
+        "revoked_tasks": revoked_count
     }

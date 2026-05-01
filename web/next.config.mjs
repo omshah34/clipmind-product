@@ -7,6 +7,9 @@
 const nextConfig = {
   reactStrictMode: true,
   productionBrowserSourceMaps: true,
+  experimental: {
+    optimizeCss: true, // Inline critical CSS, defer rest
+  },
   async headers() {
     return [
       {

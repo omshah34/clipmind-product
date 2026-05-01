@@ -138,3 +138,45 @@ code, kbd, pre { font-family: var(--font-mono); }
 
 /* ─── Scrollable area ─── */
 .scroll-area { overflow-y: auto; scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+
+/* Gap 275 — Font load optimisation */
+@font-face {
+  font-family: "ClipMindSans";
+  src: url("/fonts/clipmindsans.woff2") format("woff2");
+  font-display: optional; /* Never swap — eliminates CLS entirely */
+  font-weight: 400 700;
+  size-adjust: 105%; /* Tune until fallback layout matches */
+}
+
+/* Gap 276 — Hover-Only Actions Fix */
+.clip-actions { 
+  opacity: 0.85; 
+  transition: opacity 0.2s ease;
+}
+
+@media (hover: hover) {
+  .clip-actions { opacity: 0; }
+  .clip-card:hover .clip-actions { opacity: 1; }
+}
+
+/* Gap 360 — Z-Index Stacking Contexts (Dialogs Behind Video) */
+[data-radix-dialog-overlay],
+[data-radix-dialog-content],
+.modal-overlay {
+  /* Use a portal — render outside the video's stacking context */
+  position: fixed;
+  z-index: 9999 !important;
+}
+
+/* Prevent canvas/video from escaping its container's stacking context */
+canvas, video {
+  isolation: isolate;
+}
+
+/* Scroll virtualization row styles */
+.timeline-word-row {
+  transition: background-color 0.1s ease;
+}
+.timeline-word-row:hover {
+  background-color: var(--bg-elevated);
+}

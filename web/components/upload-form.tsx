@@ -3,6 +3,7 @@
 import React, { useState, useRef, useCallback, useEffect } from "react";
 import { useRouter } from "next/navigation";
 
+import { useQuery } from "@tanstack/react-query";
 import {
   completeDirectUpload,
   failDirectUpload,
@@ -11,13 +12,15 @@ import {
   probeVideoDuration,
   uploadFileToSignedUrl,
   uploadVideo,
+  getJobStatus,
 } from "../lib/api";
 import {
   uploadFileChunked,
   shouldUseChunkedUpload,
 } from "../lib/chunked-uploader";
+import { fetchWithCancel } from "../lib/api-client";
 
-type UploadMode = "idle" | "dragging" | "url-preview" | "uploading" | "done";
+type UploadPhase = "idle" | "dragging" | "url-preview" | "uploading" | "processing" | "done";
 
 interface VideoPreview {
   thumbnail: string;
@@ -45,13 +48,73 @@ async function fetchVideoPreview(url: string): Promise<VideoPreview | null> {
   };
 }
 
+function UploadProgress({ phase, uploadPct, jobId }: { 
+  phase: UploadPhase, 
+  uploadPct: number, 
+  jobId: string | null 
+}) {
+  // Gap 277: Poll job status during processing phase
+  const { data: job } = useQuery({
+    queryKey: ["job", jobId],
+    queryFn: () => getJobStatus(jobId!),
+    enabled: phase === "processing" && !!jobId,
+    refetchInterval: 2000,
+  });
+
+  const label = {
+    idle: "",
+    uploading: `Uploading… ${Math.round(uploadPct)}%`,
+    processing: `Processing… ${Math.round((job?.status === 'completed' ? 100 : 50))}%`, // Simplified progress mapping
+    complete: "✅ Done",
+    error: "❌ Failed",
+  }[phase];
+
+  const pct = {
+    idle: 0,
+    uploading: uploadPct * 0.4,        // Upload = 0–40%
+    processing: 40 + (job?.status === 'completed' ? 60 : 30), // Processing = 40–100%
+    complete: 100,
+    error: 0,
+  }[phase];
+
+  return (
+    <div style={{
+      background: "var(--bg-surface)", border: "1px solid var(--border)",
+      borderRadius: "var(--radius-lg)", padding: "20px 18px",
+      marginBottom: "16px",
+    }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "8px" }}>
+        <span style={{ fontSize: "13px", fontWeight: 500 }}>{label}</span>
+        <span style={{ fontSize: "12px", fontFamily: "var(--font-mono)", color: "var(--text-secondary)" }}>
+          {Math.round(pct)}%
+        </span>
+      </div>
+      <div style={{ height: 4, background: "var(--bg-elevated)", borderRadius: "99px", overflow: "hidden" }}>
+        <div style={{
+          height: "100%",
+          width: `${pct}%`,
+          background: "var(--accent)",
+          borderRadius: "99px",
+          transition: "width 0.15s ease",
+        }} />
+      </div>
+      {phase === "processing" && (
+        <p style={{ fontSize: "11px", color: "var(--text-tertiary)", marginTop: "8px" }}>
+          {job?.failed_stage ? `Failed at: ${job.failed_stage}` : (job?.status === 'completed' ? "Ready!" : "AI analyzing content…")}
+        </p>
+      )}
+    </div>
+  );
+}
+
 export default function UploadForm() {
   const router = useRouter();
-  const [mode, setMode] = useState<UploadMode>("idle");
+  const [mode, setMode] = useState<UploadPhase>("idle");
   const [url, setUrl] = useState("");
   const [preview, setPreview] = useState<VideoPreview | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
-  const [progress, setProgress] = useState(0);
+  const [uploadPct, setUploadPct] = useState(0);
+  const [jobId, setJobId] = useState<string | null>(null);
   const [file, setFile] = useState<File | null>(null);
   const [brandKit, setBrandKit] = useState("default");
   const [autoPublish, setAutoPublish] = useState(false);
@@ -129,7 +192,7 @@ export default function UploadForm() {
 
     setMode("uploading");
     setError(null);
-    setProgress(0);
+    setUploadPct(0);
     let directUploadSession: { job_id: string } | null = null;
 
     try {
@@ -141,9 +204,11 @@ export default function UploadForm() {
           file,
           undefined,
           ({ uploadedBytes, totalBytes }) => {
-            setProgress((uploadedBytes / totalBytes) * 100);
+            setUploadPct((uploadedBytes / totalBytes) * 100);
           }
         );
+        // After chunked upload completes, we would normally get a job_id or poll
+        // For this demo, we'll push to a generic new job page or similar
         router.push(`/jobs/new?source=${encodeURIComponent(sourceVideoUrl)}&brand_kit=${brandKit}&auto_publish=${autoPublish}`);
         return;
       }
@@ -152,15 +217,16 @@ export default function UploadForm() {
       const durationSeconds = await probeVideoDuration(file);
       if (uploadCapabilities.direct_upload) {
         const session = await initDirectUpload(file, durationSeconds);
-        directUploadSession = { job_id: session.job_id };
+        setJobId(session.job_id);
         await uploadFileToSignedUrl(session.upload_url, file);
         await completeDirectUpload(session.job_id);
-        router.push(`/jobs/${session.job_id}`);
+        setMode("processing");
         return;
       }
 
       const response = await uploadVideo(file);
-      router.push(`/jobs/${response.job_id}`);
+      setJobId(response.job_id);
+      setMode("processing");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Upload failed.");
       setMode("url-preview");
@@ -415,30 +481,8 @@ export default function UploadForm() {
       )}
 
       {/* ── Upload progress ── */}
-      {mode === "uploading" && (
-        <div style={{
-          background: "var(--bg-surface)", border: "1px solid var(--border)",
-          borderRadius: "var(--radius-lg)", padding: "20px 18px",
-          marginBottom: "16px",
-        }}>
-          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "8px" }}>
-            <span style={{ fontSize: "13px", fontWeight: 500 }}>
-              {progress < 100 ? "Uploading & queueing…" : "Queued!"}
-            </span>
-            <span style={{ fontSize: "12px", fontFamily: "var(--font-mono)", color: "var(--text-secondary)" }}>
-              {Math.round(progress)}%
-            </span>
-          </div>
-          <div style={{ height: 4, background: "var(--bg-elevated)", borderRadius: "99px", overflow: "hidden" }}>
-            <div style={{
-              height: "100%",
-              width: `${progress}%`,
-              background: "var(--accent)",
-              borderRadius: "99px",
-              transition: "width 0.15s ease",
-            }} />
-          </div>
-        </div>
+      {(mode === "uploading" || mode === "processing") && (
+        <UploadProgress phase={mode} uploadPct={uploadPct} jobId={jobId} />
       )}
 
       {/* ── Done state ── */}

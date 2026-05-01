@@ -19,6 +19,7 @@ from uuid import UUID, uuid4
 import httpx
 from fastapi import APIRouter, HTTPException, Query, Request, Depends, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse
+from sqlalchemy import text
 from api.dependencies import get_current_user, AuthenticatedUser
 
 from api.models.clip_studio import (
@@ -528,6 +529,52 @@ def adjust_clip_boundary(
         clip_url=new_clip_url,
         message="Clip boundary adjusted",
     )
+
+
+@router.patch("/{job_id}/clips/{clip_index}/transcript", status_code=200)
+async def update_transcript(
+    job_id: str,
+    clip_index: int,
+    new_text: str = Query(..., min_length=1),
+    user: AuthenticatedUser = Depends(get_current_user)
+):
+    """
+    Gap 293: Update clip transcript and immediately refresh search index.
+    """
+    from db.connection import engine
+    
+    with engine.begin() as conn:
+        # 1. Update the transcript
+        conn.execute(
+            text("UPDATE clips SET transcript_text = :text WHERE job_id = :job_id AND clip_index = :index"),
+            {"text": new_text, "job_id": job_id, "index": clip_index}
+        )
+
+        # 2. Immediately refresh tsvector (Postgres)
+        # COALESCE ensures it doesn't fail on NULL title
+        conn.execute(text("""
+            UPDATE clips
+            SET search_vector = to_tsvector('english', COALESCE(transcript_text, '') || ' ' || COALESCE(title, ''))
+            WHERE job_id = :job_id AND clip_index = :index
+        """), {"job_id": job_id, "index": clip_index})
+
+        # SQLite fallback — FTS5 table sync (if table exists)
+        try:
+            conn.execute(text("""
+                INSERT INTO clips_fts(clips_fts, rowid, transcript_text, title)
+                VALUES('delete', (SELECT rowid FROM clips WHERE job_id=:job_id AND clip_index=:index), '', '')
+            """), {"job_id": job_id, "index": clip_index})
+            
+            conn.execute(text("""
+                INSERT INTO clips_fts(rowid, transcript_text, title)
+                SELECT rowid, transcript_text, title FROM clips
+                WHERE job_id=:job_id AND clip_index=:index
+            """), {"job_id": job_id, "index": clip_index})
+        except Exception:
+            # Table might not exist or not be SQLite
+            pass
+
+    return {"status": "success", "message": "Transcript updated and search index refreshed."}
 
 # -- Regenerations list -------------------------------------------------------
 

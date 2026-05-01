@@ -21,6 +21,7 @@ import hashlib
 import json
 import logging
 import re
+from enum import Enum
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from pathlib import Path
@@ -36,6 +37,7 @@ from tenacity import (
 )
 
 from core.config import settings
+from core.redis import get_redis_client
 from services.caption_renderer import flatten_words
 from services.cost_tracker import estimate_llm_cost_from_tokens
 from services.content_dna import get_personalized_weights
@@ -80,6 +82,39 @@ MAX_SCORE_WORKERS: int = 4
 
 #: Emit WARNING (rather than INFO) when this fraction of chunks fail scoring.
 CHUNK_FAILURE_WARN_RATIO: float = 0.5
+
+
+class ServiceMode(str, Enum):
+    FULL = "full"        # AI scoring + all features
+    DEGRADED = "degraded" # Basic extraction, no AI scores
+    OFFLINE = "offline"  # Queue only, process later
+
+DEGRADED_FLAG_KEY = "clipmind:degraded_mode"
+
+def check_ai_health() -> ServiceMode:
+    """Gap 363: Returns current service mode based on Redis circuit breaker."""
+    try:
+        redis = get_redis_client()
+        mode = redis.get(DEGRADED_FLAG_KEY)
+        if mode:
+            return ServiceMode(mode.decode())
+    except Exception as e:
+        logger.error(f"Failed to check AI health from Redis: {e}")
+    return ServiceMode.FULL
+
+def enter_degraded_mode(reason: str, ttl: int = 300) -> None:
+    """Gap 363: Trip degraded mode for ttl seconds."""
+    try:
+        redis = get_redis_client()
+        redis.setex(DEGRADED_FLAG_KEY, ttl, ServiceMode.DEGRADED.value)
+        logger.critical(f"🔴 DEGRADED MODE ACTIVATED: {reason} — expires in {ttl}s")
+    except Exception as e:
+        logger.error(f"Failed to set degraded mode in Redis: {e}")
+
+def _is_provider_outage(e: Exception) -> bool:
+    """Gap 363: Distinguish provider outage (degrade) from prompt errors (raise)."""
+    msg = str(e).lower()
+    return any(k in msg for k in ["502", "503", "504", "connection", "timeout", "overloaded", "unavailable"])
 
 
 # ---------------------------------------------------------------------------
@@ -824,6 +859,59 @@ class ClipDetectorService:
         except Exception:
             return orig_start, orig_end, None, 0.0
 
+    def _finalize_heuristic_clips(
+        self, 
+        heuristic_candidates: list[dict], 
+        effective_weights: dict[str, float] | None = None,
+        user_id: str | None = None
+    ) -> list[ScoredClip]:
+        """Utility to convert raw heuristic candidates into ScoredClip objects."""
+        if not effective_weights and user_id:
+            from services.content_dna import get_personalized_weights
+            effective_weights = get_personalized_weights(user_id)
+        effective_weights = normalize_score_weights(effective_weights)
+
+        all_candidates = []
+        for candidate in heuristic_candidates:
+            coerced_scores = {k: float(candidate[k]) for k in SCORE_WEIGHTS}
+            all_candidates.append({
+                **candidate,
+                "duration": round(float(candidate["end_time"]) - float(candidate["start_time"]), 2),
+                "final_score": calculate_final_score(coerced_scores, weights=effective_weights),
+                "score_source": candidate.get("source", "heuristic"),
+                "score_confidence": float(candidate.get("score_confidence", 0.38)),
+            })
+
+        deduped = dedupe_candidates(all_candidates)
+        selected = select_top_clips(deduped, limit=10) # limit is handled by caller or just use high enough
+
+        results: list[ScoredClip] = []
+        for index, candidate in enumerate(selected, start=1):
+            r_start = float(candidate["start_time"])
+            r_end = float(candidate["end_time"])
+            results.append(
+                ScoredClip(
+                    clip_index=index,
+                    start_time=r_start,
+                    end_time=r_end,
+                    duration=round(r_end - r_start, 2),
+                    clip_url=None,
+                    hook_score=float(candidate["hook_score"]),
+                    emotion_score=float(candidate["emotion_score"]),
+                    clarity_score=float(candidate["clarity_score"]),
+                    story_score=float(candidate["story_score"]),
+                    virality_score=float(candidate["virality_score"]),
+                    final_score=float(candidate["final_score"]),
+                    reason=str(candidate["reason"]),
+                    hook_headlines=list(candidate.get("hook_headlines", [])),
+                    layout_suggestion=candidate.get("layout_suggestion", "vertical"),
+                    refinement_reason="Heuristic fallback due to degraded service mode.",
+                    score_source="heuristic",
+                    score_confidence=0.38,
+                )
+            )
+        return results
+
     def detect_clips(
         self,
         transcript_json: dict,
@@ -835,6 +923,15 @@ class ClipDetectorService:
     ) -> tuple[list[ScoredClip], float]:
         prompt_template, prompt_path = self.load_prompt(prompt_version)
         words = flatten_words(transcript_json)
+
+        # Gap 363: Check health before starting expensive AI work
+        mode = check_ai_health()
+        if mode == ServiceMode.DEGRADED:
+            logger.warning("Running in DEGRADED mode — skipping LLM and using heuristic fallback directly.")
+            heuristic_candidates = build_heuristic_candidates(words, limit=limit)
+            results = self._finalize_heuristic_clips(heuristic_candidates, effective_weights=None, user_id=user_id)
+            return results, 0.0
+
         chunks = chunk_transcript(words)
 
         effective_weights = custom_score_weights
@@ -862,8 +959,15 @@ class ClipDetectorService:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(self._score_chunk_safe, i, p): i for i, p in rendered_prompts}
             for future in as_completed(futures):
-                idx, candidates, cost, failed = future.result()
-                chunk_results[idx] = (candidates, cost, failed)
+                try:
+                    idx, candidates, cost, failed = future.result()
+                    chunk_results[idx] = (candidates, cost, failed)
+                except Exception as e:
+                    # Gap 363: Detect outage and trip circuit breaker
+                    if _is_provider_outage(e):
+                        enter_degraded_mode(reason=str(e))
+                        logger.error(f"AI Provider outage detected during scoring: {e}. Tripping circuit breaker.")
+                    raise
 
         all_candidates: list[dict] = []
         total_cost = 0.0

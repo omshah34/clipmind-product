@@ -814,3 +814,11 @@ export async function completeMultipartUpload(
   });
   return readResponse<MultipartCompleteResponse>(response);
 }
+
+export async function deleteClip(jobId: string, clipIndex: number): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/jobs/${jobId}/clips/${clipIndex}`, {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+  });
+  if (!response.ok) throw new Error("Failed to delete clip.");
+}

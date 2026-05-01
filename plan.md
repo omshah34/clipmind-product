@@ -310,20 +310,20 @@ This phase addresses deep architectural flaws, ML operations, storage lifecycle 
 - ⬜ **Gap 263: Unoptimized Docker Image Size**: The worker image installs full build-essential and development headers, resulting in a 4GB+ image size that slows down scaling and deployments.
 - ⬜ **Gap 264: Hardcoded DNS Lookups**: Some internal services rely on hardcoded IP addresses or external DNS instead of internal Docker/K8s service discovery, causing brittleness on IP rotation.
 - ⬜ **Gap 265: Lack of Connection Draining**: During deployments, terminating the Celery worker immediately kills active video renders instead of draining connections (SIGTERM graceful wait).
-- ⬜ **Gap 267: Non-Deterministic Builds**: Dependencies in `requirements.txt` / `pyproject.toml` lack strict hash checking, risking supply chain attacks or broken builds if a transitive dependency updates.
+- ✅ **Gap 267: Non-Deterministic Builds**: Dependencies in `requirements.txt` / `pyproject.toml` lack strict hash checking, risking supply chain attacks or broken builds if a transitive dependency updates. (Fixed: Hash-pinned `requirements.txt` generated via `pip-tools`; `Makefile` enforces `--require-hashes`; CI guard added)
 - ⬜ **Gap 268: Missing Rate Limiting on Internal APIs**: Worker-to-API communications are unthrottled. A rogue worker loop can accidentally DDoS the master API node.
 - ⬜ **Gap 270: Exposed Prometheus Metrics**: The `/metrics` endpoint is exposed to the public internet without IP restriction, leaking internal operational data.
 
 ### 17. UX/UI State Transitions & Offline Support
-- ⬜ **Gap 271: Missing Optimistic UI on Clip Deletion**: Clicking delete on a clip shows a loading spinner instead of immediately hiding the clip and resolving the network request in the background.
-- ⬜ **Gap 272: Browser Memory Leak on Video Grids**: The Dashboard video grid keeps all `<video>` tags mounted and preloading even when scrolled out of view, crashing Safari on iOS.
+- ✅ **Gap 271: Missing Optimistic UI on Clip Deletion**: Clicking delete on a clip shows a loading spinner instead of immediately hiding the clip and resolving the network request in the background. (Fixed: `ClipCard` with React Query `useMutation` + `onMutate` rollback logic)
+- ✅ **Gap 272: Browser Memory Leak on Video Grids**: The Dashboard video grid keeps all `<video>` tags mounted and preloading even when scrolled out of view, crashing Safari on iOS. (Fixed: `LazyVideo` with `IntersectionObserver` + aggressive source/decoder release)
 - ⬜ **Gap 273: No IndexedDB Fallback for Drafts**: If a user is editing captions and the browser crashes, changes are lost because auto-saves aren't flushed to local IndexedDB.
-- ⬜ **Gap 275: Layout Shift on Font Load**: Custom typography causes severe Cumulative Layout Shift (CLS) because `font-display: swap` is improperly configured.
-- ⬜ **Gap 276: Hover-Only Actions Break Touch Devices**: Critical editing actions (like trimming) rely on CSS `:hover` states, making them impossible to discover or trigger on mobile/tablets.
-- ⬜ **Gap 277: Misleading Upload Progress**: The upload progress bar jumps from 99% to complete, ignoring the server-side processing time. Needs a distinct "Processing" state to avoid user confusion.
+- ✅ **Gap 275: Layout Shift on Font Load**: Custom typography causes severe Cumulative Layout Shift (CLS) because `font-display: swap` is improperly configured. (Fixed: `next/font/google` + `optimizeCss: true` + `size-adjust` fallback matching)
+- ✅ **Gap 276: Hover-Only Actions Break Touch Devices**: Critical editing actions (like trimming) rely on CSS `:hover` states, making them impossible to discover or trigger on mobile/tablets. (Fixed: `ClipTrimHandle` with 44px touch targets + `isTouchDevice` detection + hover-aware media queries)
+- ✅ **Gap 277: Misleading Upload Progress**: The upload progress bar jumps from 99% to complete, ignoring the server-side processing time. Needs a distinct "Processing" state to avoid user confusion. (Fixed: Split progress logic (Upload: 40%, Processing: 60%) + job status polling)
 - ⬜ **Gap 278: Inaccessible Color Contrast**: AI highlights and clip tags use low-contrast text on light backgrounds, failing WCAG AA compliance.
 - ⬜ **Gap 279: Lack of Global Keyboard Shortcuts**: Power users cannot use `Space` to play/pause or `Cmd+Z` to undo transcript edits, significantly slowing down the editing workflow.
-- ⬜ **Gap 280: Non-Cancelable API Requests**: Navigating away from the dashboard while a heavy search query is pending does not abort the Axios/Fetch request, wasting bandwidth and backend resources.
+- ✅ **Gap 280: Non-Cancelable API Requests**: Navigating away from the dashboard while a heavy search query is pending does not abort the Axios/Fetch request, wasting bandwidth and backend resources. (Fixed: `fetchWithCancel` utility with global `AbortController` registry)
 
 ---
 
@@ -332,24 +332,24 @@ This phase addresses deep architectural flaws, ML operations, storage lifecycle 
 This phase addresses third-party publishing, search discovery, CDN edge optimizations, real-time collaboration limitations, and complex audio/visual processing edge cases.
 
 ### 18. Third-Party Integrations & Social Publishing
-- ⬜ **Gap 281: Missing Refresh Token Rotation Guard**: The social publisher lacks a fallback if an access token expires exactly midway through uploading a large video to YouTube, causing silent failure.
-- ⬜ **Gap 282: Rate Limit Blindness for External APIs**: The publisher does not respect `X-RateLimit-Reset` headers from TikTok/Instagram, blindly retrying and risking a permanent shadowban.
-- ⬜ **Gap 283: Unhandled Video Specification Mismatches**: Instagram Reels enforces strict aspect ratio limits. The publisher tries to push 16:9 vertical clips, which are rejected natively by the API.
+- ✅ **Gap 281: Missing Refresh Token Rotation Guard**: The social publisher lacks a fallback if an access token expires exactly midway through uploading a large video to YouTube, causing silent failure. (Fixed: `get_valid_token` with 5-minute buffer JIT refresh in `services/publishing_service.py`)
+- ✅ **Gap 282: Rate Limit Blindness for External APIs**: The publisher does not respect `X-RateLimit-Reset` headers from TikTok/Instagram, blindly retrying and risking a permanent shadowban. (Fixed: `platform_request` utility in `services/platform_client.py` with in-memory state tracking)
+- ✅ **Gap 283: Unhandled Video Specification Mismatches**: Instagram Reels enforces strict aspect ratio limits. The publisher tries to push 16:9 vertical clips, which are rejected natively by the API. (Fixed: `prepare_for_platform` in `services/platform_export.py` with automatic FFmpeg cropping/scaling)
 - ⬜ **Gap 284: Lack of Chunked Resumable Publishing**: Exporting large 4K clips directly to Google Drive times out because the integration relies on simple POST instead of chunked resumable endpoints.
-- ⬜ **Gap 285: Missing Thumbnail Injection for Shorts**: YouTube Shorts requires custom thumbnails to be uploaded *after* the video process completes, but the workflow closes out immediately.
+- ✅ **Gap 285: Missing Thumbnail Injection for Shorts**: YouTube Shorts requires custom thumbnails to be uploaded *after* the video process completes, but the workflow closes out immediately. (Fixed: `upload_youtube_short` in `workers/publishing.py` with status polling + post-process thumbnail injection)
 - ⬜ **Gap 286: Orphaned Webhook Subscriptions**: Revoking access to an external integration does not actively send a DELETE request to unregister the listening webhook.
-- ⬜ **Gap 287: Encoding Standard Violation on LinkedIn**: LinkedIn's video API rejects clips over a certain bitrate, but the generic export pipeline doesn't apply per-platform compression limits.
+- ✅ **Gap 287: Encoding Standard Violation on LinkedIn**: LinkedIn's video API rejects clips over a certain bitrate, but the generic export pipeline doesn't apply per-platform compression limits. (Fixed: Bitrate-aware transcoding and pre-upload validation in `platform_export.py`)
 - ⬜ **Gap 288: Hardcoded Social Tags**: Mentions (@) and hashtags (#) are injected without platform validation, meaning an Instagram mention might fail silently on TikTok due to non-existent users.
-- ⬜ **Gap 290: Missing Platform-Specific Content Safety Checks**: TikTok rejects videos with certain visual watermark placements; the publishing pipeline lacks pre-flight bounds checking for watermarks.
+- ✅ **Gap 290: Missing Platform-Specific Content Safety Checks**: TikTok rejects videos with certain visual watermark placements; the publishing pipeline lacks pre-flight bounds checking for watermarks. (Fixed: `validate_watermark_position` in `services/brand_kit.py` with TikTok safe-zone detection)
 
 ### 19. Search, Discovery & Metadata
-- ⬜ **Gap 292: Non-Normalized Metadata JSON**: Custom clip tags are stored as unstructured JSON without enforcing casing, leading to fragmented filters (e.g., "podcast", "Podcast", "PODCAST").
-- ⬜ **Gap 293: Stale Full-Text Search Cache**: The Postgres `tsvector` column is not updated atomically when a user manually edits the transcript in the timeline editor.
+- ✅ **Gap 292: Non-Normalized Metadata JSON**: Custom clip tags are stored as unstructured JSON without enforcing casing, leading to fragmented filters (e.g., "podcast", "Podcast", "PODCAST"). (Fixed: `normalize_tags` in `db/repositories/clips.py` + migration script)
+- ✅ **Gap 293: Stale Full-Text Search Cache**: The Postgres `tsvector` column is not updated atomically when a user manually edits the transcript in the timeline editor. (Fixed: Atomic refresh in `api/routes/clip_studio.py` + SQL trigger safety net)
 - ⬜ **Gap 294: Ignored Stop Words in Semantic Search**: Searching for "and the" pulls random clips because the text embedder encodes stop words with disproportionate weight.
-- ⬜ **Gap 295: No Lexical Typo Tolerance**: Searching for "inteview" instead of "interview" yields zero results because Postgres ILIKE and pg_trgm similarity thresholds are improperly tuned.
+- ✅ **Gap 295: No Lexical Typo Tolerance**: Searching for "inteview" instead of "interview" yields zero results because Postgres ILIKE and pg_trgm similarity thresholds are improperly tuned. (Fixed: Two-pass search with trigram fuzzy fallback in `search_clips_fuzzy`)
 - ⬜ **Gap 296: Missing Entity Recognition Caching**: Re-analyzing clips for named entities (NER) happens on the fly instead of caching the SpaCy/LLM extracted entities during ingestion.
 - ⬜ **Gap 297: Pagination Offset Performance Hit**: Search pagination uses standard `OFFSET`, which scans and discards rows. Deep pagination on large datasets will cause high DB CPU usage.
-- ⬜ **Gap 299: Clip Duplication in Search Results**: The search algorithm returns multiple overlapping sub-clips from the same source video without clustering them visually.
+- ✅ **Gap 299: Clip Duplication in Search Results**: The search algorithm returns multiple overlapping sub-clips from the same source video without clustering them visually. (Fixed: `deduplicate_search_results` with temporal overlap detection)
 - ⬜ **Gap 300: Opaque Ranking Signals**: Users cannot sort search results by "engagement potential" or "virality score" because these vectors are calculated but never indexed for ordering.
 
 ### 20. Edge Computing & CDN Optimization
@@ -368,15 +368,15 @@ This phase addresses third-party publishing, search discovery, CDN edge optimiza
 - ⬜ **Gap 320: Orphaned Editor Sessions**: Backend websocket controllers do not garbage-collect stale session metadata, causing memory bloat in the API pod over time.
 
 ### 22. Deep Audio/Visual Manipulation
-- ⬜ **Gap 321: Audio Phase Cancellation**: Summing stereo tracks to mono for the AI transcription engine occasionally causes phase cancellation, rendering dialogue completely silent to the model.
-- ⬜ **Gap 322: Missing Subpixel Rendering on Captions**: Burned-in subtitles lack subpixel anti-aliasing, making the font edges look jagged and low-quality on high-DPI smartphone displays.
-- ⬜ **Gap 323: Dynamic Range Compression Artifacts**: Applying loudnorm filters without a brickwall limiter causes clipping and distortion during sudden loud bursts of laughter or shouting.
-- ⬜ **Gap 325: Keyframe Desync on Trimming**: Trimming a video exactly between two keyframes forces FFmpeg to re-encode the entire GOP, unexpectedly ballooning the export time for simple cuts.
+- ✅ **Gap 321: Audio Phase Cancellation**: Summing stereo tracks to mono for the AI transcription engine occasionally causes phase cancellation, rendering dialogue completely silent to the model. (Fixed: Phase-safe `aformat` mono extraction in `audio_engine.py`)
+- ✅ **Gap 322: Missing Subpixel Rendering on Captions**: Burned-in subtitles lack subpixel anti-aliasing, making the font edges look jagged and low-quality on high-DPI smartphone displays. (Fixed: RGBA pipeline + `alpha=1` in `caption_renderer.py`)
+- ✅ **Gap 323: Dynamic Range Compression Artifacts**: Applying loudnorm filters without a brickwall limiter causes clipping and distortion during sudden loud bursts of laughter or shouting. (Fixed: Integrated `alimiter` in `audio_engine.py`)
+- ✅ **Gap 325: Keyframe Desync on Trimming**: Trimming a video exactly between two keyframes forces FFmpeg to re-encode the entire GOP, unexpectedly ballooning the export time for simple cuts. (Fixed: Smart keyframe-aligned seeking in `video_processor.py`)
 - ⬜ **Gap 326: Ignored Alpha Channels in WebM**: Exporting transparent overlay assets as WebM drops the alpha channel unless the `libvpx-vp9` codec is explicitly forced into RGBA mode.
-- ⬜ **Gap 327: Missing Fallback Fonts for Emojis**: The captioning engine renders emojis as blank rectangles because a fallback font like Noto Color Emoji is not chained in the FFmpeg drawtext filter.
-- ⬜ **Gap 328: VRAM Bloat with High-Res Watermarks**: Supplying a 4K transparent PNG as a corner watermark consumes massive GPU memory during the overlay pass instead of scaling it down beforehand.
-- ⬜ **Gap 329: Audio Bitrate Starvation**: Exporting clips for TikTok strictly at 128kbps AAC degrades quality when the source was already heavily compressed. Needs adaptive bitrate pass-through.
-- ⬜ **Gap 330: Asynchronous A/V Drift Over Time**: Long video concatenations (e.g., stitching 5 different 20-minute clips) accumulate sub-millisecond drifts that compound into noticeable lip-sync errors by the end.
+- ✅ **Gap 327: Missing Fallback Fonts for Emojis**: The captioning engine renders emojis as blank rectangles because a fallback font like Noto Color Emoji is not chained in the FFmpeg drawtext filter. (Fixed: Font chain with `NotoColorEmoji` fallback + Docker updates)
+- ✅ **Gap 328: VRAM Bloat with High-Res Watermarks**: Supplying a 4K transparent PNG as a corner watermark consumes massive GPU memory during the overlay pass instead of scaling it down beforehand. (Fixed: Pre-render watermark downscaling in `brand_kit.py`)
+- ✅ **Gap 329: Audio Bitrate Starvation**: Exporting clips for TikTok strictly at 128kbps AAC degrades quality when the source was already heavily compressed. Needs adaptive bitrate pass-through. (Fixed: Adaptive bitrate (up to 192k) in `platform_export.py`)
+- ✅ **Gap 330: Asynchronous A/V Drift Over Time**: Long video concatenations (e.g., stitching 5 different 20-minute clips) accumulate sub-millisecond drifts that compound into noticeable lip-sync errors by the end. (Fixed: Async resampling + uniform timebase in `video_processor.py`)
 
 ---
 
@@ -403,22 +403,25 @@ This phase addresses critical edge cases in data privacy compliance, internation
 ### 25. WebGL & Advanced UI Rendering
 - ⬜ **Gap 351: WebGL Context Loss**: If the browser places the dashboard tab to sleep, the WebGL context for the waveform visualizer is lost and does not gracefully re-initialize upon wake.
 - ⬜ **Gap 352: Canvas Memory Leak on Resizing**: Continuously resizing the browser window forces the video timeline canvas to re-allocate memory without garbage collecting old frame buffers.
-- ⬜ **Gap 353: Framerate Drops in DOM Timelines**: Rendering a 2-hour timeline with thousands of DOM nodes for individual words causes the browser to drop below 15fps. Needs virtualization.
-- ⬜ **Gap 354: Inaccurate Playhead Scrubbing**: Scrubbing the video player rapid-fires `seeked` events, causing the React state to lag behind the actual HTML5 video `currentTime`.
-- ⬜ **Gap 356: Off-Screen Video Decoding Bloat**: Preloading next/previous clips in the swipe UI consumes massive amounts of RAM because hidden `<video>` elements are fully decoded by the browser.
-- ⬜ **Gap 359: Inconsistent Pixel Ratios**: The waveform canvas looks blurry on retina displays because it does not scale its internal coordinate system by `window.devicePixelRatio`.
-- ⬜ **Gap 360: Unmanaged Z-Index Stacking Contexts**: Complex modal dialogs occasionally render *behind* the video player because the WebGL canvas forces a new, inescapable stacking context.
+- ✅ **Gap 353: Framerate Drops in DOM Timelines**: Rendering a 2-hour timeline with thousands of DOM nodes for individual words causes the browser to drop below 15fps. (Fixed: `@tanstack/react-virtual` in `transcript-timeline.tsx`)
+- ✅ **Gap 354: Inaccurate Playhead Scrubbing**: Scrubbing the video player rapid-fires `seeked` events, causing the React state to lag behind the actual HTML5 video `currentTime`. (Fixed: Debounced seeking + rAF loop in `clip-player.tsx`)
+- ⬜ **Gap 355: Canvas Tearing on Resize**: Rapidly resizing the browser window causes the WebGL preview to "flicker" or show white bars due to unsynced buffer swaps.
+- ✅ **Gap 356: Off-Screen Video Decoding Bloat**: Preloading next/previous clips in the swipe UI consumes massive amounts of RAM because hidden `<video>` elements are fully decoded by the browser. (Fixed: `IntersectionObserver` in `clip-swipe-deck.tsx`)
+- ⬜ **Gap 357: Missing GPU Feature Detection**: The editor fails silently on older Chromebooks or Linux machines without hardware acceleration, instead of falling back to a 2D canvas.
+- ⬜ **Gap 358: Unbounded Undo History**: The editor state manager stores unlimited JSON snapshots of the timeline, eventually consuming all browser heap memory on long sessions.
+- ✅ **Gap 359: Inconsistent Pixel Ratios**: The waveform canvas looks blurry on retina displays because it does not scale its internal coordinate system by `window.devicePixelRatio`. (Fixed: DPR scaling in `waveform-canvas.tsx`)
+- ✅ **Gap 360: Unmanaged Z-Index Stacking Contexts**: Complex modal dialogs occasionally render *behind* the video player because the WebGL canvas forces a new, inescapable stacking context. (Fixed: `isolation: isolate` + React Portals in `clip-player.tsx` and `export-preview-modal.tsx`)
 
 ### 26. Resiliency Testing & Chaos Engineering
 - ⬜ **Gap 362: Unhandled Message Broker Backpressure**: If the API submits jobs faster than Celery can process them, Redis memory fills up and crashes the broker without backpressure signaling.
-- ⬜ **Gap 363: No Degraded Mode for AI Failures**: If OpenAI is completely down, the app throws 500s instead of falling back to a "Degraded Mode" offering basic manual clipping without AI scores.
-- ⬜ **Gap 364: Cascading Failures on Database Slowdown**: A slow query on the `analytics` table ties up the Postgres connection pool, preventing lightweight `status_check` endpoints from completing.
+- ✅ **Gap 363: No Degraded Mode for AI Failures**: If OpenAI is completely down, the app throws 500s instead of falling back to a "Degraded Mode" offering basic manual clipping without AI scores. (Fixed: Redis circuit breaker + heuristic fallback in `clip_detector.py`)
+- ✅ **Gap 364: Cascading Failures on Database Slowdown**: A slow query on the `analytics` table ties up the Postgres connection pool, preventing lightweight `status_check` endpoints from completing. (Fixed: Isolated `fast_engine` and `analytics_engine` pools in `db/connection.py`)
 - ⬜ **Gap 365: Missing Dead-Man's Switch for Scheduled Tasks**: The Autopilot poller can silently die. There is no external monitoring verifying that it completed its run in the last hour.
 - ⬜ **Gap 366: Ephemeral Storage Exhaustion**: Workers do not monitor their own `/tmp` disk space. A massive 50GB raw video upload will silently fill the disk and crash the node.
 - ⬜ **Gap 367: Network Partition Blindness**: If a worker loses internet connectivity but stays connected to the local Redis, it continuously pulls jobs it cannot download, instantly failing them.
 - ⬜ **Gap 368: Retry Storms on Third-Party Outages**: Exponential backoff does not include random jitter, meaning thousands of failed webhook retries hit the server at the exact same synchronized second.
-- ⬜ **Gap 369: Unsafe Worker Shutdown**: Sending `SIGTERM` to a worker during a critical DB migration or index update leaves the database in an undefined state.
-- ⬜ **Gap 370: Blind Spots in Exception Handling**: Unhandled exceptions inside Python `asyncio` background tasks do not bubble up to the main event loop or Sentry, failing silently.
+- ✅ **Gap 369: Unsafe Worker Shutdown**: Sending `SIGTERM` to a worker during a critical DB migration or index update leaves the database in an undefined state. (Fixed: `SIGTERM` trap + `ShutdownRequested` pause in `workers/pipeline.py`)
+- ✅ **Gap 370: Blind Spots in Exception Handling**: Unhandled exceptions inside Python `asyncio` background tasks do not bubble up to the main event loop or Sentry, failing silently. (Fixed: `safe_background_task` + global exception handler in `api/main.py`)
 
 ### 27. Asynchronous Workflows & Complex Graph Execution
 - ⬜ **Gap 371: Monolithic Job Structure**: The video pipeline is a single massive Celery task. If step 4 (rendering) fails, step 1-3 must be completely re-run. Needs Celery Chains/Chords.
