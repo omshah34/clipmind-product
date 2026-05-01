@@ -241,48 +241,40 @@ clipmind-product/
 │
 ├── api/                        # FastAPI application
 │   ├── main.py                 # App factory, middleware, startup events
-│   └── routes/
-│       ├── clips.py            # Clip CRUD, timeline editor endpoints
-│       ├── autopilot.py        # RSS/YouTube ingestion & publishing queue
-│       ├── repurpose.py        # LinkedIn post & newsletter generation
-│       └── webhooks.py         # Outbound event dispatching
+│   ├── dependencies/           # Auth and validation dependencies
+│   ├── models/                 # API request/response Pydantic models
+│   └── routes/                 # Endpoint definitions (clips, jobs, autopilot, etc.)
+│
+├── core/                       # Shared infrastructure & utilities
+│   ├── config.py               # Global settings & env var validation
+│   ├── redis.py                # Redis client & connection pooling
+│   └── redis_breaker.py        # Circuit breaker implementation
+│
+├── db/                         # Data layer
+│   ├── connection.py           # SQLAlchemy engine & session management
+│   ├── repositories/           # Data access patterns (jobs, clips, brand_kits)
+│   └── migrations/             # SQL migration scripts (001_..., 002_...)
 │
 ├── services/                   # Core business logic (no HTTP concerns)
-│   ├── clip_detector.py        # LLM-based moment scoring
-│   ├── content_dna.py          # Audience learning & preference model
-│   ├── performance_engine.py   # Engagement metrics ingestion & feedback
-│   ├── repurpose_engine.py     # Multi-format content generation
-│   └── brand_kit.py            # Caption templates & overlay rendering
+│   ├── clip_detector.py        # AI-based moment scoring
+│   ├── publishing_service.py   # Multi-platform social dispatching
+│   ├── discovery.py            # Semantic search & embedding logic
+│   └── video_processor.py      # FFmpeg core engine (cut, crop, render)
 │
 ├── workers/                    # Celery async task definitions
 │   ├── pipeline.py             # Main video processing chain
-│   ├── transcription.py        # Whisper / Deepgram integration
-│   ├── rendering.py            # FFmpeg caption burn & export
-│   └── beat_schedule.py        # Autopilot cron definitions
-│
-├── db/                         # Data layer
-│   ├── models.py               # SQLAlchemy ORM models
-│   └── migrations/             # Alembic migration scripts
+│   ├── maintenance_tasks.py    # Stale job reclamation & GDPR purge
+│   ├── source_poller.py        # RSS/YouTube autopilot ingestion
+│   └── publish_social.py       # Social media publication workers
 │
 ├── web/                        # Next.js 14 frontend
 │   ├── app/                    # App Router pages & layouts
-│   ├── components/             # Reusable UI components
-│   ├── lib/                    # API client, auth config
-│   └── .env.local              # Frontend-specific env (gitignored)
+│   ├── components/             # Reusable UI components (Timeline Editor, etc.)
+│   └── lib/                    # API client, auth & utility libraries
 │
 ├── prompts/                    # Versioned LLM prompt templates
-│   ├── clip_scorer_v3.txt      # Moment scoring system prompt
-│   └── repurpose_linkedin.txt  # LinkedIn post generation prompt
-│
-├── scripts/                    # Developer utilities
-│   └── diagnose_redis.py       # Infrastructure health checker
-│
-├── docs/                       # Extended documentation
-│   ├── IMPLEMENTATION_STATUS.md
-│   └── assets/
-│
+├── tests/                      # Python & TypeScript test suites
 ├── run.py                      # ⭐ One-command developer launcher
-├── .env.example                # Environment variable template
 └── requirements.txt
 ```
 

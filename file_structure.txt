@@ -6,6 +6,11 @@ clipmind/
 |-- .env
 |-- .env.example
 |-- .gitignore
+|-- alembic.ini
+|-- celerybeat-schedule
+|-- celerybeat-schedule-shm
+|-- celerybeat-schedule-wal
+|-- clipmind_dev.db
 |-- config.py
 |-- conftest.py
 |-- diagnose_redis.py
@@ -14,13 +19,18 @@ clipmind/
 |-- empty.mp3
 |-- file_structure.txt
 |-- fix.py
+|-- Makefile
+|-- patch.py
+|-- plan.md
+|-- pyproject.toml
+|-- pyrefly.json
 |-- README.md
+|-- requirements.in
 |-- requirements.txt
 |-- run.py
 |-- scratch.py
-|-- celerybeat-schedule
-|-- celerybeat-schedule-shm
-|-- celerybeat-schedule-wal
+|-- sql_wrapper.log
+|-- sql_wrapper_summary.json
 |
 |-- api/
 |   |-- __init__.py
@@ -43,31 +53,48 @@ clipmind/
 |   |   |-- social_publish.py
 |   |   |-- webhook.py
 |   |   |-- workspaces.py
-|   |-- routes/
-|   |   |-- __init__.py
-|   |   |-- api_keys.py
-|   |   |-- billing.py
-|   |   |-- brand_kits.py
-|   |   |-- campaigns.py
-|   |   |-- clip_sequences.py
-|   |   |-- clip_studio.py
-|   |   |-- content_dna.py
-|   |   |-- integrations.py
-|   |   |-- jobs.py
-|   |   |-- performance.py
-|   |   |-- preview_studio.py
-|   |   |-- social_publish.py
-|   |   |-- upload.py
-|   |   |-- webhooks.py
-|   |   |-- websockets.py
-|   |   |-- workspaces.py
+|   `-- routes/
+|       |-- __init__.py
+|       |-- api_keys.py
+|       |-- autopilot.py
+|       |-- billing.py
+|       |-- brand_kits.py
+|       |-- campaigns.py
+|       |-- clip_sequences.py
+|       |-- clip_studio.py
+|       |-- content_dna.py
+|       |-- integrations.py
+|       |-- jobs.py
+|       |-- performance.py
+|       |-- preview_studio.py
+|       |-- repurpose.py
+|       |-- social_publish.py
+|       |-- upload.py
+|       |-- webhooks.py
+|       |-- websockets.py
+|       |-- workspaces.py
+|
+|-- core/
+|   |-- __init__.py
+|   |-- config.py
+|   |-- logging_config.py
+|   |-- redis.py
+|   |-- redis_breaker.py
+|   |-- request_context.py
+|   `-- sparse.py
 |
 |-- db/
 |   |-- __init__.py
 |   |-- connection.py
 |   |-- init_db.py
 |   |-- init_sqlite.py
-|   `-- queries.py
+|   |-- job_state.py
+|   |-- queries.py
+|   `-- repositories/
+|       |-- __init__.py
+|       |-- brand_kits.py
+|       |-- clips.py
+|       `-- jobs.py
 |
 |-- docs/
 |   |-- AUTHENTICATION_FILES_REFERENCE.md
@@ -90,9 +117,6 @@ clipmind/
 |   |-- ROUTES_IMPLEMENTATION_SUMMARY.md
 |   `-- WORKERS_IMPLEMENTATION_SUMMARY.md
 |
-|-- log/
-|   `-- app.log
-|
 |-- migrations/
 |   |-- 001_create_jobs_table.sql
 |   |-- 002_create_brand_kits_table.sql
@@ -102,28 +126,61 @@ clipmind/
 |   |-- 006_create_clip_performance_table.sql
 |   |-- 007_create_content_dna_tables.sql
 |   |-- 008_create_team_workspaces_tables.sql
-|   `-- 009_create_users_billing_tables.sql
+|   |-- 009_create_users_billing_tables.sql
+|   |-- 010_add_soft_delete.sql
+|   |-- env.py
+|   |-- README
+|   |-- script.py.mako
+|   `-- versions/
+|       `-- (alembic version files...)
 |
 |-- prompts/
-|   `-- clip_detection_v2.txt
+|   |-- clip_detection_v2.txt
+|   |-- clip_detection_v3.txt
+|   |-- clip_detection_v4.txt
+|   |-- clip_scorer_v3.txt
+|   |-- repurpose_linkedin.txt
+|   `-- (other prompt templates...)
 |
 |-- services/
 |   |-- __init__.py
+|   |-- audio_engine.py
+|   |-- brand_kit.py
 |   |-- brand_kit_renderer.py
 |   |-- caption_renderer.py
 |   |-- clip_detector.py
+|   |-- content_dna.py
 |   |-- cost_tracker.py
+|   |-- discovery.py
 |   |-- event_emitter.py
+|   |-- export_engine.py
 |   |-- instagram_publisher.py
 |   |-- integration_adapters.py
+|   |-- llm_cache.py
+|   |-- llm_config.py
 |   |-- llm_integration.py
 |   |-- openai_client.py
+|   |-- performance_engine.py
+|   |-- publishing_service.py
+|   |-- render_recipe.py
+|   |-- repurpose_engine.py
 |   |-- storage.py
+|   |-- subject_tracking.py
 |   |-- task_queue.py
 |   |-- tiktok_publisher.py
+|   |-- token_tracker.py
 |   |-- transcription.py
+|   |-- video_downloader.py
 |   |-- video_processor.py
-|   `-- youtube_publisher.py
+|   |-- visual_engine.py
+|   |-- ws_manager.py
+|   |-- youtube_publisher.py
+|   `-- publishing_adapters/
+|       |-- __init__.py
+|       |-- base.py
+|       |-- linkedin.py
+|       |-- tiktok.py
+|       `-- youtube.py
 |
 |-- tests/
 |   |-- auth.test.ts
@@ -195,18 +252,25 @@ clipmind/
 |   |   |-- clip-list.tsx
 |   |   |-- clip-player.tsx
 |   |   |-- clip-timeline-editor.tsx
+|   |   |-- error-boundary.tsx
 |   |   |-- job-status.tsx
+|   |   |-- live-pipeline.tsx
 |   |   |-- performance-charts.tsx
 |   |   |-- performance-summary.tsx
 |   |   |-- score-radar.tsx
 |   |   |-- skeleton.tsx
 |   |   |-- toast.tsx
+|   |   |-- transcript-timeline.tsx
 |   |   |-- upload-form-with-brand-kit.tsx
-|   |   `-- upload-form.tsx
+|   |   |-- upload-form.tsx
+|   |   |-- video-grid.tsx
+|   |   `-- waveform-canvas.tsx
 |   |-- lib/
+|   |   |-- api-client.ts
 |   |   |-- api.ts
 |   |   |-- auth-stub.ts
 |   |   |-- auth-utils.ts
+|   |   |-- chunked-uploader.ts
 |   |   `-- prisma.ts
 |   |-- prisma/
 |   |   `-- schema.prisma
@@ -217,13 +281,19 @@ clipmind/
 |
 `-- workers/
     |-- __init__.py
+    |-- analytics.py
     |-- analyze_sequences.py
     |-- celery_app.py
+    |-- dna_tasks.py
+    |-- hooks.py
     |-- integrations.py
+    |-- maintenance_tasks.py
     |-- optimize_captions.py
     |-- pipeline.py
+    |-- publishing.py
     |-- publish_social.py
     |-- regenerate_clips.py
     |-- render_clips.py
+    |-- source_poller.py
     |-- track_signals.py
     `-- webhooks.py

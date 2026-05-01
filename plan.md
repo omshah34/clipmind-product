@@ -433,3 +433,157 @@ This phase addresses critical edge cases in data privacy compliance, internation
 - ⬜ **Gap 377: Unbounded Map-Reduce Memory Limit**: Fanning out to 100 small transcription chunks and reducing them loads all 100 JSON results into the coordinator's RAM simultaneously.
 - ⬜ **Gap 379: Silent Graph Deadlocks**: If a Celery Chord callback fails to trigger because a single child task was mysteriously dropped, the entire parent job hangs in `PENDING` forever.
 - ⬜ **Gap 380: Opaque Workflow Progress**: The API only exposes a single 0-100% integer, completely hiding the execution graph state (e.g., "Downloading: 100%, Transcribing: 45%, Rendering: Pending").
+
+## 🧨 Phase 9: Additional Non-Auth / Non-Billing Critical Gaps & Errors (Next 50: 381-430)
+
+This final block captures the remaining high-risk product gaps across media handling, discovery, preview, publishing, analytics, workers, and frontend workflows. Auth and billing are intentionally excluded.
+
+### 28. Core Route Stubs & Workflow Gaps
+- ⬜ **Gap 381: Clip Sequence API Is a Stub**: `api/routes/clip_sequences.py` only returns an empty list, so sequence creation, inspection, and export workflows are unavailable to clients.
+- ⬜ **Gap 382: Preview List API Is Empty**: `api/routes/preview_studio.py` exposes `list_previews()` but always returns `{"previews": []}`, so the preview studio has no discoverable catalog.
+- ⬜ **Gap 383: YouTube Webhook Never Triggers Processing**: `api/routes/webhooks.py` logs incoming Atom payloads but never parses entries or enqueues Autopilot work.
+- ⬜ **Gap 384: Malformed YouTube Signature Can Crash the Handler**: `api/routes/webhooks.py` assumes `X-Hub-Signature` always contains a single `=` delimiter, so malformed headers can raise before validation.
+- ⬜ **Gap 385: Brand Kit Overlay Helpers Are Placeholders**: `services/brand_kit_renderer.py` returns stub watermark and intro/outro filters, so branded exports can appear configured while silently omitting overlays.
+- ⬜ **Gap 386: Brand Kit Cache Purge Is Best-Effort Only**: `api/routes/brand_kits.py` swallows purge failures when media changes, leaving stale watermark or bumper assets in circulation.
+
+### 29. Upload, Storage & Media Integrity
+- ⬜ **Gap 387: YouTube URL Validation Is Too Strict**: `services/video_downloader.py` only matches exact hostnames, rejecting valid YouTube variants and redirect forms.
+- ⬜ **Gap 388: Video Format Assumptions Are Too Narrow**: `services/video_downloader.py` assumes the best stream path will resolve cleanly to MP4/M4A, so some otherwise playable sources fail during download.
+- ⬜ **Gap 389: Direct Upload Verification Doubles Bandwidth**: `api/routes/upload.py` downloads the uploaded object again just to verify it, which turns every large browser upload into a second transfer.
+- ⬜ **Gap 390: MOV Uploads Can Be Rejected as MP4**: `api/routes/upload.py` direct completion checks the detected container against MP4 only, so valid MOV payloads can fail verification.
+- ⬜ **Gap 391: Upstream Metadata Failures Are Flattened Into 400s**: `api/routes/upload.py` maps downloader metadata problems to generic client errors, which hides transient infrastructure issues from retry logic.
+- ⬜ **Gap 392: Storage Existence Checks Can False-Negative**: `services/storage.py` only lists the immediate parent folder when checking for object existence, so nested object layouts can be missed.
+- ⬜ **Gap 393: Local Upload Durability Is Weak**: `services/storage.py` relies on copy-then-replace without an explicit fsync barrier, so an interrupted write can leave a partial artifact.
+- ⬜ **Gap 394: Integrity Metadata Lives in Query Strings**: `services/storage.py` embeds SHA-256 expectations in URL query params, which is brittle when intermediaries strip or rewrite queries.
+- ⬜ **Gap 395: Remote Download Guards Depend on Content-Length**: `services/storage.py` trusts `Content-Length` for preflight limits, but missing or incorrect headers can still overrun the safety budget until chunking aborts.
+
+### 30. Discovery, Visual, and Document Intelligence
+- ⬜ **Gap 396: Rate-Limit State Is Process-Local**: `services/platform_client.py` tracks API quota state only in memory, so multi-worker deployments can stampede the same platform after a 429.
+- ⬜ **Gap 397: 429 Retry Has No Hard Cap**: `services/platform_client.py` recursively retries on rate-limit responses without a strict upper bound, which can extend outages longer than intended.
+- ⬜ **Gap 398: Discovery Index Corruption Is Silently Reset**: `services/discovery.py` replaces corrupt index files with an empty corpus, losing prior semantic search state without operator visibility.
+- ⬜ **Gap 399: Embedding Input Length Is Unbounded**: `services/discovery.py` does not cap transcript length before embedding, so oversized inputs can still blow past model limits.
+- ⬜ **Gap 400: Async Loop Access Is Fragile**: `services/discovery.py` uses `asyncio.get_event_loop()` in async helpers, which is brittle under newer loop policies and background threads.
+- ⬜ **Gap 401: Content DNA Parse Failures Are Swallowed**: `services/content_dna.py` uses bare `except` blocks around timeline parsing, leaving personalization partially inert without a surfaced error.
+- ⬜ **Gap 402: Regenerate Feedback Can Skew All Weights**: `services/content_dna.py` globally dampens weights on regenerate signals, but the update is not bounded per clip or per session.
+- ⬜ **Gap 403: Performance Feedback Can Accept Bad Payloads**: `services/content_dna.py` only gates updates by sample size, so malformed deltas can still pollute weight history after the gate opens.
+- ⬜ **Gap 404: PDF OCR Fallback Can Blow Up RAM**: `services/document_parser.py` rasterizes every PDF page to base64 in memory, which is unsafe for long or image-heavy brand guides.
+- ⬜ **Gap 405: OCR Pages Have No Practical Cap**: `services/document_parser.py` sends each scanned page through the vision model without a page limit, so large guides can time out or exhaust provider quota.
+- ⬜ **Gap 406: Face Model Download Has No Offline Fallback**: `services/subject_tracking.py` pulls the detection model from the network on startup without checksum validation or a local mirror path.
+- ⬜ **Gap 407: Subject Tracking Can Stall on Corrupt Media**: `services/subject_tracking.py` does not bound the video scan with a timeout, so a bad file can keep a worker busy indefinitely.
+- ⬜ **Gap 408: FFmpeg Frame Extraction Can Hang**: `services/visual_analyzer.py` calls `communicate()` without a timeout, so a wedged FFmpeg process can block the worker.
+- ⬜ **Gap 409: Raw Frame Decoding Assumes Perfect Output Size**: `services/visual_analyzer.py` reshapes bytes directly into a frame buffer, so malformed output can crash the analyzer.
+- ⬜ **Gap 410: Contextual B-Roll Is Effectively Disabled**: `services/visual_engine.py` returns no clips even when the feature flag and provider key are enabled, so the UI can advertise a capability that never surfaces assets.
+
+### 31. Layout, Cropping, and Visual Composition
+- ⬜ **Gap 411: Layout Helpers Still Return Placeholder Filters**: `services/brand_kit_renderer.py` does not build real overlay or concat graphs, so higher-level rendering code can believe branding is active when it is not.
+- ⬜ **Gap 412: Multi-Subject Layouts Rely on Synthetic Face Boxes**: `services/layout_engine.py` uses fixed-size bounding boxes in some paths instead of real tracked detections, which can produce misleading crop windows.
+- ⬜ **Gap 413: Center-Fallback Crops Can Clip the Speaker**: `services/face_tracker.py` falls back to a centered crop when tracking fails, which can remove the actual subject on asymmetric framing.
+- ⬜ **Gap 414: Performance Engine Initialization Is a Stub**: `services/performance_engine.py` still has an empty `__init__`, so provider setup and sync-state warmup are not centralized.
+- ⬜ **Gap 415: Unsupported Platforms Quietly Fall Back to Mock Data**: `services/performance_engine.py` defaults unknown providers to a mock implementation, which can make the dashboard look healthy while real signals are missing.
+- ⬜ **Gap 416: Performance Sync Runs Sequentially**: `services/performance_engine.py` iterates clips one by one, so one high-volume account can block the entire polling cycle.
+
+### 32. Analytics, Campaigns, and Publish Contracts
+- ⬜ **Gap 417: Clip Performance Endpoint Exposes Raw Rows**: `api/routes/performance.py` returns unnormalized database rows, which leaks internal columns and creates a brittle frontend contract.
+- ⬜ **Gap 418: Analytics Summary Ignores Date Windows**: `api/routes/analytics.py` accepts `start_date` and `end_date` but the SQL aggregates all-time values only, so trend charts can be materially wrong.
+- ⬜ **Gap 419: Analytics Error Mapping Is Too Narrow**: `api/routes/analytics.py` only recognizes one timeout string, leaving other operational failures uncategorized and hard to recover from.
+- ⬜ **Gap 420: Campaign Batch Uploads Have No Resume Manifest**: `api/routes/campaigns.py` continues after per-file errors but never records a resumable manifest or retry queue for partially failed uploads.
+- ⬜ **Gap 421: Campaign Calendar Can Collapse Intended Spacing**: `api/routes/campaigns.py` reuses the job-level scheduled date for every clip when one exists, which can remove per-clip spacing logic.
+- ⬜ **Gap 422: Campaign Stats Can Drift From Actual Campaign Scope**: `api/routes/campaigns.py` mixes campaign-local clip counts with a separate published count query, so totals can diverge from the job set.
+- ⬜ **Gap 423: Social Publish Routes Defer Platform Validation**: `api/routes/social_publish.py` forwards platform lists straight into the service layer without rejecting unsupported platforms up front.
+- ⬜ **Gap 424: Publish Idempotency Locks Outlive Success**: `services/publishing_service.py` keeps the Redis lock for the full TTL after successful publish paths, delaying legitimate retries and operator recovery.
+- ⬜ **Gap 425: Scheduled Publish Attribution Can Use a Placeholder Account**: `services/publishing_service.py` can fall back to a synthetic social account id when no connected account is found, weakening downstream reporting.
+- ⬜ **Gap 426: Publish Asset Readiness Has No Requeue Path**: `services/publishing_service.py` raises a 409 when the clip asset is not ready, but nothing re-enqueues the publish job once the asset appears.
+
+### 33. Workers, Sequences, and Frontend UX
+- ⬜ **Gap 427: Chord Monitoring Polls in Coarse Intervals**: `workers/pipeline.py` sleeps in fixed 30-second chunks while waiting for a chord, so dead graphs can sit unresolved for too long.
+- ⬜ **Gap 428: Child-Task Revocation Depends on Expiring Redis Membership**: `workers/pipeline.py` stores child task ids in a TTL-backed set, so late cancellation can miss spawned tasks after the key expires.
+- ⬜ **Gap 429: Sequence Analysis Failures Lack Structured Diagnostics**: `workers/analyze_sequences.py` catches failures and returns a generic failed payload, but it never emits a richer operator-facing diagnostic record.
+- ⬜ **Gap 430: Brand Kit Modal Is Still Placeholder UI**: `web/components/upload-form-with-brand-kit.tsx` renders a stub instead of the real `BrandKitSettings` component, so users cannot manage brand assets inline.
+
+## 🧨 Phase 10: Remaining Non-Auth / Non-Billing Critical Gaps & Errors (Next 70: 431-500)
+
+This block closes out the remaining high-risk gaps in job lifecycle handling, preview and publishing contracts, discovery and transcription robustness, storage/media streaming, analytics surfaces, worker orchestration, and frontend resilience. Auth and billing remain excluded.
+
+### 34. Job Lifecycle & Event Delivery
+- ⬜ **Gap 431: Job Deletion Can Leave Orphaned Assets**: `api/routes/jobs.py` deletes the DB record first and only then tries best-effort file cleanup, so a storage failure leaves unrecoverable media behind.
+- ⬜ **Gap 432: Orphan Sweep Uses Substring Matching**: `api/routes/jobs.py` removes artifacts when `job_id` appears anywhere in the path, which can accidentally delete unrelated files with similar names.
+- ⬜ **Gap 433: Cancellation Never Confirms Revocation**: `api/routes/jobs.py` marks a job cancelled even if Celery revocation only partially succeeded, so workers can keep running briefly after the API says they stopped.
+- ⬜ **Gap 434: Expired Child-Task Sets Break Cancellation**: `workers/pipeline.py` stores child task ids in a TTL-backed Redis set, so late cancellations can miss spawned tasks after the set expires.
+- ⬜ **Gap 435: Partial Job States Are Hidden**: `build_clip_summaries()` in `api/routes/jobs.py` returns `None` for every non-completed job, which prevents the UI from showing partial clip output or debugging context.
+- ⬜ **Gap 436: Discovery Cleanup Failures Are Only Logged**: `api/routes/jobs.py` swallows semantic-index cleanup failures after job deletion, leaving ghost search results with no retry path.
+- ⬜ **Gap 437: Sparse Fieldsets Can Strip Required Data**: `api/routes/jobs.py` applies sparse filters without validating the requested field list, so malformed `fields` inputs can silently remove data that the client still needs.
+- ⬜ **Gap 438: Job State Writes Bypass Repository Guards**: `api/routes/jobs.py` writes `job_state_events` rows directly instead of using a repository API, which makes future schema changes brittle.
+- ⬜ **Gap 439: Event Buffers Persist Through Cancellation**: `services/ws_manager.py` keeps buffered websocket history until TTL expiry, so cancelled or deleted jobs can still replay stale progress to reconnecting clients.
+- ⬜ **Gap 440: Event Emission Drops When Redis Is Unavailable**: `services/event_emitter.py` silently skips integration delivery if Redis is down, so operational events are lost rather than queued for later recovery.
+
+### 35. Preview, Render, and Editor UX
+- ⬜ **Gap 441: Preview WebSocket Reconnect Uses Stale State**: `web/app/preview/preview-content.tsx` closes over an old `renderJob.status`, so reconnect logic can keep retrying after completion or failure.
+- ⬜ **Gap 442: Preview Canvas Never Reflows to Video Geometry**: `web/app/preview/preview-content.tsx` renders captions on a fixed canvas size, so caption placement can drift on resize or non-standard aspect ratios.
+- ⬜ **Gap 443: Malformed SRT Blocks Disappear Without Diagnostics**: `parseSrt()` in `web/app/preview/preview-content.tsx` filters bad blocks out entirely, turning caption file corruption into a silent empty preview.
+- ⬜ **Gap 444: Preview Falls Back to Fake Captions**: `web/app/preview/preview-content.tsx` injects a placeholder SRT when preview data is missing, masking upstream data loss instead of surfacing an error.
+- ⬜ **Gap 445: WebSocket URL Construction Is Fragile**: `web/app/preview/preview-content.tsx` derives the websocket URL with a raw string replace, which breaks when `API_BASE_URL` is relative or already websocket-shaped.
+- ⬜ **Gap 446: Render Errors Lose Backend Detail**: `web/app/preview/preview-content.tsx` turns every failed render request into the same generic message, which makes validation and infrastructure failures indistinguishable.
+- ⬜ **Gap 447: Preview Fetch Ignores Non-OK Payloads**: `web/app/preview/preview-content.tsx` treats a null JSON body as a soft failure and never shows the actual backend response text to the user.
+- ⬜ **Gap 448: Preview WebSocket Reconnect Has No Upper Cap**: `web/app/preview/preview-content.tsx` retries forever every 3 seconds on persistent failure, so dead backends keep a tab stuck in a reconnect loop.
+- ⬜ **Gap 449: Job Redirect Timer Survives Unmount**: `web/components/job-status.tsx` schedules a delayed studio redirect after completion but never clears that timeout on unmount, which can fire a late navigation.
+- ⬜ **Gap 450: Pipeline Completion Callback Hides Fetch Failures**: `web/components/job-status.tsx` swallows failures when it refreshes the final job state, so a completion event can still leave the UI stale.
+
+### 36. Publishing & Integrations
+- ⬜ **Gap 451: Publish Batch Results Can Be Misleading**: `web/app/publish/page.tsx` submits one request per platform but appends every parsed response as a success object, even when some requests failed.
+- ⬜ **Gap 452: Publish UI Never Checks `response.ok`**: `web/app/publish/page.tsx` parses JSON regardless of HTTP status, so a 400 or 500 payload can be treated like a valid publish result.
+- ⬜ **Gap 453: Connect Buttons Are Non-Functional**: `web/app/publish/page.tsx` renders Connect actions that only log to the console, so disconnected platforms cannot be repaired from the UI.
+- ⬜ **Gap 454: Publish Account Payload Has No Shape Guard**: `api/routes/publish.py` returns raw account dictionaries, but the frontend assumes `account_id`, `platform`, `username`, and `connected_at` always exist.
+- ⬜ **Gap 455: Publish Queue Entries Are Created Before Asset Readiness**: `services/publishing_service.py` records queue rows before it proves the clip asset can actually be downloaded, leaving dangling publish records on failure.
+- ⬜ **Gap 456: Missing Connected Account Fallback Pollutes Attribution**: `services/publishing_service.py` falls back to `str(user_id)` when no platform account is resolved, which weakens downstream platform reporting.
+- ⬜ **Gap 457: Token Return Contract Is Inconsistent**: `services/token_manager.py` returns a string for YouTube but a tuple for TikTok, which makes call sites easy to break when platform handling changes.
+- ⬜ **Gap 458: Integration Support Does Not Match UI Platforms**: `services/token_manager.py` only supports YouTube and TikTok refresh paths even though the publish UI exposes Instagram and LinkedIn as first-class options.
+- ⬜ **Gap 459: Integration Events Vanish Without Redis**: `services/event_emitter.py` skips `emit_to_integrations()` entirely when Redis is unavailable, so integration side effects disappear during infrastructure degradation.
+- ⬜ **Gap 460: LLM Cache Ignores Prompt Version Drift**: `services/llm_cache.py` keys responses by prompt and model only, so prompt-template changes can replay stale completions after a rollout.
+
+### 37. Discovery, Transcription, and Document Intake
+- ⬜ **Gap 461: Discovery Index Writes Are Not Atomic**: `services/discovery.py` overwrites the JSON index directly instead of using a temp-file swap, so a crash can corrupt semantic search state.
+- ⬜ **Gap 462: Discovery Lock Contention Has No Retry Strategy**: `services/discovery.py` exits on Redis lock contention without a bounded retry loop, so concurrent indexing can silently lose updates.
+- ⬜ **Gap 463: Search Queries Have No Hard Length Ceiling**: `services/discovery.py` accepts arbitrary query length before embedding, which can trip model limits and block search requests.
+- ⬜ **Gap 464: Content DNA Parse Failures Are Swallowed**: `services/content_dna.py` catches timeline parsing errors with bare `except` blocks, leaving personalization partially disabled with no surfaced error.
+- ⬜ **Gap 465: Arbitrary Signal Types Can Mutate DNA Weights**: `services/content_dna.py` records whatever signal string arrives, so malformed or unexpected signals can still influence future scoring.
+- ⬜ **Gap 466: Chunk Failures Only Produce Partial Transcripts**: `services/transcription.py` skips failed chunks and still returns the merged result, so missing sections of audio can be hidden instead of failing loudly.
+- ⬜ **Gap 467: Temp Cleanup Errors Are Silently Suppressed**: `services/transcription.py` eats cleanup exceptions in the finalizer, which can leave chunk directories behind and accelerate disk pressure.
+- ⬜ **Gap 468: PDF OCR Fallback Is Memory-Hungry**: `services/document_parser.py` rasterizes every PDF page into base64 for OCR, which can exhaust RAM on large or image-heavy documents.
+- ⬜ **Gap 469: OCR Input Size Is Not Bounded**: `services/document_parser.py` sends images to the vision model without a practical byte or dimension cap, so giant uploads can blow up cost and latency.
+- ⬜ **Gap 470: Subject Sampling Can Miscenter VFR Sources**: `services/subject_tracking.py` samples frames at a fixed interval derived from FPS, which can miss motion on variable-framerate or low-FPS sources and produce poor crops.
+
+### 38. Storage, Uploads, and Media Streaming
+- ⬜ **Gap 471: Local Public URLs Leak File Paths**: `services/storage.py` returns `file://` URIs for local storage, exposing raw filesystem structure to any client that receives the link.
+- ⬜ **Gap 472: Object Existence Checks Can False-Positive**: `services/storage.py` treats any filename match in the parent folder as a hit, so stale siblings with the same name can satisfy the completion check.
+- ⬜ **Gap 473: Presigned URL Repair Is Too Narrow**: `services/storage.py` only rewrites very specific Supabase public-path shapes, so alternate public URL forms are left unsafely unsigned.
+- ⬜ **Gap 474: Partial Downloads Can Be Left Behind**: `services/storage.py` only cleans up on size or checksum mismatch, not on arbitrary network exceptions, so interrupted downloads can leave corrupt files on disk.
+- ⬜ **Gap 475: Remote Playback Pays a Double-Request Tax**: `api/routes/clip_studio.py` probes every remote clip with a HEAD request before streaming, adding avoidable latency and origin load during scrubbing.
+- ⬜ **Gap 476: Range Parse Failures Fall Back to Full-File Streaming**: `api/routes/clip_studio.py` silently treats invalid byte ranges as a full download, hiding client range bugs and increasing bandwidth use.
+- ⬜ **Gap 477: Upload Integrity Checks Skip Hash Validation**: `api/routes/upload.py` verifies browser uploads by size and container signature, but not by content hash, so bit-level corruption can slip through.
+- ⬜ **Gap 478: Upload Rejection Happens After Full Buffering**: `api/routes/upload.py` reads the entire file to disk before duration validation, so oversized or invalid videos still consume storage and CPU first.
+- ⬜ **Gap 479: yt-dlp Titles Can Produce Pathological Object Keys**: `api/routes/upload.py` uses the fetched title in the uploaded filename, which can create overly long or awkward storage names.
+- ⬜ **Gap 480: Windows Path Normalization Is Fragile**: `services/storage.py` strips leading slashes from local `file://` paths, which can mis-handle UNC shares or extended Windows path forms.
+
+### 39. Analytics, Campaigns, and Performance UI
+- ⬜ **Gap 481: Analytics Queries Hit the Database on Every Refresh**: `api/routes/analytics.py` has no caching layer, so dashboard polling can hammer the analytics engine under repeated refreshes.
+- ⬜ **Gap 482: Aggregate Nulls Are Not Normalized**: `api/routes/analytics.py` returns raw aggregate values, which can surface `null` fields to the frontend when tables are sparse.
+- ⬜ **Gap 483: Performance Sync Runs in Ephemeral Background Tasks**: `api/routes/performance.py` schedules sync work with `BackgroundTasks`, so a process restart can drop an in-flight sync with no retry record.
+- ⬜ **Gap 484: Platform Syncs Execute Sequentially**: `services/performance_engine.py` processes each clip one by one, so a slow metrics provider can block every other clip in the same batch.
+- ⬜ **Gap 485: Inactive Platforms Never Auto-Recover**: `services/performance_engine.py` marks credentials inactive on quota or token errors but never schedules a safe reactivation check.
+- ⬜ **Gap 486: Engagement Display Assumes a Ratio Contract**: `web/components/performance-summary.tsx` multiplies `avg_engagement` by 100, so a backend percentage would render 100x too large.
+- ⬜ **Gap 487: Performance Charts Assume Dense Payloads**: `web/components/performance-charts.tsx` directly reads `platform_stats` and `all_clips_performance`, so sparse API responses can throw during render.
+- ⬜ **Gap 488: Synced-At Can Render as `Invalid Date`**: `web/components/performance-charts.tsx` formats `data.synced_at` without guarding for missing or null values.
+- ⬜ **Gap 489: Campaign Calendar Ignores Clip-Level Timing**: `api/routes/campaigns.py` derives schedules from the job-level publish date or enumeration order, which can scramble intended clip spacing.
+- ⬜ **Gap 490: Batch Uploads Report Partial Failures Poorly**: `api/routes/campaigns.py` returns plain text errors for failed files, but it never provides a structured retry manifest for the UI.
+
+### 40. Workers and Frontend Resilience
+- ⬜ **Gap 491: Chord Deadlocks Have No Operator Artifact**: `workers/pipeline.py` times out chord monitoring but does not create a dedicated dead-letter or recovery record for manual follow-up.
+- ⬜ **Gap 492: Child-Task Revocation Assumes Byte Responses**: `workers/pipeline.py` decodes Redis set members unconditionally, which can fail if the Redis client is configured with response decoding enabled.
+- ⬜ **Gap 493: Executive Summary Fan-Out Is Unbounded**: `workers/dna_tasks.py` enqueues summaries for every active user at once, so a large tenant list can flood the queue without backpressure.
+- ⬜ **Gap 494: Sequence Detection Can Return Success on Failure**: `workers/analyze_sequences.py` returns a plain error dictionary when a job is not ready instead of failing the task, which makes orchestration think the run succeeded.
+- ⬜ **Gap 495: Global Performance Sync Is Fully Sequential**: `workers/analytics.py` iterates through users one by one, so a single slow account can delay the rest of the nightly sync.
+- ⬜ **Gap 496: Live Pipeline Ignores Unknown Event Types**: `web/components/live-pipeline.tsx` treats unrecognized websocket events as no-ops, so backend contract drift can hide new failure states from the dashboard.
+- ⬜ **Gap 497: Live Reconnect Has No Upper Attempt Cap**: `web/components/live-pipeline.tsx` keeps retrying forever, so a dead backend can pin a browser tab in endless reconnect mode.
+- ⬜ **Gap 498: Job Status Redirect Timer Is Not Cleared**: `web/components/job-status.tsx` schedules a delayed studio redirect but never cancels it when the component unmounts, allowing late navigation jumps.
+- ⬜ **Gap 499: Publish Batching Can Hide Partial Success**: `web/app/publish/page.tsx` uses `Promise.all` across platform requests, so one rejected network call can obscure which platforms actually succeeded.
+- ⬜ **Gap 500: Publish State Is Never Reset After Success**: `web/app/publish/page.tsx` leaves caption, hashtag, and selection state intact after publishing, making accidental repeat submissions far too easy.
