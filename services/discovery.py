@@ -3,6 +3,9 @@ import logging
 import json
 import os
 import re
+import shutil
+import tempfile
+import time
 import warnings
 from typing import List, Dict, Any
 from pathlib import Path
@@ -75,13 +78,13 @@ class DiscoveryService:
 
     async def _generate_embedding_async(self, text: str) -> List[float]:
         """Offload CPU-bound embedding to a thread so the event loop is not blocked (Gap 36)."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self.generate_embedding, text)
 
     async def _encode_texts_async(self, texts: List[str]):
         """Batch encode texts in a thread executor (Gap 36)."""
         import functools
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, functools.partial(self.model.encode, texts))
 
     def _load_index(self) -> Dict[str, Any]:
@@ -91,22 +94,30 @@ class DiscoveryService:
                 with self._index_path.open("r", encoding="utf-8") as f:
                     return json.load(f)
             except (json.JSONDecodeError, OSError) as e:
-                logger.warning("Discovery index corrupt or unreadable, resetting: %s", e)
+                backup = self._index_path.with_name(
+                    f"{self._index_path.stem}.corrupt-{int(time.time())}{self._index_path.suffix}"
+                )
+                try:
+                    shutil.move(str(self._index_path), str(backup))
+                except Exception:
+                    logger.debug("Could not preserve corrupt discovery index backup", exc_info=True)
+                logger.warning("Discovery index corrupt or unreadable, reset after backup: %s", e)
         return {"embeddings": [], "metadata": []}
 
     def _save_index(self, index: Dict[str, Any]):
         """Persist the vector index as JSON (Gap 32 — replaces joblib/pickle)."""
-        with self._index_path.open("w", encoding="utf-8") as f:
-            import numpy as np
-            # Convert numpy arrays to lists for JSON serialisability
-            safe = {
-                "embeddings": [
-                    emb.tolist() if hasattr(emb, "tolist") else emb
-                    for emb in index["embeddings"]
-                ],
-                "metadata": index["metadata"],
-            }
-            json.dump(safe, f)
+        import numpy as np
+        safe = {
+            "embeddings": [
+                emb.tolist() if hasattr(emb, "tolist") else emb
+                for emb in index["embeddings"]
+            ],
+            "metadata": index["metadata"],
+        }
+        with tempfile.NamedTemporaryFile("w", delete=False, dir=self._index_path.parent, suffix=".tmp", encoding="utf-8") as temp_file:
+            json.dump(safe, temp_file)
+            temp_name = temp_file.name
+        Path(temp_name).replace(self._index_path)
 
     async def add_job_to_index(self, job_id: str, transcript_json: Dict[str, Any]):
         """
@@ -123,7 +134,10 @@ class DiscoveryService:
         if not segments:
             return
 
-        texts = [s.get("text", "") for s in segments]
+        texts = [
+            (s.get("text", "") or "")[: settings.discovery_embedding_max_chars]
+            for s in segments
+        ]
         # Gap 36: Run CPU-bound encoding in a thread pool so we don't block the event loop
         embeddings = await self._encode_texts_async(texts)
         
@@ -133,7 +147,9 @@ class DiscoveryService:
         lock = RobustRedisLock(
             r, "discovery_index_lock", 
             timeout=120, heartbeat_interval=30, 
-            blocking=True, blocking_timeout=15
+            blocking=True, blocking_timeout=15,
+            retry_attempts=3,
+            retry_delay_seconds=1.0,
         )
         
         try:
@@ -168,7 +184,9 @@ class DiscoveryService:
         lock = RobustRedisLock(
             r, "discovery_index_lock", 
             timeout=120, heartbeat_interval=30,
-            blocking=True, blocking_timeout=15
+            blocking=True, blocking_timeout=15,
+            retry_attempts=3,
+            retry_delay_seconds=1.0,
         )
         
         try:

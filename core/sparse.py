@@ -26,6 +26,10 @@ def apply_sparse_filter(
         return data
 
     allowed_fields = set(schema.model_fields.keys())
+    required_fields = {
+        name for name, field in schema.model_fields.items()
+        if getattr(field, "is_required", lambda: False)()
+    }
     
     # Check for invalid fields (security check)
     invalid_fields = requested_fields - allowed_fields
@@ -38,6 +42,9 @@ def apply_sparse_filter(
                 "allowed_fields": sorted(list(allowed_fields))
             }
         )
+
+    # Keep required fields even when the client asks for a sparse view.
+    requested_fields |= required_fields
 
     # 2. Apply filtering
     if isinstance(data, list):

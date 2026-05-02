@@ -5,8 +5,6 @@ Purpose: Modular video layout engine supporting Vertical and Split-Screen (Podca
 from __future__ import annotations
 import logging
 from typing import Literal, List
-from pathlib import Path
-from services.face_tracker import BoundingBox, get_crop_params
 
 logger = logging.getLogger(__name__)
 
@@ -79,12 +77,9 @@ class LayoutEngine:
     @staticmethod
     def _vertical_filter(width: int, height: int, x_center: float) -> str:
         """Standard 9:16 vertical crop centered on subject with safety clamping."""
-        # Use face_tracker to get robust crop params
-        # We simulate a 100px wide face at the center X for the tracker
-        raw_bbox = BoundingBox(x=int(x_center - 50), y=int(height / 2 - 50), w=100, h=100)
-        crop = get_crop_params(raw_bbox, width, height, target_aspect=9/16)
-        
-        return f"crop={crop['w']}:{crop['h']}:{crop['x']}:{crop['y']}"
+        crop_width = LayoutEngine._crop_width_for_ratio(width, height, 9 / 16)
+        crop_x = LayoutEngine._focus_crop_x(width, crop_width, x_center=x_center)
+        return f"crop={crop_width}:{height}:{crop_x}:0"
 
     @staticmethod
     def _screen_only_filter(width: int, height: int, screen_focus: str) -> str:
@@ -97,14 +92,9 @@ class LayoutEngine:
         """Stacked split screen (Host/Guest) with safety clamping."""
         half_h = int(height / 2)
         half_h = LayoutEngine._ensure_even(half_h)
-        
-        # Calculate crops for top and bottom.
-        bbox1 = BoundingBox(x=int(x1 - 50), y=int(half_h / 2 - 50), w=100, h=100)
-        bbox2 = BoundingBox(x=int(x2 - 50), y=int(half_h / 2 - 50), w=100, h=100)
-        
-        # Each half is 9:8 aspect ratio
-        crop1 = get_crop_params(bbox1, width, half_h, target_aspect=9/8)
-        crop2 = get_crop_params(bbox2, width, half_h, target_aspect=9/8)
+        crop_w = LayoutEngine._crop_width_for_ratio(width, half_h, 9 / 8)
+        crop1_x = LayoutEngine._focus_crop_x(width, crop_w, x_center=x1)
+        crop2_x = LayoutEngine._focus_crop_x(width, crop_w, x_center=x2)
 
         # Filtergraph: 
         # 1. Split input into two streams
@@ -113,8 +103,8 @@ class LayoutEngine:
         # 4. Vertical stack
         filter_str = (
             f"[0:v]split=2[top_raw][bot_raw]; "
-            f"[top_raw]crop={crop1['w']}:{crop1['h']}:{crop1['x']}:{crop1['y']}[top]; "
-            f"[bot_raw]crop={crop2['w']}:{crop2['h']}:{crop2['x']}:{crop2['y']}[bot]; "
+            f"[top_raw]crop={crop_w}:{half_h}:{crop1_x}:0[top]; "
+            f"[bot_raw]crop={crop_w}:{half_h}:{crop2_x}:0[bot]; "
             f"[top][bot]vstack=inputs=2"
         )
         return filter_str

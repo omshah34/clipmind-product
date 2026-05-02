@@ -116,6 +116,9 @@ async def stream_clip(job_id: str, clip_index: int, request: Request):
     raw_url: str = str(clip.clip_url)
 
     logger.debug("[stream] job=%s clip=%d raw_url=%s", job_id, clip_index, raw_url)
+    range_header = request.headers.get("range")
+    if range_header and not range_header.startswith("bytes="):
+        raise HTTPException(status_code=416, detail="Invalid Range header")
 
     # ── Case 1: file:// URI (local storage on dev) ────────────────────────
     #    StorageService.upload_file returns file:///C:/... on Windows when
@@ -133,8 +136,8 @@ async def stream_clip(job_id: str, clip_index: int, request: Request):
     if raw_url.startswith(("http://", "https://")):
         # Forward the client's Range header so seeking works.
         upstream_headers = {}
-        if "range" in request.headers:
-            upstream_headers["Range"] = request.headers["range"]
+        if range_header:
+            upstream_headers["Range"] = range_header
 
         async def _proxy():
             async with httpx.AsyncClient(timeout=60) as client:
@@ -142,19 +145,8 @@ async def stream_clip(job_id: str, clip_index: int, request: Request):
                     async for chunk in r.aiter_bytes(chunk_size=65536):
                         yield chunk
 
-        # Probe for content-length / accept-ranges from upstream.
-        try:
-            head = httpx.head(raw_url, timeout=10)
-            proxy_headers = {
-                "Content-Type": head.headers.get("content-type", "video/mp4"),
-                "Accept-Ranges": "bytes",
-            }
-            if "content-length" in head.headers:
-                proxy_headers["Content-Length"] = head.headers["content-length"]
-            status = 206 if "range" in request.headers else 200
-        except Exception:
-            proxy_headers = {"Content-Type": "video/mp4", "Accept-Ranges": "bytes"}
-            status = 200
+        proxy_headers = {"Content-Type": "video/mp4", "Accept-Ranges": "bytes"}
+        status = 206 if range_header else 200
 
         return StreamingResponse(_proxy(), status_code=status, headers=proxy_headers)
 
@@ -163,8 +155,8 @@ async def stream_clip(job_id: str, clip_index: int, request: Request):
         try:
             presigned = storage_service.get_presigned_url(raw_url, expires_in=3600)
             upstream_headers = {}
-            if "range" in request.headers:
-                upstream_headers["Range"] = request.headers["range"]
+            if range_header:
+                upstream_headers["Range"] = range_header
 
             async def _s3_proxy():
                 async with httpx.AsyncClient(timeout=60) as client:
@@ -172,14 +164,8 @@ async def stream_clip(job_id: str, clip_index: int, request: Request):
                         async for chunk in r.aiter_bytes(chunk_size=65536):
                             yield chunk
 
-            head = httpx.head(presigned, timeout=10)
-            proxy_headers = {
-                "Content-Type": head.headers.get("content-type", "video/mp4"),
-                "Accept-Ranges": "bytes",
-            }
-            if "content-length" in head.headers:
-                proxy_headers["Content-Length"] = head.headers["content-length"]
-            status = 206 if "range" in request.headers else 200
+            proxy_headers = {"Content-Type": "video/mp4", "Accept-Ranges": "bytes"}
+            status = 206 if range_header else 200
             return StreamingResponse(_s3_proxy(), status_code=status, headers=proxy_headers)
         except Exception as exc:
             logger.error("S3 stream failed for %s: %s", raw_url, exc)
@@ -193,8 +179,6 @@ async def stream_clip(job_id: str, clip_index: int, request: Request):
 
     file_size = file_path.stat().st_size
     content_type = mimetypes.guess_type(str(file_path))[0] or "video/mp4"
-    range_header = request.headers.get("range")
-
     if range_header:
         # Parse "bytes=start-end"
         try:
@@ -203,8 +187,10 @@ async def stream_clip(job_id: str, clip_index: int, request: Request):
             start = int(start_str)
             end = int(end_str) if end_str else file_size - 1
         except ValueError:
-            start, end = 0, file_size - 1
+            raise HTTPException(status_code=416, detail="Invalid Range header")
 
+        if start >= file_size:
+            raise HTTPException(status_code=416, detail="Requested range not satisfiable")
         end = min(end, file_size - 1)
         chunk_size = end - start + 1
 

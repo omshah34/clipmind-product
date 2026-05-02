@@ -59,7 +59,7 @@ def detect_clip_sequences(
         job = get_job(job_id)
         if not job or job.status != "completed":
             logger.error(f"Job {job_id} not ready for sequence analysis")
-            return {"status": "error", "message": "Job not completed"}
+            raise self.retry(exc=RuntimeError("Job not completed"), countdown=60)
         
         if not job.clips_json or len(job.clips_json) < 3:
             logger.info(f"Job {job_id} has fewer than 3 clips, skipping sequence detection")
@@ -109,7 +109,7 @@ def detect_clip_sequences(
     except SoftTimeLimitExceeded:
         logger.error(f"Soft time limit exceeded for job {job_id}")
         update_job(job_id, status="failed", error_message="Task timed out")
-        return {"status": "failed", "error": "Task timed out"}
+        raise
 
     except TRANSIENT_ERRORS as exc:
         logger.warning(f"Transient error in sequence detection for job {job_id}: {exc}")
@@ -121,10 +121,16 @@ def detect_clip_sequences(
         logger.exception(f"Sequence detection failed: {exc}")
         
         try:
-            update_job(job_id, status="failed", error_message=str(exc))
+            diagnostics = {
+                "job_id": str(job_id),
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+                "retry_count": self.request.retries,
+            }
+            update_job(job_id, status="failed", failed_stage="sequence_analysis", error_message=json.dumps(diagnostics, default=str))
         except Exception:
             pass
-        return {"status": "failed", "error": str(exc)}
+        raise
 
 
 def detect_sequences_heuristic(clips, clip_descriptions: list) -> list[dict]:

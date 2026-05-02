@@ -38,19 +38,36 @@ def extract_frame_for_clip(
     ]
 
     try:
-        # We use a large enough bufsize for the expected frame size
-        # 224 * 224 * 3 bytes = 150,528 bytes
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        out, err = process.communicate()
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
 
-        if process.returncode != 0:
-            logger.error("FFmpeg frame extraction failed: %s", err.decode())
+        if result.returncode != 0:
+            logger.error("FFmpeg frame extraction failed: %s", result.stderr.decode(errors="replace"))
             return None
 
-        # Convert raw bytes to numpy array
-        frame = np.frombuffer(out, dtype=np.uint8).reshape((h, w, 3))
+        expected_size = w * h * 3
+        if len(result.stdout) != expected_size:
+            logger.error(
+                "Unexpected FFmpeg frame size for %s at %.2fs: got %d bytes, expected %d",
+                video_path.name,
+                timestamp_s,
+                len(result.stdout),
+                expected_size,
+            )
+            return None
+
+        # Convert raw bytes to numpy array only after validating byte count.
+        frame = np.frombuffer(result.stdout, dtype=np.uint8).reshape((h, w, 3))
         return frame
 
+    except subprocess.TimeoutExpired:
+        logger.error("FFmpeg frame extraction timed out for %s at %.2fs", video_path.name, timestamp_s)
+        return None
     except Exception as e:
         logger.exception("Error extracting frame from %s: %s", video_path, e)
         return None

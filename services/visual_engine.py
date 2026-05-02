@@ -7,6 +7,8 @@ from __future__ import annotations
 import re
 import logging
 
+import httpx
+
 from core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -87,7 +89,54 @@ class VisualEngine:
             logger.info("Contextual B-roll enabled but PEXELS_API_KEY is not configured; skipping.")
             return []
 
-        # Provider integration intentionally returns no clips until the download
-        # path can enforce licensing, duration, and timeout constraints.
-        logger.info("Contextual B-roll provider configured but no provider adapter is active; skipping.")
-        return []
+        query_terms = [term.strip() for term in keywords if term and term.strip()]
+        query = " ".join(query_terms[:3]) or "abstract business"
+        params = {
+            "query": query,
+            "per_page": max(1, min(count, 15)),
+            "orientation": "landscape",
+        }
+        headers = {"Authorization": settings.pexels_api_key}
+
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.get(
+                    f"{settings.pexels_api_base_url.rstrip('/')}/videos/search",
+                    params=params,
+                    headers=headers,
+                )
+                response.raise_for_status()
+                payload = response.json()
+        except Exception as exc:
+            logger.warning("Contextual B-roll search failed for query %r: %s", query, exc)
+            return []
+
+        results: list[dict] = []
+        for video in payload.get("videos", [])[:count]:
+            video_files = video.get("video_files", []) or []
+            if not video_files:
+                continue
+
+            chosen_file = sorted(
+                video_files,
+                key=lambda item: (item.get("width", 0) * item.get("height", 0), item.get("file_size", 0)),
+                reverse=True,
+            )[0]
+            link = chosen_file.get("link")
+            if not link:
+                continue
+
+            results.append(
+                {
+                    "id": video.get("id"),
+                    "url": link,
+                    "thumbnail": video.get("image"),
+                    "duration": video.get("duration"),
+                    "width": chosen_file.get("width"),
+                    "height": chosen_file.get("height"),
+                    "source": "pexels",
+                    "query": query,
+                }
+            )
+
+        return results

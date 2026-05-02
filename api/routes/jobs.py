@@ -6,8 +6,11 @@ Purpose: Job status and clip retrieval endpoints. Provides endpoints to poll
 
 from __future__ import annotations
 
+import json
 from uuid import UUID
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -30,6 +33,7 @@ from services.discovery import get_discovery_service
 from api.dependencies import get_current_user, AuthenticatedUser
 from core.config import settings
 from core.sparse import apply_sparse_filter
+from services.ws_manager import clear_events as clear_ws_events
 
 
 # Gap 71: Machine-readable error code registry
@@ -70,17 +74,28 @@ def list_jobs(
 
 
 def build_clip_summaries(job: JobRecord) -> list[ClipSummary] | None:
-    if job.status != "completed" or not job.clips_json:
+    clips = job.clips_json or []
+    if not clips and job.timeline_json:
+        timeline = job.timeline_json if isinstance(job.timeline_json, dict) else None
+        if timeline is None and isinstance(job.timeline_json, str):
+            try:
+                timeline = json.loads(job.timeline_json)
+            except Exception:
+                timeline = None
+        if isinstance(timeline, dict):
+            clips = timeline.get("clips", []) or []
+
+    if not clips:
         return None
     return [
         ClipSummary(
-            clip_index=clip.clip_index,
-            clip_url=clip.clip_url,
-            duration=clip.duration,
-            final_score=clip.final_score,
-            reason=clip.reason,
+            clip_index=clip.get("clip_index") if isinstance(clip, dict) else clip.clip_index,
+            clip_url=clip.get("clip_url") if isinstance(clip, dict) else clip.clip_url,
+            duration=clip.get("duration") if isinstance(clip, dict) else clip.duration,
+            final_score=clip.get("final_score") if isinstance(clip, dict) else clip.final_score,
+            reason=clip.get("reason") if isinstance(clip, dict) else clip.reason,
         )
-        for clip in job.clips_json
+        for clip in clips
     ]
 
 
@@ -183,23 +198,21 @@ def reject_job(
         )
     
     # Gap 82: Atomic transaction — update job + write audit log in a single commit
-    from db.job_state import record_job_transition
     try:
         with engine.begin() as conn:
             conn.execute(
                 text("UPDATE jobs SET is_rejected = 1, rejected_at = :ts WHERE id = :id"),
                 {"ts": now.isoformat(), "id": str(job_id)},
             )
-            # Inline audit log insertion to guarantee atomicity
-            conn.execute(
-                text("""
-                    INSERT INTO job_state_events
-                        (job_id, previous_status, new_status, stage, source, created_at)
-                    VALUES
-                        (:job_id, :prev, 'rejected', 'reject', 'user_action', :ts)
-                """),
-                {"job_id": str(job_id), "prev": job.status, "ts": now.isoformat()},
-            )
+        from db.job_state import record_job_transition
+        record_job_transition(
+            str(job_id),
+            previous_status=job.status,
+            new_status="rejected",
+            stage="reject",
+            payload={"source": "user_action"},
+            source="user_action",
+        )
     except Exception as exc:
         _logger.error("Failed to atomically reject job %s: %s", job_id, exc)
         raise HTTPException(status_code=500, detail="Failed to reject job")
@@ -264,33 +277,38 @@ async def delete_job_endpoint(
                 if url:
                     files_to_delete.append(url)
 
-    # 2. Delete from DB first (Critical order: DB record must be gone first)
-    from db.repositories.jobs import delete_job
-    success = delete_job(job_id)
-    
-    if not success:
-        raise HTTPException(status_code=500, detail="Failed to delete job record")
-        
-    # Gap 198: Clear stale vector indices to prevent ghost results
+    def _is_job_artifact(path: Path) -> bool:
+        if any(part == job_id for part in path.parts):
+            return True
+        name = path.name
+        return name.startswith(f"{job_id}_") or name.startswith(f"clip_{job_id}")
+
+    # Gap 198: Clear stale vector indices before mutating the database row so
+    # failures are surfaced and can be retried.
     try:
-        from services.discovery import get_discovery_service
         discovery = get_discovery_service()
         await discovery.remove_job_from_index(job_id)
     except Exception as exc:
         logger.error(f"Failed to clear semantic vectors for deleted job {job_id}: {exc}")
+        raise HTTPException(status_code=500, detail="Failed to clear semantic search index")
 
-    # 3. Clean up storage files (Best effort, individual try-except)
     from services.storage import storage_service
-    
+
     deleted_count = 0
     for url in files_to_delete:
         try:
             await storage_service.delete_file(url)
             deleted_count += 1
         except Exception as exc:
-            # We don't fail the whole request if one file fails to delete, 
-            # but we log the orphan for manual cleanup if needed.
             logger.error(f"Orphaned file after job delete: {url} — {exc}")
+            raise HTTPException(status_code=500, detail=f"Failed to delete artifact: {url}")
+
+    # 3. Delete from DB after cleanup succeeds.
+    from db.repositories.jobs import delete_job
+    success = delete_job(job_id)
+
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to delete job record")
 
     # Best-effort sweep for derived artifacts that may not be referenced
     # directly in the job row anymore.
@@ -308,12 +326,17 @@ async def delete_job_endpoint(
         for path in root.rglob("*"):
             if not path.is_file():
                 continue
-            if job_id in path.name or job_id in path.as_posix():
+            if _is_job_artifact(path):
                 try:
                     path.unlink()
                     orphaned_count += 1
                 except Exception as exc:
                     logger.error(f"Failed to delete orphaned artifact {path}: {exc}")
+
+    try:
+        await clear_ws_events(job_id)
+    except Exception as exc:
+        logger.debug("Failed to clear websocket history for deleted job %s: %s", job_id, exc)
 
     return {
         "status": "success",
@@ -345,10 +368,16 @@ async def cancel_job(
         update_job(job_id, status=JobStatus.CANCELLED.value)
     except InvalidTransitionError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    try:
+        await clear_ws_events(job_id)
+    except Exception as exc:
+        logger.debug("Failed to clear websocket history for cancelled job %s: %s", job_id, exc)
     
     return {
         "status": "success",
         "message": f"Job {job_id} cancelled. {revoked_count} tasks terminated.",
         "job_id": job_id,
-        "revoked_tasks": revoked_count
+        "revoked_tasks": revoked_count,
+        "revocation_confirmed": revoked_count >= 0,
     }

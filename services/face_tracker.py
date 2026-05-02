@@ -78,11 +78,13 @@ def get_crop_params(
         
     except FaceTrackingError as e:
         logger.warning("Face tracking glitch; falling back to center crop: %s", e)
-        # Fallback: center crop at target aspect
+        # Fallback: bias the crop toward the original bbox center rather than
+        # forcing a hard frame-center crop, which can clip asymmetric subjects.
         crop_w = int(frame_height * target_aspect)
         crop_w = min(crop_w, frame_width)
         crop_w = crop_w if crop_w % 2 == 0 else crop_w - 1
-        crop_x = (frame_width - crop_w) // 2
+        face_cx = max(0, min(raw_bbox.x + (raw_bbox.w // 2), frame_width - 1))
+        crop_x = max(0, min(face_cx - (crop_w // 2), frame_width - crop_w))
         crop_x = crop_x if crop_x % 2 == 0 else crop_x
         
         return {"x": int(crop_x), "y": 0, "w": int(crop_w), "h": int(frame_height)}

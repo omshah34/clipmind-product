@@ -108,6 +108,7 @@ class Settings:
     clip_detector_model: str = os.getenv("CLIP_DETECTOR_MODEL", DEFAULT_GROQ_TEXT_MODELS[0])
     clip_detector_fallback_model: str = os.getenv("CLIP_DETECTOR_FALLBACK_MODEL", DEFAULT_GROQ_TEXT_MODELS[1])
     clip_detector_retry_attempts: int = _get_int("CLIP_DETECTOR_RETRY_ATTEMPTS", 1)
+    discovery_embedding_max_chars: int = _get_int("DISCOVERY_EMBEDDING_MAX_CHARS", 8000)
     openai_timeout_seconds: float = _get_float("OPENAI_TIMEOUT_SECONDS", 90.0)
     llm_temp_analytical: float = _get_float("LLM_TEMP_ANALYTICAL", 0.1)
     llm_temp_creative: float = _get_float("LLM_TEMP_CREATIVE", 0.85)
@@ -115,7 +116,11 @@ class Settings:
     hf_token: str = os.getenv("HF_TOKEN", "")
     enable_contextual_broll: bool = _get_bool("ENABLE_CONTEXTUAL_BROLL", False)
     pexels_api_key: str = os.getenv("PEXELS_API_KEY", "")
+    pexels_api_base_url: str = os.getenv("PEXELS_API_BASE_URL", "https://api.pexels.com")
     brand_guide_ocr_model: str = os.getenv("BRAND_GUIDE_OCR_MODEL", DEFAULT_GROQ_VISION_MODELS[0])
+    brand_guide_ocr_page_limit: int = _get_int("BRAND_GUIDE_OCR_PAGE_LIMIT", 16)
+    subject_tracking_model_mirror: str = os.getenv("SUBJECT_TRACKING_MODEL_MIRROR", "")
+    subject_tracking_model_sha256: str = os.getenv("SUBJECT_TRACKING_MODEL_SHA256", "")
     whisper_model: str = os.getenv("WHISPER_MODEL", DEFAULT_GROQ_WHISPER_MODELS[0])
     job_retry_limit: int = 3
     chunk_upload_size_bytes: int = 1024 * 1024

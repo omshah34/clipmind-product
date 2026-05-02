@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import os
 import time
 import logging
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from uuid import UUID, uuid4
 
+import httpx
 from fastapi import APIRouter, File, UploadFile, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -42,6 +44,7 @@ class URLUploadRequest(BaseModel):
 
 router = APIRouter(tags=["upload"])
 ALLOWED_EXTENSIONS = {".mp4", ".mov"}
+SUPPORTED_CONTAINERS = {"mp4", "mov"}
 TEMP_UPLOAD_TTL_SECONDS = 3600
 
 
@@ -63,6 +66,11 @@ def _detect_video_container(path: Path) -> str | None:
         return None
 
     if header[4:8] == b"ftyp":
+        major_brand = header[8:12].decode("latin1", errors="ignore").lower().strip()
+        if major_brand.startswith("qt"):
+            return "mov"
+        if major_brand in {"isom", "iso2", "avc1", "mp41", "mp42", "mmp4"}:
+            return "mp4"
         return "mp4"
     if header.startswith(b"\x1A\x45\xDF\xA3"):
         return "mkv"
@@ -105,6 +113,34 @@ def _extract_expected_size(url: str) -> int | None:
     try:
         return int(value)
     except (TypeError, ValueError):
+        return None
+
+
+def _probe_uploaded_size(source_url: str) -> int | None:
+    """Best-effort size probe for a browser-uploaded object without re-downloading it."""
+    if source_url.startswith("file://"):
+        raw_path = unquote(urlparse(source_url).path)
+        if os.name == "nt" and raw_path.startswith("/") and len(raw_path) > 2 and raw_path[2] == ":":
+            raw_path = raw_path.lstrip("/")
+        path = Path(raw_path)
+        if path.exists():
+            return path.stat().st_size
+        return None
+
+    if "://" not in source_url:
+        path = Path(source_url)
+        if path.exists():
+            return path.stat().st_size
+        return None
+
+    try:
+        response = httpx.head(source_url, follow_redirects=True, timeout=10.0)
+        response.raise_for_status()
+        header = response.headers.get("content-length")
+        if header is None:
+            return None
+        return int(header)
+    except Exception:
         return None
 
 
@@ -265,10 +301,13 @@ def complete_direct_upload(payload: DirectUploadCompleteRequest) -> UploadRespon
         )
 
     expected_size_bytes = _extract_expected_size(job.source_video_url)
-    verification_path = settings.temp_dir / f"direct_upload_verify_{job.id}.mp4"
     try:
-        storage_service.download_to_local(job.source_video_url, verification_path)
-        actual_size_bytes = verification_path.stat().st_size
+        actual_size_bytes = _probe_uploaded_size(job.source_video_url)
+        if actual_size_bytes is None:
+            raise UploadValidationError(
+                error="upload_verification_failed",
+                message="Could not read the uploaded file size from storage.",
+            )
         if expected_size_bytes is None:
             raise UploadValidationError(
                 error="upload_verification_failed",
@@ -279,21 +318,15 @@ def complete_direct_upload(payload: DirectUploadCompleteRequest) -> UploadRespon
                 error="upload_verification_failed",
                 message="Uploaded file size does not match the size recorded at upload start.",
             )
-        detected_container = _detect_video_container(verification_path)
-        if detected_container != "mp4":
+        if Path(object_path).suffix.lower() not in ALLOWED_EXTENSIONS:
             raise UploadValidationError(
                 error="invalid_format",
-                message=(
-                    "The uploaded file signature does not match an MP4/MOV video."
-                    if detected_container is None
-                    else f"Detected {detected_container.upper()} container data in a file presented as MP4/MOV."
-                ),
+                message="The uploaded object key does not match an MP4/MOV video filename.",
             )
         logger.info(
-            "Verified direct upload %s (%d bytes, sha256=%s)",
-            verification_path.name,
+            "Verified direct upload %s (%d bytes)",
+            job.id,
             actual_size_bytes,
-            _hash_file(verification_path)[:12],
         )
     except UploadValidationError as exc:
         update_job(
@@ -315,9 +348,6 @@ def complete_direct_upload(payload: DirectUploadCompleteRequest) -> UploadRespon
             f"Could not verify the uploaded file: {exc}",
             409,
         )
-    finally:
-        if verification_path.exists():
-            verification_path.unlink(missing_ok=True)
 
     update_job(job.id, status="uploaded")
 
@@ -370,7 +400,7 @@ async def upload_video(
     try:
         temp_path, size_bytes = await save_upload_to_temp(file)
         detected_container = _detect_video_container(temp_path)
-        if detected_container != "mp4":
+        if detected_container not in SUPPORTED_CONTAINERS:
             raise UploadValidationError(
                 error="invalid_format",
                 message=(
@@ -452,10 +482,11 @@ async def upload_url(
         try:
             video_downloader.download_video(payload.url, temp_path)
         except Exception as e:
-            return error_response("download_failed", f"Failed to download video: {str(e)}", 500)
+            status_code = 503 if isinstance(e, video_downloader.VideoDownloaderError) else 500
+            return error_response("download_failed", f"Failed to download video: {str(e)}", status_code)
 
         detected_container = _detect_video_container(temp_path)
-        if detected_container != "mp4":
+        if detected_container not in SUPPORTED_CONTAINERS:
             return error_response(
                 "invalid_format",
                 (

@@ -37,6 +37,22 @@ def emit_event(event_type: str, event_data: dict, user_id: UUID | str) -> None:
     from workers.webhooks import deliver_webhook_event
     
     try:
+        if not is_redis_available():
+            deliver_webhook_event.run(
+                event_type=event_type,
+                event_data=event_data,
+                user_id=str(user_id),
+                idempotency_key=idempotency_key,
+                snapshot={
+                    "job_id": str(event_data.get("job_id", "")) if isinstance(event_data, dict) else None,
+                    "event_type": event_type,
+                    "status": event_data.get("status", "unknown") if isinstance(event_data, dict) else "unknown",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            emit_to_integrations(event_type, event_data, user_id)
+            return
+
         # Gap 246: Pass a snapshot of critical data to prevent race conditions
         # if the job is deleted before the worker fetches it.
         snapshot = {
@@ -61,10 +77,26 @@ def emit_event(event_type: str, event_data: dict, user_id: UUID | str) -> None:
         
         # Also trigger integrations (Zapier, Make, etc)
         emit_to_integrations(event_type, event_data, user_id)
-    
+        
     except Exception as e:
         # Log but don't fail - webhook delivery should not block main flow
         logger.warning(f"[emit] Failed to queue event {event_type}: {e}")
+        try:
+            deliver_webhook_event.run(
+                event_type=event_type,
+                event_data=event_data,
+                user_id=str(user_id),
+                idempotency_key=idempotency_key,
+                snapshot={
+                    "job_id": str(event_data.get("job_id", "")) if isinstance(event_data, dict) else None,
+                    "event_type": event_type,
+                    "status": event_data.get("status", "unknown") if isinstance(event_data, dict) else "unknown",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        except Exception as fallback_exc:
+            logger.warning(f"[emit] Webhook fallback failed for {event_type}: {fallback_exc}")
+        emit_to_integrations(event_type, event_data, user_id)
 
 
 def emit_job_completed(
@@ -159,7 +191,12 @@ def emit_to_integrations(event_type: str, event_data: dict, user_id: UUID | str)
     logger.debug(f"[integrations] Triggering for event: {event_type} user: {user_id}")
 
     if not is_redis_available():
-        logger.warning(f"[integrations] Redis unavailable; skipping event {event_type}")
+        logger.warning(f"[integrations] Redis unavailable; falling back to synchronous delivery for {event_type}")
+        try:
+            from workers.integrations import process_integrations_for_event
+            process_integrations_for_event(event_type, event_data, str(user_id))
+        except Exception as exc:
+            logger.warning(f"[integrations] Synchronous fallback failed for {event_type}: {exc}")
         return
 
     from workers.integrations import trigger_integrations_for_event
@@ -174,3 +211,8 @@ def emit_to_integrations(event_type: str, event_data: dict, user_id: UUID | str)
     
     except Exception as e:
         logger.warning(f"[integrations] Failed to queue trigger for {event_type}: {e}")
+        try:
+            from workers.integrations import process_integrations_for_event
+            process_integrations_for_event(event_type, event_data, str(user_id))
+        except Exception as fallback_exc:
+            logger.warning(f"[integrations] Synchronous fallback failed for {event_type}: {fallback_exc}")

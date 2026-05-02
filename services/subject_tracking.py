@@ -6,6 +6,9 @@ Purpose: AI-powered subject detection and reframing logic.
 
 import logging
 import os
+import hashlib
+import shutil
+import time
 from pathlib import Path
 import urllib.request
 from dataclasses import dataclass
@@ -82,13 +85,67 @@ logger = logging.getLogger(__name__)
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/latest/blaze_face_short_range.tflite"
 MODEL_PATH = Path(__file__).parent / "models" / "blaze_face_short_range.tflite"
 
+
+def _verify_model_checksum(path: Path) -> None:
+    expected = settings.subject_tracking_model_sha256.strip()
+    if not expected:
+        return
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    actual = digest.hexdigest()
+    if actual != expected:
+        raise TrackingError(
+            f"Face detector checksum mismatch for {path.name}: expected {expected[:12]}…, got {actual[:12]}…"
+        )
+
+
+def _copy_mirror_model() -> bool:
+    mirror = settings.subject_tracking_model_mirror.strip()
+    if not mirror:
+        return False
+
+    mirror_path = Path(mirror)
+    if not mirror_path.exists():
+        return False
+
+    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(mirror_path, MODEL_PATH)
+    _verify_model_checksum(MODEL_PATH)
+    logger.info("[tracking] Loaded face detection model from mirror: %s", mirror_path)
+    return True
+
 def ensure_model_exists():
     """Downloads the Mediapipe TFLite model if not present."""
-    if not MODEL_PATH.exists():
-        MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-        logger.info("[tracking] Downloading face detection model: %s", MODEL_URL)
-        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+    if MODEL_PATH.exists():
+        try:
+            _verify_model_checksum(MODEL_PATH)
+            return
+        except TrackingError:
+            if _copy_mirror_model():
+                logger.warning("[tracking] Replaced corrupted local model with mirror copy.")
+                return
+            raise
+
+    if _copy_mirror_model():
+        return
+
+    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = MODEL_PATH.with_suffix(".download")
+    logger.info("[tracking] Downloading face detection model: %s", MODEL_URL)
+    try:
+        urllib.request.urlretrieve(MODEL_URL, str(temp_path))
+        os.replace(temp_path, MODEL_PATH)
+        _verify_model_checksum(MODEL_PATH)
         logger.info("[tracking] Model download complete.")
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        if _copy_mirror_model():
+            logger.warning("[tracking] Network download failed, used local mirror instead.")
+            return
+        raise
 
 class TrackingError(RuntimeError):
     """Raised when subject tracking fails due to file or detection issues."""
@@ -118,7 +175,7 @@ class SubjectTracker:
         options = vision.FaceDetectorOptions(base_options=base_options)
         self.detector = vision.FaceDetector.create_from_options(options)
 
-    def analyze_subjects(self, video_path: Path, count: int = 1) -> TrackingAnalysis:
+    def analyze_subjects(self, video_path: Path, count: int = 1, timeout_seconds: float = 120.0) -> TrackingAnalysis:
         """Analyze the clip and return center positions plus simple face-size heuristics."""
         if not self.enabled or self.detector is None:
             return TrackingAnalysis(
@@ -142,7 +199,8 @@ class SubjectTracker:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         
-        sample_interval = max(1, int(fps / self.sample_rate_fps))
+        next_sample_ms = 0.0
+        started_at = time.monotonic()
         
         # List of lists, one per detected face index
         face_x_histories: List[List[float]] = [[] for _ in range(count)]
@@ -152,11 +210,16 @@ class SubjectTracker:
         
         frame_idx = 0
         while cap.isOpened():
+            if time.monotonic() - started_at > timeout_seconds:
+                cap.release()
+                raise TrackingError(f"Subject tracking timed out after {timeout_seconds:.0f}s for {video_path.name}")
+
             ret, frame = cap.read()
             if not ret:
                 break
                 
-            if frame_idx % sample_interval == 0:
+            current_ms = float(cap.get(cv2.CAP_PROP_POS_MSEC) or ((frame_idx / fps) * 1000.0 if fps > 0 else frame_idx * 500.0))
+            if current_ms + 0.5 >= next_sample_ms:
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
                 
@@ -179,6 +242,7 @@ class SubjectTracker:
                             primary_face_area_ratios.append(
                                 float((bbox.width * bbox.height) / float(width * height))
                             )
+                next_sample_ms += 1000.0 / max(1, self.sample_rate_fps)
             
             frame_idx += 1
             

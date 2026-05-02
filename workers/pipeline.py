@@ -15,6 +15,7 @@ Gap 368: Replaced all fixed countdown= values with get_jittered_countdown().
 from __future__ import annotations
 
 import logging
+import json
 import signal
 import shutil
 import threading
@@ -70,6 +71,18 @@ def register_child_task(job_id: str, task_id: str) -> None:
         key = CHILD_TASK_KEY.format(job_id=job_id)
         redis_client.sadd(key, task_id)
         redis_client.expire(key, 86400)
+        try:
+            from db.job_state import record_job_transition
+            record_job_transition(
+                job_id,
+                previous_status=None,
+                new_status="processing",
+                stage="child_task_registered",
+                payload={"task_id": task_id},
+                source="worker",
+            )
+        except Exception:
+            logger.debug("Could not persist child task registration for %s", job_id, exc_info=True)
     except Exception as e:
         logger.error(f"Failed to register child task {task_id} for job {job_id}: {e}")
 
@@ -79,9 +92,27 @@ def revoke_job_recursively(job_id: str) -> int:
         redis_client = get_redis_client()
         key = CHILD_TASK_KEY.format(job_id=job_id)
         child_ids = redis_client.smembers(key)
+        if not child_ids:
+            try:
+                from db.job_state import get_job_transition_history
+                for event in get_job_transition_history(job_id, limit=500):
+                    if event.get("stage") != "child_task_registered":
+                        continue
+                    payload = event.get("payload_json") or {}
+                    if isinstance(payload, str):
+                        try:
+                            payload = json.loads(payload)
+                        except Exception:
+                            continue
+                    task_id = payload.get("task_id") or payload.get("child_task_id")
+                    if task_id:
+                        child_ids = set(child_ids)
+                        child_ids.add(str(task_id).encode("utf-8"))
+            except Exception as exc:
+                logger.debug("Could not load persisted child tasks for job %s: %s", job_id, exc)
         count = 0
         for task_id_bytes in child_ids:
-            task_id = task_id_bytes.decode()
+            task_id = task_id_bytes.decode() if isinstance(task_id_bytes, (bytes, bytearray)) else str(task_id_bytes)
             celery_app.control.revoke(task_id, terminate=True, signal="SIGTERM")
             count += 1
         redis_client.delete(key)
@@ -118,12 +149,36 @@ def monitor_chord(chord_id: str, job_id: str, timeout: int = CHORD_TIMEOUT) -> N
             logger.error(f"[{job_id}] Chord {chord_id} failed")
             from db.repositories.jobs import update_job
             update_job(job_id, status="failed", error_message=f"Parallel processing chord {chord_id} failed.")
+            try:
+                from db.job_state import record_job_transition
+                record_job_transition(
+                    job_id,
+                    previous_status="processing",
+                    new_status="failed",
+                    stage="chord_monitor",
+                    payload={"chord_id": chord_id, "reason": "chord_failed"},
+                    source="worker",
+                )
+            except Exception:
+                logger.debug("Could not persist chord failure artifact for job %s", job_id, exc_info=True)
             return
-        time.sleep(30)
+        time.sleep(10)
     logger.critical(f"[{job_id}] Chord {chord_id} deadlocked after {timeout}s")
     celery_app.control.revoke(chord_id, terminate=True)
     from db.repositories.jobs import update_job
     update_job(job_id, status="failed", error_message=f"Processing timed out (Chord deadlock detected after {timeout}s).")
+    try:
+        from db.job_state import record_job_transition
+        record_job_transition(
+            job_id,
+            previous_status="processing",
+            new_status="failed",
+            stage="chord_monitor",
+            payload={"chord_id": chord_id, "reason": "deadlock", "timeout": timeout},
+            source="worker",
+        )
+    except Exception:
+        logger.debug("Could not persist chord deadlock artifact for job %s", job_id, exc_info=True)
 
 _RETRY_BASE_SECONDS: int = 2
 

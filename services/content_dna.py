@@ -7,6 +7,7 @@ Purpose: Personalization engine that learns from user behavior.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 from db.repositories.jobs import get_job
@@ -40,6 +41,7 @@ SCORE_TO_WEIGHT = {
 # Signal influence
 POSITIVE_SIGNALS = ["download", "publish", "edit"]
 NEGATIVE_SIGNALS = ["skip", "regenerate"]
+VALID_SIGNALS = set(POSITIVE_SIGNALS + NEGATIVE_SIGNALS)
 
 LEARNING_RATE = 0.05
 MAX_WEIGHT = 2.5
@@ -59,6 +61,10 @@ def record_signal(
     metadata: dict | None = None,
 ) -> None:
     """Record a user signal and update their Content DNA weights."""
+    if signal_type not in VALID_SIGNALS:
+        logger.warning("[dna] Ignoring unsupported signal type: %s", signal_type)
+        return
+
     logger.info("[dna] Recording signal: user=%s job=%s type=%s", user_id, job_id, signal_type)
     
     # 1. Persist the signal
@@ -73,10 +79,13 @@ def record_signal(
 
 def _update_weights_from_signal(user_id: str, job_id: str, clip_index: int, signal_type: str) -> None:
     """The 'Brain' of Content DNA. Adjusts weights based on evidence."""
+    if signal_type not in VALID_SIGNALS:
+        logger.warning("[dna] Ignoring unsupported signal type during weight update: %s", signal_type)
+        return
+
     job = get_job(job_id)
-    if not job or not job.timeline_json: # timeline_json is used for clips in some contexts
-        # Fallback to clips_json if available
-        pass
+    if not job:
+        return
 
     # Fetch clips
     clips_json = getattr(job, "clips_json", []) or []
@@ -85,8 +94,9 @@ def _update_weights_from_signal(user_id: str, job_id: str, clip_index: int, sign
         try:
             timeline = json.loads(job.timeline_json) if isinstance(job.timeline_json, str) else job.timeline_json
             clips_json = timeline.get("clips", [])
-        except:
-            pass
+        except Exception as exc:
+            logger.warning("[dna] Could not parse timeline JSON for job %s: %s", job_id, exc)
+            return
 
     if not clips_json:
         return
@@ -126,7 +136,7 @@ def _update_weights_from_signal(user_id: str, job_id: str, clip_index: int, sign
     modifier = 0.0
     if signal_type in POSITIVE_SIGNALS:
         modifier = LEARNING_RATE
-    elif signal_type in NEGATIVE_SIGNALS:
+    elif signal_type in NEGATIVE_SIGNALS or signal_type == "regenerate":
         modifier = -LEARNING_RATE
 
     if modifier != 0:
@@ -142,11 +152,6 @@ def _update_weights_from_signal(user_id: str, job_id: str, clip_index: int, sign
                 current_w = weights.get(weight_key, 1.0)
                 new_w = max(MIN_WEIGHT, min(MAX_WEIGHT, current_w + modifier))
                 weights[weight_key] = round(new_w, 3)
-
-    # Special case: regenerate (all weights slightly decreased)
-    if signal_type == "regenerate":
-        for k in weights:
-            weights[k] = max(MIN_WEIGHT, round(weights[k] * 0.95, 3))
 
     # 3. Update stats
     signal_count += 1
@@ -173,6 +178,11 @@ def apply_performance_feedback(
     
     logger.info("[dna] Applying performance feedback: user=%s job=%s delta=%.2f", user_id, job_id, delta)
 
+    if not math.isfinite(delta):
+        logger.warning("[dna] Ignoring non-finite performance delta for user %s job %s: %r", user_id, job_id, delta)
+        return
+    delta = max(-1.0, min(1.0, float(delta)))
+
     # 1. Gate: Minimum Sample Size (n>=5 completed windows)
     query_count = text("""
         SELECT COUNT(*) FROM clip_performance 
@@ -196,8 +206,9 @@ def apply_performance_feedback(
         try:
             timeline = json.loads(job.timeline_json) if isinstance(job.timeline_json, str) else job.timeline_json
             clips_json = timeline.get("clips", [])
-        except:
-            pass
+        except Exception as exc:
+            logger.warning("[dna] Could not parse timeline JSON for performance feedback on job %s: %s", job_id, exc)
+            return
             
     if not clips_json:
         return

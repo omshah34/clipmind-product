@@ -22,12 +22,11 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency guard
 logger = logging.getLogger(__name__)
 
 # Security: Only allow YouTube/Shorts domains
-ALLOWED_DOMAINS = [
+ALLOWED_DOMAINS = (
     "youtube.com",
-    "www.youtube.com",
     "youtu.be",
-    "m.youtube.com"
-]
+    "youtube-nocookie.com",
+)
 
 # Gap 94: Max resolution cap — 1080p is sufficient for vertical clip generation
 # and avoids unnecessary 4K bandwidth/storage costs
@@ -72,7 +71,10 @@ def validate_url(url: str) -> bool:
     from urllib.parse import urlparse
     parsed = urlparse(url)
     domain = parsed.netloc.lower()
-    return any(domain == d for d in ALLOWED_DOMAINS)
+    return any(
+        domain == allowed or domain.endswith(f".{allowed}")
+        for allowed in ALLOWED_DOMAINS
+    )
 
 def get_video_info(url: str, timeout_seconds: int = _INFO_TIMEOUT_SECONDS) -> dict[str, Any]:
     """Extract metadata from a YouTube URL without downloading.
@@ -120,7 +122,7 @@ def download_video(url: str, output_path: Path) -> Path:
 
     # Gap 94: Quality capped at _MAX_HEIGHT to save bandwidth and storage
     ydl_opts = {
-        'format': f'bestvideo[ext=mp4][height<={_MAX_HEIGHT}]+bestaudio[ext=m4a]/best[ext=mp4][height<={_MAX_HEIGHT}]/best[height<={_MAX_HEIGHT}]/best',
+        'format': f'bestvideo[height<={_MAX_HEIGHT}]+bestaudio/best[height<={_MAX_HEIGHT}]/best',
         'outtmpl': str(output_path),
         'quiet': True,
         'no_warnings': True,

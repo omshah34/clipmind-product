@@ -48,21 +48,11 @@ def build_watermark_filter(watermark_url: Optional[str], video_width: int = 1080
     """
     if not watermark_url:
         return ""
-    
-    # Escape for FFmpeg filter syntax
-    escaped_path = watermark_url.replace("'", "'\\''")
-    
-    # Position: bottom-right with 10px padding
-    # (W-w-10):(H-h-10) = x:y coordinates
-    watermark_filter = (
-        f"[0:v][wm]overlay="
-        f"(W-w-10):(H-h-10):enable='between(t,0,n)'"
-        f"[v]"
-    )
-    
-    # Would need to chain input for watermark file
-    # This is a placeholder — full implementation requires input handling in video_processor
-    return watermark_filter
+
+    # The caller must map the watermark image to input 1 as `[1:v]`.
+    # We keep the graph simple and explicit so higher-level rendering code can
+    # insert it directly into a larger FFmpeg filter chain.
+    return "[0:v][1:v]overlay=W-w-10:H-h-10:format=auto[v]"
 
 
 def build_intros_outros_filter(
@@ -83,10 +73,19 @@ def build_intros_outros_filter(
     """
     if not intro_url and not outro_url:
         return ""
-    
-    # This would typically use the concat demuxer in FFmpeg
-    # [0:v][0:a][1:v][1:a][2:v][2:a]concat=n=3:v=1:a=1[outv][outa]
-    # where 0 = intro, 1 = clip, 2 = outro
-    
-    logger.warning("Intro/outro rendering not yet implemented")
-    return ""
+
+    # The caller is responsible for mapping intro/main/outro inputs as
+    # `[0:v]/[0:a]`, `[1:v]/[1:a]`, `[2:v]/[2:a]` before applying this graph.
+    parts = []
+    input_count = 0
+    if intro_url:
+        input_count += 1
+    input_count += 1
+    if outro_url:
+        input_count += 1
+
+    if input_count == 1:
+        return ""
+
+    concat_inputs = "".join(f"[{i}:v][{i}:a]" for i in range(input_count))
+    return f"{concat_inputs}concat=n={input_count}:v=1:a=1[v][a]"

@@ -27,9 +27,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
-@app.task(bind=True, max_retries=0)
-def trigger_integrations_for_event(
-    self,
+def process_integrations_for_event(
     event_type: str,
     event_data: dict,
     user_id: str,
@@ -67,6 +65,16 @@ def trigger_integrations_for_event(
     except Exception as e:
         logger.error(f"[integrations] Error querying integrations: {e}")
         # Don't retry - this is a query issue, not a delivery issue
+
+
+@app.task(bind=True, max_retries=0)
+def trigger_integrations_for_event(
+    self,
+    event_type: str,
+    event_data: dict,
+    user_id: str,
+) -> None:
+    process_integrations_for_event(event_type, event_data, user_id)
 
 
 @app.task(bind=True, max_retries=0)

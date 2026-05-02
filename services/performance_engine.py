@@ -36,7 +36,7 @@ MILESTONES = {
 class PerformanceEngine:
     def __init__(self) -> None:
         """Engine resolves providers dynamically based on user credentials."""
-        pass
+        self._provider_cache: dict[tuple[str, str], DataProvider] = {}
 
     def sync_user_performance(self, user_id: str | UUID) -> dict[str, Any]:
         """Sync metrics for all published clips across all connected platforms."""
@@ -199,12 +199,24 @@ class PerformanceEngine:
         from services.data_providers.tiktok_provider import get_tiktok_provider
         from services.data_providers.mock_provider import get_mock_provider
 
+        cache_key = (str(user_id), platform)
+        if cache_key in self._provider_cache:
+            return self._provider_cache[cache_key]
+
         creds = get_platform_credentials(str(user_id), platform)
         if creds and creds.get("is_active"):
-            if platform == "youtube": return get_youtube_provider()
-            if platform == "tiktok": return get_tiktok_provider()
-        
-        return get_mock_provider()
+            if platform == "youtube":
+                provider = get_youtube_provider()
+                self._provider_cache[cache_key] = provider
+                return provider
+            if platform == "tiktok":
+                provider = get_tiktok_provider()
+                self._provider_cache[cache_key] = provider
+                return provider
+
+        provider = get_mock_provider()
+        self._provider_cache[cache_key] = provider
+        return provider
 
     def can_sync(self, user_id: str | UUID) -> bool:
         """Rate limit syncs to preserve platform quotas and user experience."""

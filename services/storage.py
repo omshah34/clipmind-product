@@ -11,14 +11,16 @@ Gap 237: Content-Addressable Storage (CAS)
 
 from __future__ import annotations
 
+import io
 import logging
 import mimetypes
 import hashlib
 import shutil
 import tempfile
+import os
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, urlunparse
 from uuid import uuid4
 
 import httpx
@@ -68,10 +70,6 @@ class StorageService:
         return self.supabase.storage.from_(settings.storage_bucket).get_public_url(object_path)
 
     def _decorate_public_url(self, url: str, checksum: str) -> str:
-        parsed = urlparse(url)
-        if parsed.scheme:
-            query_prefix = "&" if parsed.query else "?"
-            return f"{url}{query_prefix}cm_sha256={checksum}"
         return url
 
     def _extract_expected_checksum(self, url: str) -> str | None:
@@ -82,6 +80,65 @@ class StorageService:
         for part in raw_query.split("&"):
             if part.startswith("cm_sha256="):
                 return part.split("=", 1)[1]
+        return None
+
+    def _sidecar_reference(self, url: str) -> str | None:
+        parsed = urlparse(url)
+
+        if parsed.scheme == "file":
+            local_path = self._local_path_from_file_uri(url)
+            sidecar = local_path.with_name(f"{local_path.name}.sha256")
+            return sidecar.as_uri()
+
+        if "://" not in url:
+            sidecar = Path(url).with_name(f"{Path(url).name}.sha256")
+            return str(sidecar)
+
+        if parsed.scheme in {"http", "https"}:
+            return urlunparse(parsed._replace(path=f"{parsed.path}.sha256", query="", fragment=""))
+
+        return None
+
+    def _local_path_from_file_uri(self, url: str) -> Path:
+        parsed = urlparse(url)
+        raw_path = unquote(parsed.path)
+        if os.name == "nt" and raw_path.startswith("/") and len(raw_path) > 2 and raw_path[2] == ":":
+            raw_path = raw_path.lstrip("/")
+        return Path(raw_path)
+
+    def _read_text_reference(self, reference: str) -> str | None:
+        if not reference:
+            return None
+
+        try:
+            if reference.startswith("file://"):
+                parsed = urlparse(reference)
+                path = Path(unquote(parsed.path))
+                if os.name == "nt" and path.as_posix().startswith("/") and ":" in path.as_posix()[1:3]:
+                    path = Path(path.as_posix().lstrip("/"))
+                return path.read_text(encoding="utf-8").strip()
+
+            if "://" not in reference:
+                path = Path(reference)
+                if path.exists():
+                    return path.read_text(encoding="utf-8").strip()
+                return None
+
+            with httpx.Client(timeout=10.0) as client:
+                response = client.get(reference)
+                response.raise_for_status()
+                return response.text.strip()
+        except Exception:
+            return None
+
+    def _get_expected_checksum(self, source_url: str) -> str | None:
+        checksum = self._extract_expected_checksum(source_url)
+        if checksum:
+            return checksum
+
+        sidecar = self._sidecar_reference(source_url)
+        if sidecar:
+            return self._read_text_reference(sidecar)
         return None
 
     def _file_sha256(self, path: Path) -> str:
@@ -144,7 +201,7 @@ class StorageService:
                 parent if parent != "." else ""
             )
         except Exception:
-            return False
+            items = []
 
         for item in items:
             if isinstance(item, dict):
@@ -153,7 +210,12 @@ class StorageService:
                 name = getattr(item, "name", None)
             if name == filename:
                 return True
-        return False
+
+        try:
+            self.supabase.storage.from_(settings.storage_bucket).download(object_path)
+            return True
+        except Exception:
+            return False
 
     def get_presigned_url(self, url: str, expires_in: int = 3600) -> str:
         """Convert a public URL or object path into a signed URL if needed."""
@@ -187,11 +249,13 @@ class StorageService:
                 temp_path = Path(temp_handle.name)
             try:
                 shutil.copy2(local_path, temp_path)
+                with temp_path.open("r+b") as temp_reader:
+                    os.fsync(temp_reader.fileno())
                 temp_path.replace(destination)
             finally:
                 temp_path.unlink(missing_ok=True)
             destination.with_name(f"{destination.name}.sha256").write_text(checksum, encoding="utf-8")
-            return self._decorate_public_url(destination.resolve().as_uri(), checksum)
+            return destination.resolve().as_uri()
 
         content_type = mimetypes.guess_type(local_path.name)[0] or "application/octet-stream"
         object_path = f"{folder}/{safe_name}"
@@ -202,6 +266,15 @@ class StorageService:
                     file=file_handle,
                     file_options={"content-type": content_type, "upsert": "true"},
                 )
+            try:
+                sidecar_content = io.BytesIO(checksum.encode("utf-8"))
+                self.supabase.storage.from_(settings.storage_bucket).upload(
+                    path=f"{object_path}.sha256",
+                    file=sidecar_content,
+                    file_options={"content-type": "text/plain", "upsert": "true"},
+                )
+            except Exception:
+                _cas_logger.warning("Checksum sidecar upload failed for %s (non-fatal)", object_path, exc_info=True)
             return self.supabase.storage.from_(settings.storage_bucket).get_public_url(object_path)
 
         with ThreadPoolExecutor(max_workers=1) as executor:
@@ -214,15 +287,15 @@ class StorageService:
                     f"Storage upload exceeded {settings.storage_upload_timeout_seconds}s for {filename}"
                 ) from exc
 
-        return self._decorate_public_url(public_url, checksum)
+        return public_url
 
     def download_to_local(self, source_url: str, local_target: Path) -> Path:
         local_target.parent.mkdir(parents=True, exist_ok=True)
         max_bytes = settings.max_upload_size_bytes
-        expected_checksum = self._extract_expected_checksum(source_url)
+        expected_checksum = self._get_expected_checksum(source_url)
 
         if source_url.startswith("file://"):
-            source_path = Path(unquote(urlparse(source_url).path).lstrip("/"))
+            source_path = self._local_path_from_file_uri(source_url)
             if not source_path.exists():
                 raise FileNotFoundError(f"Local source file not found: {source_path}")
             shutil.copy2(source_path, local_target)
@@ -240,19 +313,27 @@ class StorageService:
             return local_target
 
         with httpx.stream("GET", source_url, timeout=settings.storage_download_timeout_seconds) as response:
-            response.raise_for_status()
-            content_length = response.headers.get("content-length")
-            if content_length and int(content_length) > max_bytes:
-                raise ValueError(f"Remote file is too large to download safely ({content_length} bytes)")
-            with local_target.open("wb") as file_handle:
-                total = 0
-                for chunk in response.iter_bytes():
-                    total += len(chunk)
-                    if total > max_bytes:
-                        file_handle.close()
-                        local_target.unlink(missing_ok=True)
-                        raise ValueError(f"Remote file exceeded the maximum download size of {max_bytes} bytes")
-                    file_handle.write(chunk)
+            try:
+                response.raise_for_status()
+                content_length = response.headers.get("content-length")
+                if content_length:
+                    try:
+                        content_length_value = int(content_length)
+                    except ValueError:
+                        logger.debug("Ignoring invalid Content-Length header for %s", source_url)
+                    else:
+                        if content_length_value > max_bytes:
+                            raise ValueError(f"Remote file is too large to download safely ({content_length} bytes)")
+                with local_target.open("wb") as file_handle:
+                    total = 0
+                    for chunk in response.iter_bytes():
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise ValueError(f"Remote file exceeded the maximum download size of {max_bytes} bytes")
+                        file_handle.write(chunk)
+            except Exception:
+                local_target.unlink(missing_ok=True)
+                raise
         if expected_checksum and self._file_sha256(local_target) != expected_checksum:
             local_target.unlink(missing_ok=True)
             raise ValueError("Downloaded artifact checksum did not match expected SHA-256.")
@@ -296,13 +377,7 @@ class StorageService:
 
         # 1. Handle local file URIs
         if url.startswith("file://"):
-            parsed = urlparse(url)
-            raw_path = unquote(parsed.path)
-            # Handle Windows leading slash in URIs (e.g., /C:/...)
-            if os.name == "nt" and raw_path.startswith("/") and ":" in raw_path[1:3]:
-                path = Path(raw_path.lstrip("/"))
-            else:
-                path = Path(raw_path)
+            path = self._local_path_from_file_uri(url)
 
             if path.exists() and _is_allowed(path):
                 try:

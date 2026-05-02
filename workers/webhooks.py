@@ -23,6 +23,7 @@ from db.repositories.webhooks import (
     get_webhook_delivery,
 )
 from services.event_emitter import WEBHOOK_SCHEMA_VERSION
+from services.task_queue import is_redis_available
 from workers.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -121,7 +122,14 @@ def deliver_webhook_event(
             )
             
             if delivery:
-                attempt_delivery_task.delay(str(delivery["id"]))
+                if is_redis_available():
+                    attempt_delivery_task.delay(str(delivery["id"]))
+                else:
+                    attempt_webhook_delivery.run(
+                        webhook_id=str(webhook["id"]),
+                        event_payload=event_payload,
+                        attempt_number=1,
+                    )
                 queued += 1
             else:
                 failed += 1
